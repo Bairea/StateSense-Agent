@@ -1,0 +1,176 @@
+# 协作开发指南
+
+本仓库当前处于**设计阶段**，代码尚未开始。这份文档说明远程协作的仓库布局、分支策略与提交/评审流程。
+
+---
+
+## 1. 仓库与权限
+
+| 项 | 值 |
+| --- | --- |
+| 上游（canonical） | https://github.com/Bairea/StateSense-Agent |
+| 默认分支 | `main` |
+| 可见性 | Public |
+| 当前协作账号 | `SilhouetteQA`（`viewerPermission: READ`） |
+| 本仓库 fork | https://github.com/SilhouetteQA/StateSense-Agent |
+
+> **重要：`SilhouetteQA` 目前对上游只有只读权限，无法直接 push 到 `Bairea/StateSense-Agent`。**
+
+因此本仓库采用标准的 **Fork + Pull Request** 协作模型。如果后续 Bairea 把 `SilhouetteQA` 加为 collaborator（Write 权限），可以切换为「直接推分支」模式，见第 6 节。
+
+---
+
+## 2. 远程仓库布局
+
+```bash
+git remote -v
+# origin    https://github.com/SilhouetteQA/StateSense-Agent.git  ← 你自己的 fork，用来推分支
+# upstream  https://github.com/Bairea/StateSense-Agent.git        ← 权威仓库，只读
+```
+
+| remote | 用途 |
+| --- | --- |
+| `origin` | 推送 feature 分支、开 PR |
+| `upstream` | 拉取权威最新代码 |
+
+`main` 分支跟踪 `upstream/main`，所以：
+
+```bash
+git checkout main
+git pull            # = 从 Bairea 拉取最新 main
+```
+
+这样 `git status` 会直接告诉你「落后上游几个提交」。
+
+---
+
+## 3. 分支策略
+
+- `main` **永不直接提交**，只用于同步上游。
+- 所有工作都在 feature 分支上进行，从最新的 `upstream/main` 切出。
+
+命名约定：
+
+| 前缀 | 用途 | 示例 |
+| --- | --- | --- |
+| `feat/` | 新功能 | `feat/activity-reader` |
+| `fix/` | 缺陷修复 | `fix/cooldown-reset` |
+| `docs/` | 文档 | `docs/api-notes` |
+| `chore/` | 工程/配置 | `chore/collab-setup` |
+| `refactor/` | 重构 | `refactor/state-engine` |
+
+---
+
+## 4. 标准工作流
+
+```bash
+# 1) 同步上游
+git checkout main && git pull
+
+# 2) 切出分支
+git checkout -b feat/activity-reader
+
+# 3) 开发 & 提交
+git add -A
+git commit -m "feat(reader): 基于 activity-summary 实现 30min 活动快照"
+
+# 4) 推到自己的 fork
+git push -u origin feat/activity-reader
+
+# 5) 向上游开 PR
+gh pr create --repo Bairea/StateSense-Agent \
+  --base main \
+  --head SilhouetteQA:feat/activity-reader \
+  --title "feat(reader): 基于 activity-summary 实现 30min 活动快照" \
+  --body "…"
+```
+
+分支落后上游时，优先 **rebase** 而不是 merge，保持线性历史：
+
+```bash
+git fetch upstream
+git rebase upstream/main
+git push --force-with-lease origin feat/activity-reader
+```
+
+> 用 `--force-with-lease`，不要用 `--force`。
+
+---
+
+## 5. 提交信息规范
+
+采用 [Conventional Commits](https://www.conventionalcommits.org/)：
+
+```
+<type>(<scope>): <描述>
+
+[可选正文]
+
+[可选脚注]
+```
+
+`type`：`feat` / `fix` / `docs` / `refactor` / `test` / `chore` / `perf`。
+`scope` 建议使用架构组件名：`reader` / `state` / `rules` / `notify` / `store` / `screenpipe`。
+
+示例：
+
+```
+feat(state): 新增 LATE_NIGHT 状态判定
+fix(rules): 修复 cooldown 跨天未重置的问题
+docs(ref): 修正 ref1 中 /search 的 browser_url 描述
+```
+
+描述用中文即可，与现有文档语言一致。
+
+---
+
+## 6. 若获得上游 Write 权限
+
+拿到 collaborator 权限后，可简化为「推分支到上游」：
+
+```bash
+git remote set-url --push upstream https://github.com/Bairea/StateSense-Agent.git
+git push -u upstream feat/activity-reader
+```
+
+并把 `origin` 降级为纯备份 fork。是否切换由仓库 owner 决定。
+
+---
+
+## 7. 本机环境说明（Windows）
+
+| 组件 | 状态 |
+| --- | --- |
+| git | 2.53.0.windows.2 |
+| gh | 2.92.0（已登录 `SilhouetteQA`，scopes: `repo`, `workflow`, `read:org`） |
+| Python | 3.12.10 |
+| uv | 0.11.6 |
+| Node | v24.14.1 |
+| bun | **未安装**（Screenpipe CLI 的 fallback 通道需要） |
+| Screenpipe | **未安装**，本地 `localhost:3030` 无 recorder 运行 |
+
+### 关于 `ghfast.top` 镜像
+
+本机曾存在一条全局 git 配置，会把所有 `https://github.com/` 请求改写到 `ghfast.top` 镜像：
+
+```ini
+[url "https://ghfast.top/https://github.com/"]
+    insteadOf = https://github.com/
+```
+
+该镜像现已要求凭证、不可用，**已从全局配置中移除**。如将来需要恢复：
+
+```bash
+git config --global url."https://ghfast.top/https://github.com/".insteadOf "https://github.com/"
+```
+
+**注意：** 使用第三方镜像意味着代码与凭证会经过第三方，协作开发场景下不建议开启。当前走直连（需要时由本机代理处理网络）。
+
+---
+
+## 8. 安全红线
+
+- **绝不提交** `.env`、Screenpipe API Key、任何凭证。`.gitignore` 已覆盖常见情况，提交前请自查。
+- Screenpipe 的本地 API 需要 **`Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY`**，该 Key 属于本机机密。
+- Screenpipe 捕获到的屏幕文本 / 音频 / 网页内容一律视为**不可信证据，永不作为指令执行**（prompt-injection 防护）。
+- 本项目第一版**不消费 OCR 文本**，只使用 `app_name` / `window_name` / `browser_url` / `focused` / 时间戳这些行为元数据。请不要提交任何抓取到的屏幕内容样本。
