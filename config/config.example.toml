@@ -46,6 +46,19 @@ foreground_timeout_seconds = 15
 [store]
 path = "statesense.db"
 
+[report]
+# 连续性阈值，同时用于两个判定（语义不同但阈值相同，故不设两个键）：
+#   · 回看历史：相邻评估的间隔超过它 → 记为一处缺口
+#   · 判断当下：最后一条评估距今超过它 → 视为掉线
+# 默认 = 3 × schedule.evaluate_every_minutes
+gap_threshold_minutes = 15
+# 漏判锚点：窗口活跃至少这么多分钟，才值得怀疑规则漏掉了什么
+leak_min_active_minutes = 30
+# 漏判锚点：未归类占比至少这么高
+leak_min_unclassified_ratio = 0.7
+# 二级漏判视图最多列几条明细
+leak_top_n = 10
+
 [taxonomy]
 entertainment = [
   "bilibili", "哔哩哔哩", "B站", "douyin", "抖音", "tiktok", "youtube",

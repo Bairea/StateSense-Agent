@@ -81,6 +81,24 @@ class NotifyConfig:
 
 
 @dataclass(frozen=True)
+class ReportConfig:
+    """观测层的判据阈值。
+
+    gap_threshold_minutes 同时用于两个语义不同、阈值相同的判定：
+    回看历史时「相邻评估的间隔」，与判断当下时「最后一条评估距今」。
+    合成一个键是有意的 —— 分两个键会让配置项翻倍，而它们本来就是一回事。
+    """
+
+    gap_threshold_minutes: float = 15
+    #: 漏判锚点：窗口活跃至少这么多分钟，才值得怀疑规则漏掉了什么。
+    leak_min_active_minutes: float = 30
+    #: 漏判锚点：未归类占比至少这么高。0.7 是起点，用真实分布再调。
+    leak_min_unclassified_ratio: float = 0.7
+    #: 二级漏判视图最多列几条明细。
+    leak_top_n: int = 10
+
+
+@dataclass(frozen=True)
 class TaxonomyConfig:
     entertainment: tuple[re.Pattern[str], ...] = ()
     gray: tuple[re.Pattern[str], ...] = ()
@@ -103,6 +121,7 @@ class Config:
     outcome: OutcomeConfig
     notify: NotifyConfig
     store_path: Path
+    report: ReportConfig
     taxonomy: TaxonomyConfig
     actions: tuple[Action, ...] = field(default_factory=tuple)
 
@@ -171,6 +190,19 @@ def load_config(path: Path) -> Config:
     store_raw = raw.get("store", {})
     store_path = (path.parent / store_raw.get("path", "statesense.db")).resolve()
 
+    report = ReportConfig(**raw.get("report", {}))
+    if report.gap_threshold_minutes <= 0:
+        raise ConfigError("report.gap_threshold_minutes 必须为正数")
+    if report.leak_min_active_minutes < 0:
+        raise ConfigError("report.leak_min_active_minutes 不能为负")
+    if not (0.0 < report.leak_min_unclassified_ratio <= 1.0):
+        raise ConfigError(
+            f"report.leak_min_unclassified_ratio 必须在 (0, 1] 区间内，"
+            f"当前为 {report.leak_min_unclassified_ratio}"
+        )
+    if report.leak_top_n <= 0:
+        raise ConfigError("report.leak_top_n 必须为正数")
+
     tax_raw = raw.get("taxonomy", {})
     taxonomy = TaxonomyConfig(
         entertainment=_compile(tax_raw.get("entertainment", []), "taxonomy.entertainment"),
@@ -203,6 +235,7 @@ def load_config(path: Path) -> Config:
         outcome=outcome,
         notify=notify,
         store_path=store_path,
+        report=report,
         taxonomy=taxonomy,
         actions=tuple(actions),
     )
