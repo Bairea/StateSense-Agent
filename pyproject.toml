@@ -1,0 +1,20 @@
+[project]
+name = "statesense-agent"
+version = "0.0.1"
+description = "持续感知活动状态、在正确时机轻推一下的个人状态智能体"
+requires-python = ">=3.12"
+dependencies = ["winotify>=1.1.0; sys_platform == 'win32'"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/statesense"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
