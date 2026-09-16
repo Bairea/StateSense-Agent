@@ -5,7 +5,9 @@
 *.local.json
 *.local.toml
 secrets/
+.secrets/
 credentials/
+.credentials/
 
 # --- Python ---
 __pycache__/
@@ -31,6 +33,10 @@ htmlcov/
 *.db-shm
 data/
 *.parquet
+
+# --- Pipe 运行期日志（只在本机累积，不入库） ---
+pipes/*/runs.jsonl
+pipes/*/interventions.jsonl
 
 # --- 日志 / 运行产物 ---
 *.log
