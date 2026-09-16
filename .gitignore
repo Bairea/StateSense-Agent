@@ -1,0 +1,49 @@
+# --- 密钥 / 本地配置（绝不入库） ---
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.toml
+secrets/
+credentials/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- 本地数据（Screenpipe 已负责存储原始活动，本项目 DB 只存干预记录） ---
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+data/
+*.parquet
+
+# --- 日志 / 运行产物 ---
+*.log
+logs/
+out/
+tmp/
+
+# --- 编辑器 / 操作系统 ---
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
