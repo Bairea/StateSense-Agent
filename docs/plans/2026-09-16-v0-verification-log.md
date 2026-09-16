@@ -176,7 +176,76 @@ note=delivered response=accepted
 
 ---
 
-## 9. 下一步建议
+## 9. 代码审查与修复（2026-09-16）
+
+本分支在收尾前做了一轮双轴审查（Standards / Spec 隔离并行），共 24 项发现，随后逐项修复。
+
+### 9.1 两条最严重的
+
+| 轴 | 问题 | 影响 | 修复 |
+|---|---|---|---|
+| Spec | `run_gates` 用 `if name in GATE_REGISTRY` **静默丢弃未知闸门名** | 配置里少写或拼错 `state_min` → 闸门列表为空 → `decide` 在 `state=NORMAL` 下返回 `intervene=True`，**对并不处于被动消费状态的人弹窗**，直接击穿核心安全属性 | 配置层逐名校验 + `state_min` 列为强制闸门 + 去掉静默过滤（实测复现后确认已堵住） |
+| Standards | 非 ok 数据下 `engine` 仍写 `state=NORMAL`，而 `evaluations` 没有 `skipped` 列 | V0 全部结论所依赖的表**分不清「真的正常」与「根本没采到数据」** | schema v3 增加 `evaluations.skipped`，`data_status` 恢复写原始值 |
+
+### 9.2 其余修复分组
+
+| 组 | 内容 |
+|---|---|
+| reader | 封闭 `data_status` 枚举（枚举外的值按 `unreachable` 处理）；删除用 entries 估算总时长（违反 §15.1）；删除 `apps` 静默回退（无 title/url 属静默降质）；失败告警限流（满 5 轮一次，成功归零） |
+| spec 缺口 | `SCREENPIPE_LOCAL_API_URL` 环境变量覆盖；`--db` 命令行覆盖；休眠/唤醒空档检测（超过 2× 窗口则跳过本轮）；`entBefore == 0` 时记内部告警 |
+| 坏味道 | 提取 `_time.py` 消除两份 `_iso`；提取 `taxonomy.entertainment_minutes` 使状态判定与回执**共用同一口径**；删除死常量；`RecordingNotifier` 改为注入 Clock；`win32_popup` 补平台守卫 |
+
+### 9.3 有意未处理（记录理由）
+
+| 项 | 理由 |
+|---|---|
+| `reader` 的 `(start, end, window_minutes, captured_at)` 四元组 Data Clumps | 引入 `ReadWindow` 类型需改动公开接口（spec §5.1 契约）与约 20 处测试调用点；属判断项，收益有限，留待 V0.5 与 fixtures 一并整理 |
+| `tests/fixtures/*.json` | 原计划有、实际未采用。改为在 spec 里说明「样本以模块内联 dict 形式写在受访测试里更易维护」，而不是为凑合文档而造文件 |
+
+修复后 `pytest` 154 passed（修复前 137）。
+
+---
+
+## 10. 实跑中新发现的问题（审查未覆盖）
+
+### 10.1 分类清单漏掉「窗口标题只有游戏名」的游戏
+
+2026-09-16 晚间的 `--check` 抓到一条真实数据：
+
+```
+取到 24 条窗口记录，总活跃 59.9 分钟
+    46.9 分钟  Brotato          ← 游戏，被判成 NORMAL
+     3.8 分钟  测试 spec02 构筑内容 — DSH 本地构建
+state=NORMAL  intervened=False  note=... ratio_min 未通过（0.04 vs 阈值 0.75）
+```
+
+`Brotato` 是游戏，但窗口标题只有游戏名，既不含 `steam` 也不含 `battle.net` 等平台关键词，
+于是 `ent ≈ 0`、`ratio = 0.04`，系统判成 `NORMAL`。**刷了 47 分钟游戏却完全没被识别**。
+
+这不是实现缺陷，而是 §5.2 默认清单的覆盖度问题：**「平台名」不等于「游戏名」**。
+Steam 启动的游戏进程与窗口标题都是游戏自身。
+
+可能的处理方向（V0 先不改，等真实数据说话）：
+
+| 方向 | 代价 |
+|---|---|
+| 在配置里逐个人工添加游戏名 | 换游戏就要改配置，覆盖不全 |
+| 识别「全屏 + 非工作类进程」作为娱乐信号 | 需要新的信号源，Screenpipe 的 `frames` 里没有直接的全屏标志 |
+| 引入进程名→类别的外部映射表 | 引入外部依赖，与「0 依赖」冲突 |
+| 保持现状，靠用户按需补配置 | 最简单；但这正是 §5.2 说的「用 V0 数据决定」 |
+
+**这条恰好证明了 V0 存在的意义**：`evaluations` 表把「Brotato 46.9 分钟 / ent=0」这个事实
+如实记了下来，配置该补什么、阈值该怎么调，有据可依。
+
+### 10.2 审查修复后可复用的真实数据
+
+同一次 `--check` 也验证了修复后的行为：`data_status ok`、24 条窗口记录、
+闸门逐条留痕（`ratio_min 0.04 vs 阈值 0.75`）—— 四条闸门的实际值与阈值都在库里，
+「为什么这次没打扰我」一眼可查。
+
+---
+
+## 11. 下一步建议
 
 1. **挂上常驻**：确认一天的 `--once --dry-run` 记录符合直觉后，再注册任务计划程序（命令见计划 Task 11 的说明）。
 2. **观察 3~5 天**，重点看 `evaluations.gate_trace` 里 `ratio_min` 的阻挡频率，据此判断 0.75 是否过严。

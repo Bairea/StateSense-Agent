@@ -2,11 +2,30 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 实现 V0 状态介入系统 —— 每 5 分钟读取 Screenpipe 活动、判定是否处于被动消费状态、通过闸门时投递 Windows Toast 轻推，并在 10 分钟后自动复查干预效果。
+> ## ⚠️ 本计划已执行完毕，部分内联代码在实施中被取代
+>
+> **权威来源是 [`docs/specs/2026-09-16-v0-state-intervention-design.md`](../specs/2026-09-16-v0-state-intervention-design.md)
+> 与 `src/` 下的实际代码，不是本文件里的代码块。**
+>
+> 本文件作为历史记录保留。实施过程中因真机实测推翻原设计，以下内容**已经失效**：
+>
+> | 失效内容 | 现状 | 见 |
+> |---|---|---|
+> | 所有 `windows_toast` / `winotify` 相关代码块（Task 1 的 `NotifyConfig`、Task 8 全文、Task 10 的 `make_notifier`） | 改为原生前台弹窗，运行期依赖降为 0 | 「Task 8 修订版」、spec §8 |
+> | Task 1 的 `pyproject.toml`（`dependencies = ["winotify..."]`） | `dependencies = []` | 同上 |
+> | Task 1 的 `config.example.toml` `[notify]` 段 | 字段已全换 | spec §12 |
+> | Task 5 的 schema（无 `user_response` / `skipped`） | schema v3 | spec §10 |
+> | Task 2 的 `data_status` 实现（`unreachable: <原因>`、`apps` 回退、用 entries 估算 total） | 封闭枚举、无回退、不估算 | spec §5.1 |
+> | Task 10 的 `check()` | 原稿把 `now` 同时当 start 与 end，会读零长度窗口 | 「修订记录」 |
+>
+> 下文 Task 1–11 的**步骤结构（TDD 循环、任务边界、接口契约）仍然准确**，
+> 失效的是其中若干代码块。**照抄代码前请先对照 spec 与 `src/`。**
 
-**Architecture:** 六组件分层。`ActivityReader` 是唯一接触 Screenpipe 的组件；`StateEngine` / `InterventionDecider` / `OutcomeTracker` 是纯函数，时间与配置全部注入，因此可脱离真实录制做表驱动测试；`Notifier` / `Wording` 是接口，V0 给出 Windows Toast 与模板实现。
+**Goal:** 实现 V0 状态介入系统 —— 每 5 分钟读取 Screenpipe 活动、判定是否处于被动消费状态、通过闸门时投递**原生前台弹窗**轻推（含按钮回执），并在 10 分钟后自动复查干预效果。
 
-**Tech Stack:** Python 3.12、uv（依赖管理）、标准库 `tomllib` / `sqlite3` / `urllib`、`winotify`（仅 Windows）、`pytest`（仅开发依赖）。
+**Architecture:** 六组件分层。`ActivityReader` 是唯一接触 Screenpipe 的组件；`StateEngine` / `InterventionDecider` / `OutcomeTracker` 是纯函数，时间与配置全部注入，因此可脱离真实录制做表驱动测试；`Notifier` / `Wording` 是接口，V0 给出前台弹窗与模板实现。
+
+**Tech Stack:** Python 3.12、uv（依赖管理）、**全部标准库**（`tomllib` / `sqlite3` / `urllib` / `ctypes` / `winsound`）、`pytest`（仅开发依赖）。运行期第三方依赖为 **0**。
 
 **Spec:** `docs/specs/2026-09-16-v0-state-intervention-design.md`（已合并进 `main`）
 
@@ -24,7 +43,7 @@
 每个任务都隐含包含本节。
 
 - Python 下限 `>=3.12`（使用 `tomllib` 与 `X | None`）。
-- 运行时第三方依赖只允许 `winotify`，且仅 `sys_platform == 'win32'`。HTTP、SQLite、TOML、时间全部标准库。
+- 运行时第三方依赖为 **0**（实施中由「只允许 winotify」收紧而来，见顶部失效清单）。HTTP、SQLite、TOML、时间、Win32 调用全部标准库。
 - **代码中不得出现盘符或用户目录硬编码**（不得出现 `D:\`、`C:\Users`、`~/.screenpipe` 字面量）。路径一律来自配置或环境变量。
 - `gate.ratio_min` 的确定值：**0.75**。缺失时**必须启动失败**，绝不静默降级为 0。
 - `ActivityReader` 请求必须带 `Authorization: Bearer <key>`、`X-Screenpipe-Client: api`、`X-Screenpipe-Agent: statesense`，并必须带 `include_key_texts=false`、`include_snippets=false`、`include_memories=false`、`include_guidance=false`。
@@ -54,7 +73,8 @@
 | `src/statesense/intervention/wording.py` | `Wording` 接口 + 模板实现 |
 | `src/statesense/intervention/decider.py` | 组合闸门与动作（纯函数） |
 | `src/statesense/notify/base.py` | `Notifier` 协议 + `DeliveryResult` |
-| `src/statesense/notify/windows_toast.py` | `winotify` 实现 |
+| `src/statesense/notify/win32_popup.py` | ctypes 封装（MessageBox / 抢前台 / 关窗） |
+| `src/statesense/notify/foreground_popup.py` | 投递实现（超时与回执映射） |
 | `src/statesense/outcome/models.py` | `OutcomeVerdict` |
 | `src/statesense/outcome/tracker.py` | 回执判定（纯函数） |
 | `src/statesense/store/schema.sql` | 建表语句 |

@@ -70,7 +70,7 @@ V0 只验证一个问题：
 │  ① ActivityReader   ── 唯一接触 Screenpipe 的组件         │
 │  ② StateEngine      ── 活动快照 → 状态（纯函数）          │
 │  ③ InterventionDecider ── 状态+历史 → 是否介入（纯函数）  │
-│  ④ Notifier         ── 投递（V0: Windows Toast）          │
+│  ④ Notifier         ── 投递（V0: 原生前台弹窗）           │
 │  ⑤ OutcomeTracker   ── T+10min 复查 → 行为回执            │
 │  ⑥ Store (SQLite)   ── evaluations / interventions /      │
 │                        outcomes                           │
@@ -136,6 +136,13 @@ class ActivitySnapshot:
 ```
 
 `entries` 只用 `app` / `title` / `url` 三个文本字段做匹配，**不含任何屏幕文本**。
+
+关于 `data_status` 的两条硬约束：
+
+1. **它是封闭枚举。** 读到枚举外的值（含字段缺失）一律按 `unreachable` 处理 —— 不认识的字段意味着响应结构与预期不符，此时任何「没有活动」的结论都不成立。
+2. **`total_active_minutes` 只取服务端字段，绝不用 `entries` 之和估算。** `entries` 是窗口粒度记录，拿它反推时长正是 §15.1 明令禁止的做法。
+
+`entries` 只从响应的 `windows` 字段构造。**不提供 `apps` 回退**：`apps` 没有 `title` / `url`，用它顶替只能靠进程名匹配，属于静默降质（例如 `chrome.exe` 完全无法区分刷视频与查文档）。明细缺失时留空并记日志，让缺口可见。
 
 ### 5.2 分类
 
@@ -265,7 +272,7 @@ applies_to = ["HIGH_RISK_PASSIVE_CONSUMPTION"]
 
 ```python
 class Wording(Protocol):
-    def render(self, verdict: StateVerdict, action: Action, snapshot: ActivitySnapshot) -> str: ...
+    def render(self, verdict: StateVerdict, action: Action, top_label: str | None) -> str: ...
 ```
 
 V0 实现 `TemplateWording`，输出形如：
@@ -421,6 +428,7 @@ CREATE TABLE evaluations (
   state TEXT NOT NULL,
   late_night INTEGER NOT NULL,
   data_status TEXT NOT NULL,
+  skipped INTEGER NOT NULL DEFAULT 0,  -- 1 = 本轮因采集中断未下结论
   prev_state TEXT,
   decision TEXT NOT NULL,           -- intervene | skip
   gate_trace TEXT NOT NULL          -- JSON: [{name, passed, value, threshold}]
@@ -577,7 +585,7 @@ work          = [ /* §5.2 清单 */ ]
 | **鉴权** | ⚠️ `/activity-summary` **即使来自 localhost 也返回 403**，必须带 `Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY`（`screenpipe auth token` 获取），并带归因头 `X-Screenpipe-Client: api`、`X-Screenpipe-Agent: statesense` |
 | Python | 3.12+，依赖用 `uv` 管理 |
 | 不需要 bun / Pipes | 本规格走 REST，不依赖 Screenpipe 的 pipe 机制或 pi agent |
-| Windows Toast | 见 §8.2 |
+| 前台弹窗 | 见 §8.2 |
 
 ### 15.1 已实测的 Screenpipe 行为（2026-09，v0.4.50）
 
@@ -609,10 +617,11 @@ work          = [ /* §5.2 清单 */ ]
 | 5 | `WORK` 分类准确性未验证 | 影响 ratio 解释（#3 闸门未启用，影响有限） | V0 不依赖它做判定 |
 | 6 | 行为回执把「离开电脑」也算作 `disengaged` | 高估干预效果 | ⚠️ **已缓解**。按钮回执可区分「用户配合」与「用户离开」；分析时应先按 `user_response` 分层 |
 | 7 | `gate.ratio_min` 未定 | 闸门不生效 | ✅ **已定：0.75** |
-| 8 | 凌晨干预的文案与强度未定 | `late_night` 只是标记，尚未影响行为 | V1 处理 |
+| 8 | 凌晨干预的文案已随 `late_night` 变化，但**强度**未变 | 文案会加「凌晨了。」前缀；闸门与阈值不受影响 | 文案侧已实现；是否在凌晨收紧阈值留待 V1 |
 | 9 | **弹窗是模态的，会抢焦点** | 比 Toast 更打断；若频繁触发会显著影响工作 | 由 `cooldown_minutes`(30) 与 `daily_cap`(8) 约束；V0 观察实际打扰感 |
 | 10 | **弹窗期间调度器会阻塞** | `notify()` 最多阻塞 `answer_timeout_seconds`(180s)，期间不评估、不查回执 | 可接受（tick 间隔 5 分钟）；若实际影响明显，改为异步 + 回调 |
 | 11 | **`ToastEnabled` 曾被关闭** | 说明该用户对通知打扰敏感 | 已尊重用户选择改用主动弹窗；若后续觉得被打扰，优先调 `daily_cap` 而非换通道 |
+| 12 | **分类清单按「平台名」匹配，漏掉「窗口标题只有游戏名」的游戏** | 实测刷 `Brotato` 46.9 分钟被判成 `NORMAL`（`ent=0`）—— Steam 启动的游戏，进程名与窗口标题都是游戏自身，不含 `steam` 等关键词 | V0 先靠配置按需补游戏名；`evaluations` 表已如实记录这类漏判，处理方向见验证日志 §10.1 |
 
 ---
 
@@ -675,8 +684,9 @@ src/statesense/
 │  └─ schema.sql
 └─ scheduler.py
 tests/
-├─ fixtures/*.json
-└─ test_*.py
+└─ test_*.py            # 固定样本以模块内联 dict 的形式写在各测试文件里
+                        # （早期计划里的 tests/fixtures/*.json 未采用：
+                        #  样本只在受访的测试里读得懂，抽成 JSON 反而更难维护）
 config/
 └─ config.example.toml
 ```
@@ -689,6 +699,6 @@ config/
 2. `activity/`（含防御式解析，用录制响应做测试）
 3. `state/`（纯函数 + 表驱动测试）——**这一步就能产出可评审的判定结果**
 4. `intervention/`（闸门 + 动作池 + 模板文案）
-5. `notify/`（先实测全屏场景的 Toast 可达性，再定是否启用兜底）
+5. `notify/`（原生前台弹窗；投递通道已在实施中由 Toast 改为弹窗，见 §8.2）
 6. `outcome/` + `scheduler.py`
 7. `--once` 端到端手动验证，观察一天，再决定是否挂任务计划程序
