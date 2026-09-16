@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from statesense.config import GateConfig
+from statesense.config import KNOWN_GATES, GateConfig
 from statesense.intervention.models import GateResult
 from statesense.state.models import State, StateVerdict
 
@@ -32,7 +32,7 @@ def evaluate_state_min(ctx: GateContext) -> GateResult:
 
 
 def evaluate_ratio_min(ctx: GateContext) -> GateResult:
-    threshold = ctx.config.ratio_min if ctx.config.ratio_min is not None else 1.0
+    threshold = ctx.config.required_ratio_min()
     return GateResult(
         name="ratio_min",
         passed=ctx.verdict.ent_ratio >= threshold,
@@ -44,7 +44,8 @@ def evaluate_ratio_min(ctx: GateContext) -> GateResult:
 def evaluate_cooldown(ctx: GateContext) -> GateResult:
     limit = ctx.config.cooldown_minutes
     if ctx.last_intervention_at is None:
-        return GateResult(name="cooldown", passed=True, value=float("inf"), threshold=limit)
+        # 从未干预过：没有「距上次多少分钟」这个量，只能显式为 None，不要用 inf 假装它是个数。
+        return GateResult(name="cooldown", passed=True, value=None, threshold=limit)
     elapsed = (ctx.now - ctx.last_intervention_at).total_seconds() / 60.0
     return GateResult(
         name="cooldown", passed=elapsed >= limit, value=round(elapsed, 1), threshold=limit
@@ -67,6 +68,12 @@ GATE_REGISTRY: dict[str, Callable[[GateContext], GateResult]] = {
     "daily_cap": evaluate_daily_cap,
 }
 
+# 注册表必须覆盖配置层认可的全部闸门名。缺一个就意味着配置能写、运行时却静默不跑。
+assert set(GATE_REGISTRY) == set(KNOWN_GATES), (
+    f"GATE_REGISTRY 与 KNOWN_GATES 不一致：{set(GATE_REGISTRY) ^ set(KNOWN_GATES)}"
+)
+
 
 def run_gates(ctx: GateContext) -> tuple[GateResult, ...]:
-    return tuple(GATE_REGISTRY[name](ctx) for name in ctx.config.enabled if name in GATE_REGISTRY)
+    """按配置顺序跑闸门。名字合法性由配置层保证，这里不再过滤 —— 静默过滤正是缺陷来源。"""
+    return tuple(GATE_REGISTRY[name](ctx) for name in ctx.config.enabled)

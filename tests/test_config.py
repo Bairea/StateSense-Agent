@@ -48,6 +48,43 @@ def test_ratio_min_out_of_range_fails(tmp_path):
         load_config(_write(tmp_path, MINIMAL.replace("0.75", "1.5")))
 
 
+GATE_BLOCK = 'ratio_min = 0.75'
+
+
+def test_unknown_gate_name_fails_fast(tmp_path):
+    """拼错一个闸门名曾经会静默少跑一条闸门，若少的是 state_min 就会打扰不该打扰的人。"""
+    body = MINIMAL.replace(GATE_BLOCK, 'enabled = ["state_min", "ratio_mim"]\nratio_min = 0.75')
+    with pytest.raises(ConfigError, match="未知闸门名"):
+        load_config(_write(tmp_path, body))
+
+
+def test_missing_state_min_fails_fast(tmp_path):
+    body = MINIMAL.replace(GATE_BLOCK, 'enabled = ["ratio_min"]\nratio_min = 0.75')
+    with pytest.raises(ConfigError, match="state_min"):
+        load_config(_write(tmp_path, body))
+
+
+def test_empty_gate_list_fails_fast(tmp_path):
+    body = MINIMAL.replace(GATE_BLOCK, 'enabled = []\nratio_min = 0.75')
+    with pytest.raises(ConfigError, match="不能为空"):
+        load_config(_write(tmp_path, body))
+
+
+def test_known_gate_names_are_accepted(tmp_path):
+    body = MINIMAL.replace(GATE_BLOCK, 'enabled = ["state_min"]')
+    assert load_config(_write(tmp_path, body)).gate.enabled == ("state_min",)
+
+
+def test_required_ratio_min_raises_instead_of_falling_back():
+    """绝不静默降级 —— 一个悄悄变成 0 的闸门比一条报错危险得多。"""
+    from statesense.config import KNOWN_GATES, GateConfig
+
+    assert "ratio_min" in KNOWN_GATES
+    with pytest.raises(ConfigError, match="ratio_min"):
+        GateConfig().required_ratio_min()
+    assert GateConfig(ratio_min=0.75).required_ratio_min() == 0.75
+
+
 def test_empty_action_pool_fails(tmp_path):
     with pytest.raises(ConfigError, match="actions"):
         load_config(_write(tmp_path, MINIMAL.split("[[actions]]")[0]))

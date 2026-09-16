@@ -11,7 +11,8 @@ from statesense.intervention.models import Decision, GateResult
 
 
 def _describe(result: GateResult) -> str:
-    return f"{result.name} 未通过（{result.value} vs 阈值 {result.threshold}）"
+    shown = "不适用" if result.value is None else f"{result.value}"
+    return f"{result.name} 未通过（{shown} vs 阈值 {result.threshold}）"
 
 
 def decide(ctx: GateContext, actions: Iterable[Action], last_action_id: str | None) -> Decision:

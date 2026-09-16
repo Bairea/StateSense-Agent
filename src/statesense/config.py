@@ -12,6 +12,15 @@ class ConfigError(Exception):
     """配置非法。"""
 
 
+#: 闸门注册表里允许出现的名字。
+#: 配置中出现未知名字必须**启动失败**：拼错一个名字会静默少跑一条闸门，
+#: 若少掉的是 state_min，系统就会对并不处于被动消费状态的人弹窗。
+KNOWN_GATES: tuple[str, ...] = ("state_min", "ratio_min", "cooldown", "daily_cap")
+
+#: 必须始终启用的闸门。state_min 是「只在真的被困住时才打扰」这条安全属性的唯一守卫。
+MANDATORY_GATES: tuple[str, ...] = ("state_min",)
+
+
 @dataclass(frozen=True)
 class ScreenpipeConfig:
     base_url: str = "http://localhost:3030"
@@ -42,6 +51,16 @@ class GateConfig:
     ratio_min: float | None = None
     cooldown_minutes: float = 30
     daily_cap: int = 8
+
+    def required_ratio_min(self) -> float:
+        """取比例阈值。
+
+        配置层已保证「enabled 含 ratio_min 时它必非 None」，这里再抛一次是为了
+        不提供静默兜底 —— 一个悄悄降级成 0 的闸门比一条报错危险得多。
+        """
+        if self.ratio_min is None:
+            raise ConfigError("gate.ratio_min 未设置；该项为必填，不接受默认值")
+        return self.ratio_min
 
 
 @dataclass(frozen=True)
@@ -119,6 +138,20 @@ def load_config(path: Path) -> Config:
     if "enabled" in gate_raw:
         gate_raw["enabled"] = tuple(gate_raw["enabled"])
     gate = GateConfig(**gate_raw)
+    # 闸门名必须逐一可识别 —— 静默丢弃未知名字会让安全属性无声失效。
+    if not gate.enabled:
+        raise ConfigError("gate.enabled 不能为空；至少要启用 state_min")
+    unknown = [name for name in gate.enabled if name not in KNOWN_GATES]
+    if unknown:
+        raise ConfigError(
+            f"gate.enabled 含未知闸门名 {unknown}；已知闸门：{list(KNOWN_GATES)}"
+        )
+    missing = [name for name in MANDATORY_GATES if name not in gate.enabled]
+    if missing:
+        raise ConfigError(
+            f"gate.enabled 必须包含 {missing}。state_min 是唯一阻止在"
+            "非被动消费状态下打扰用户的闸门，不允许关闭。"
+        )
     # ratio_min 是必填项。缺失时绝不静默降级为 0 —— 静默失效的闸门比报错危险得多。
     if "ratio_min" in gate.enabled:
         if gate.ratio_min is None:

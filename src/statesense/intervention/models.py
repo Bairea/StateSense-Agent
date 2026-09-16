@@ -9,7 +9,9 @@ from dataclasses import dataclass
 class GateResult:
     name: str
     passed: bool
-    value: float
+    #: 闸门的实际值。为 None 表示「这个概念此刻不适用」（例如从未干预过，就没有「距上次多少分钟」），
+    #: 而不是用 inf 之类的哨兵值假装它是个数。
+    value: float | None
     threshold: float
 
 
