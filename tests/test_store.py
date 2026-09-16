@@ -28,6 +28,7 @@ def _verdict(state=State.PASSIVE_CONSUMPTION) -> StateVerdict:
         gray_minutes=5.0,
         work_minutes=10.0,
         ent_ratio=0.75,
+        entries_minutes=60.0,
         window_minutes=60,
         data_status="ok",
         skipped=False,
@@ -121,7 +122,8 @@ def test_skipped_flag_distinguishes_no_data_from_truly_normal(store):
     normal = store.insert_evaluation(T0, _verdict(state=State.NORMAL), _decision(False))
     skipped_verdict = StateVerdict(
         state=State.NORMAL, late_night=False, total_active_minutes=0.0, ent_minutes=0.0,
-        gray_minutes=0.0, work_minutes=0.0, ent_ratio=0.0, window_minutes=60,
+        gray_minutes=0.0, work_minutes=0.0, ent_ratio=0.0, entries_minutes=0.0,
+        window_minutes=60,
         data_status="no_capture_in_range", skipped=True,
         skip_reason="no_capture_in_range",
     )

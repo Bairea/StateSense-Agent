@@ -7,8 +7,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from statesense.activity.base import ActivitySource
 from statesense.activity.models import ActivitySnapshot
-from statesense.activity.reader import ActivityReader
 from statesense.clock import Clock
 from statesense.config import Config
 from statesense.intervention.actions import candidates
@@ -40,7 +40,7 @@ class Scheduler:
         self,
         config: Config,
         clock: Clock,
-        reader: ActivityReader,
+        reader: ActivitySource,
         store: Store,
         notifier: Notifier,
         wording: Wording | None = None,

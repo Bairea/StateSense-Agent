@@ -37,6 +37,7 @@ def classify(
     gray = _round2(buckets[Category.GRAY])
     work = _round2(buckets[Category.WORK])
     total = _round2(snapshot.total_active_minutes)
+    entries = _round2(sum(e.minutes for e in snapshot.entries))
     ratio = _round2(ent / total) if total > 0 else 0.0
 
     shared = dict(
@@ -46,6 +47,7 @@ def classify(
         gray_minutes=gray,
         work_minutes=work,
         ent_ratio=ratio,
+        entries_minutes=entries,
         window_minutes=snapshot.window_minutes,
         data_status=snapshot.data_status,
     )

@@ -155,3 +155,26 @@ def test_late_night_is_independent_of_state():
     v = classify(snap, TAX, TH)
     assert v.state is State.NORMAL
     assert v.late_night is True
+
+
+# ── entries_minutes（区分「未命中规则」与「明细缺失」）────────
+
+def test_entries_minutes_sums_all_entries_including_other():
+    """未命中任何规则的条目也算进去 —— 它正是漏判视图要找的东西。"""
+    v = classify(_snap([_ent(20.0), _work(30.0), _other(9.9)], 59.9), TAX, TH)
+    assert v.entries_minutes == 59.9
+    assert v.total_active_minutes == 59.9
+
+
+def test_entries_minutes_smaller_than_total_means_detail_missing():
+    """total 声称有活动、条目却只覆盖一部分 → 差额是「明细缺失」，不是漏判。"""
+    v = classify(_snap([_ent(10.0)], 59.9), TAX, TH)
+    assert v.entries_minutes == 10.0
+    assert v.total_active_minutes == 59.9
+
+
+def test_entries_minutes_is_present_on_skipped_verdict_too():
+    """skipped 分支走的是同一个 shared dict，不能漏掉这个字段。"""
+    v = classify(_snap([], 0.0, data_status="unreachable"), TAX, TH)
+    assert v.skipped is True
+    assert v.entries_minutes == 0.0

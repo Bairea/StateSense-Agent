@@ -26,3 +26,7 @@ class StateVerdict:
     data_status: str
     skipped: bool
     skip_reason: str | None
+    #: 条目分钟数之和。与 total_active_minutes 的差额是「明细缺失」，
+    #: 与 (ent+gray+work) 的差额是「未命中任何规则」。刻意不给默认值 ——
+    #: 0.0 本身就是可疑信号，静默默认会让漏判检测失效。
+    entries_minutes: float
