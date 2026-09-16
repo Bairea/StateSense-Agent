@@ -70,12 +70,30 @@ class Scheduler:
         while True:
             now = self._clock.now()
             if last is None or now - last >= interval:
-                try:
-                    self.run_once()
-                except Exception:  # noqa: BLE001 - 常驻进程不能因为单轮失败就退出
-                    log.exception("本轮评估失败，跳过")
+                self.run_tick_guarded(now)
                 last = now
             time.sleep(self._config.schedule.tick_seconds)
+
+    def run_tick_guarded(self, now: datetime) -> TickReport | None:
+        """常驻循环的单轮：异常必须落库，不能只留在日志里。
+
+        原本 `except Exception` 只写日志，于是「崩在日志里」与「进程根本没在跑」
+        在库里长得一模一样。补上落行之后，「无记录」只剩「进程死了」一个解释。
+
+        写事件本身若也失败（磁盘满、库损坏），只能退回日志 —— 此时观测退化为
+        「看起来像进程死了」，这是已知边界，不是新问题。
+        """
+        try:
+            return self.run_once()
+        except Exception as exc:  # noqa: BLE001 - 常驻进程不能因为单轮失败就退出
+            log.exception("本轮评估失败，跳过")
+            try:
+                self._store.insert_run_event(
+                    now, "tick_error", f"{type(exc).__name__}: {exc}"[:200]
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("写入 tick_error 运行事件失败")
+            return None
 
     # ── 内部 ────────────────────────────────────────────────
 
@@ -108,6 +126,8 @@ class Scheduler:
                     gap.total_seconds() / 60,
                     window * 2,
                 )
+                # 必须落行：否则「有意跳过」与「进程死了」在库里完全一样。
+                self._store.insert_run_event(now, "sleep_gap", f"{gap.total_seconds() / 60:.1f}")
                 return TickReport(None, None, False, closed, f"空档 {gap} 超过 2× 窗口，跳过")
         self._last_evaluation_at = now
 

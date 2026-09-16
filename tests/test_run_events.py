@@ -1,11 +1,19 @@
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
+from statesense.activity.reader import ActivityReader
+from statesense.clock import FrozenClock
+from statesense.config import load_config
+from statesense.notify.base import RecordingNotifier
+from statesense.scheduler import Scheduler
 from statesense.store.db import RUN_EVENT_KINDS, Store
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
+REPO = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture()
@@ -105,3 +113,152 @@ def test_v3_database_upgrades_in_place(tmp_path):
     assert row["state"] == "NORMAL"
     assert row["entries_minutes"] == 0.0
     s.close()
+
+
+# ── 调度器两处落行（V0.5 健康信号）──────────────────────────
+
+def _body(ent_minutes: float, total: float = 60.0, status: str = "ok") -> bytes:
+    return json.dumps(
+        {
+            "total_active_minutes": total,
+            "data_status": status,
+            "windows": [
+                {
+                    "app_name": "chrome.exe",
+                    "window_name": "哔哩哔哩",
+                    "browser_url": "https://www.bilibili.com/video/BV1",
+                    "minutes": ent_minutes,
+                }
+            ],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+@pytest.fixture()
+def config(tmp_path):
+    src = (REPO / "config" / "config.example.toml").read_text(encoding="utf-8")
+    # TOML 基本字符串里反斜杠是转义符，Windows 路径必须用正斜杠。
+    src = src.replace('path = "statesense.db"', f'path = "{(tmp_path / "s.db").as_posix()}"')
+    target = tmp_path / "config.toml"
+    target.write_text(src, encoding="utf-8")
+    return load_config(target)
+
+
+@pytest.fixture()
+def cfg_store(config):
+    s = Store(config.store_path)
+    s.migrate()
+    yield s
+    s.close()
+
+
+def _scheduler(config, store, bodies, clock) -> Scheduler:
+    queue = list(bodies)
+
+    def fake_get(url, headers, timeout):
+        return 200, (queue.pop(0) if queue else _body(0.0, 0.0))
+
+    return Scheduler(
+        config=config,
+        clock=clock,
+        reader=ActivityReader("http://localhost:3030", "k", 10.0, fake_get),
+        store=store,
+        notifier=RecordingNotifier(),
+    )
+
+
+def _run_events(store) -> list[sqlite3.Row]:
+    return store._conn.execute("SELECT * FROM run_events ORDER BY at").fetchall()
+
+
+def test_sleep_gap_lands_in_run_events(config, cfg_store):
+    """休眠跳过原本静默不落行，导致与「进程死了」在表里无法区分。"""
+    clock = FrozenClock(T0)
+    sch = _scheduler(config, cfg_store, [_body(45.0), _body(45.0)], clock)
+    sch.run_once()
+    clock.advance(minutes=200)
+    report = sch.run_once()
+    assert report.evaluation_id is None
+    rows = _run_events(cfg_store)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "sleep_gap"
+    assert float(rows[0]["detail"]) == pytest.approx(200.0)
+    # 有意跳过：确实没有 evaluations 行，但有 run_events 行 → 可辨。
+    assert (
+        cfg_store._conn.execute("SELECT COUNT(*) AS n FROM evaluations").fetchone()["n"] == 1
+    )
+
+
+def test_gap_within_limit_writes_no_run_event(config, cfg_store):
+    clock = FrozenClock(T0)
+    sch = _scheduler(config, cfg_store, [_body(45.0), _body(45.0)], clock)
+    sch.run_once()
+    clock.advance(minutes=110)
+    assert sch.run_once().evaluation_id is not None
+    assert _run_events(cfg_store) == []
+
+
+def test_tick_error_lands_in_run_events(config, cfg_store):
+    """run_forever 的 except 原本只写日志 —— 崩在日志里与进程死了长得一样。"""
+
+    class Exploding:
+        def read(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    sch = Scheduler(
+        config=config,
+        clock=FrozenClock(T0),
+        reader=Exploding(),
+        store=cfg_store,
+        notifier=RecordingNotifier(),
+    )
+    assert sch.run_tick_guarded(T0) is None
+    rows = _run_events(cfg_store)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "tick_error"
+    assert "RuntimeError" in rows[0]["detail"]
+    assert "boom" in rows[0]["detail"]
+
+
+def test_tick_error_detail_is_truncated(config, cfg_store):
+    """异常消息可能很长，落库前截断，避免一行撑爆表。"""
+
+    class Exploding:
+        def read(self, *args, **kwargs):
+            raise RuntimeError("x" * 5000)
+
+    sch = Scheduler(
+        config=config,
+        clock=FrozenClock(T0),
+        reader=Exploding(),
+        store=cfg_store,
+        notifier=RecordingNotifier(),
+    )
+    sch.run_tick_guarded(T0)
+    assert len(_run_events(cfg_store)[0]["detail"]) <= 200
+
+
+def test_tick_error_does_not_leak_into_interventions(config, cfg_store):
+    """运维信号与干预信号必须分离：告警绝不能占用 daily_cap 或 cooldown。"""
+
+    class Exploding:
+        def read(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    sch = Scheduler(
+        config=config,
+        clock=FrozenClock(T0),
+        reader=Exploding(),
+        store=cfg_store,
+        notifier=RecordingNotifier(),
+    )
+    sch.run_tick_guarded(T0)
+    assert cfg_store._conn.execute("SELECT COUNT(*) AS n FROM interventions").fetchone()["n"] == 0
+
+
+def test_successful_tick_writes_no_run_event(config, cfg_store):
+    """只有异常才落行 —— 正常存活由 evaluations.at 派生，同一事实不存两遍。"""
+    sch = _scheduler(config, cfg_store, [_body(5.0)], FrozenClock(T0))
+    assert sch.run_tick_guarded(T0) is not None
+    assert _run_events(cfg_store) == []
