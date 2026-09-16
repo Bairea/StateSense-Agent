@@ -121,3 +121,16 @@ def test_defaults_are_applied(tmp_path):
     assert cfg.outcome.delay_minutes == 10
     assert cfg.notify.channel == "foreground_popup"
     assert cfg.store_path == (tmp_path / "statesense.db").resolve()
+
+
+def test_base_url_can_be_overridden_by_env(tmp_path, monkeypatch):
+    """spec §12/§15.1：上游存在 fallback port，写死 3030 会打到另一个实例。"""
+    path = _write(tmp_path, MINIMAL)
+    monkeypatch.delenv("SCREENPIPE_LOCAL_API_URL", raising=False)
+    assert load_config(path).screenpipe.base_url == "http://localhost:3030"
+
+    monkeypatch.setenv("SCREENPIPE_LOCAL_API_URL", "http://127.0.0.1:3031")
+    assert load_config(path).screenpipe.base_url == "http://127.0.0.1:3031"
+
+    monkeypatch.setenv("SCREENPIPE_LOCAL_API_URL", "   ")
+    assert load_config(path).screenpipe.base_url == "http://localhost:3030"

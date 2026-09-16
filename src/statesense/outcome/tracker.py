@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 from statesense.activity.models import ActivitySnapshot
 from statesense.config import OutcomeConfig
 
 from .models import OutcomeVerdict
+
+log = logging.getLogger(__name__)
 
 NO_DATA = "no_data"
 
@@ -35,7 +38,17 @@ def evaluate(
     window_minutes = float(after.window_minutes)
 
     # 任一侧采集中断，或干预前根本没有被动消费，都不能当结论。
-    if not before.is_trustworthy or not after.is_trustworthy or ent_before <= 0:
+    if not before.is_trustworthy or not after.is_trustworthy:
+        return OutcomeVerdict(
+            outcome=NO_DATA,
+            ent_before=ent_before,
+            ent_after=ent_after,
+            after_window_minutes=window_minutes,
+        )
+
+    if ent_before <= 0:
+        # 干预的前提是 ent >= 40，走到这里说明判定或取数有问题，不能当成「干预成功」。
+        log.warning("干预前的被动消费为 0，回执不可信（判定与取数可能不一致）")
         return OutcomeVerdict(
             outcome=NO_DATA,
             ent_before=ent_before,

@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import sys
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -21,6 +22,12 @@ from statesense.store.db import Store
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="statesense", description="StateSense-Agent V0")
     parser.add_argument("--config", type=Path, default=Path("config/config.toml"))
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="覆盖配置里的 store.path（相对当前工作目录解析）",
+    )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--check", action="store_true", help="校验配置与 Screenpipe 连通性后退出")
     group.add_argument("--once", action="store_true", help="跑一轮评估")
@@ -103,6 +110,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         config = load_config(args.config)
+        if args.db is not None:
+            config = replace(config, store_path=args.db.resolve())
     except ConfigError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2

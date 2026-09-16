@@ -225,3 +225,34 @@ def test_late_night_wording_is_used_at_night(config, store):
     row = store.fetch_evaluation(report.evaluation_id)
     assert row["late_night"] == 1
     assert row["state"] == "PASSIVE_CONSUMPTION"
+
+
+# ── 休眠/唤醒 ────────────────────────────────────────────────
+
+def test_long_gap_skips_evaluation_instead_of_concluding_from_stale_window(config, store):
+    """醒来后第一轮的窗口横跨没采集的时间，直接用会得出「几乎没活动」的假结论。"""
+    clock = FrozenClock(T0)
+    sch = _scheduler(config, store, [_body(45.0), _body(45.0)], clock)
+    sch.run_once()
+    clock.advance(minutes=200)  # > 2 × 60 分钟
+    report = sch.run_once()
+    assert report.evaluation_id is None
+    assert "空档" in report.note
+    assert store._conn.execute("SELECT COUNT(*) AS n FROM evaluations").fetchone()["n"] == 1
+
+
+def test_gap_within_limit_still_evaluates(config, store):
+    clock = FrozenClock(T0)
+    sch = _scheduler(config, store, [_body(45.0), _body(45.0)], clock)
+    sch.run_once()
+    clock.advance(minutes=110)  # < 2 × 60 分钟
+    assert sch.run_once().evaluation_id is not None
+
+
+# ── CLI ─────────────────────────────────────────────────────
+
+def test_db_option_is_accepted():
+    from statesense.__main__ import build_parser
+
+    args = build_parser().parse_args(["--check", "--db", "custom.db"])
+    assert args.db == Path("custom.db")

@@ -51,6 +51,7 @@ class Scheduler:
         self._store = store
         self._notifier = notifier
         self._wording = wording or TemplateWording()
+        self._last_evaluation_at: datetime | None = None
 
     # ── 对外 ────────────────────────────────────────────────
 
@@ -95,6 +96,22 @@ class Scheduler:
 
     def _evaluate_tick(self, now: datetime, closed: int) -> TickReport:
         window = self._config.schedule.window_minutes
+
+        # 休眠/唤醒检测：醒来后第一轮拿到的窗口会横跨一段根本没采集的时间，
+        # 直接用会得出「这段时间几乎没活动」的假结论。
+        gap_limit = timedelta(minutes=window * 2)
+        if self._last_evaluation_at is not None:
+            gap = now - self._last_evaluation_at
+            if gap > gap_limit:
+                self._last_evaluation_at = now
+                log.warning(
+                    "检测到 %.0f 分钟空档（休眠/唤醒），超过 %d 分钟上限，跳过本轮评估",
+                    gap.total_seconds() / 60,
+                    window * 2,
+                )
+                return TickReport(None, None, False, closed, f"空档 {gap} 超过 2× 窗口，跳过")
+        self._last_evaluation_at = now
+
         snapshot = self._reader.read(now - timedelta(minutes=window), now, window, now)
         verdict = classify(snapshot, self._config.taxonomy, self._config.thresholds)
 

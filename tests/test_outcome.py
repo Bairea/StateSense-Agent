@@ -78,6 +78,15 @@ def test_zero_before_is_no_data_not_disengaged():
     assert evaluate(_snap(0.0), _snap(0.0), _ent, CFG).outcome == "no_data"
 
 
+def test_zero_before_also_warns(caplog):
+    """spec §9.2 要求这种情况记一条内部告警 —— 它意味着判定与取数不一致。"""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="statesense.outcome.tracker"):
+        evaluate(_snap(0.0), _snap(0.0), _ent, CFG)
+    assert "回执不可信" in caplog.text
+
+
 def test_raw_values_are_recorded_even_when_no_data():
     verdict = evaluate(_snap(45.0), _snap(12.0, data_status="unreachable"), _ent, CFG)
     assert verdict.ent_before == 45.0

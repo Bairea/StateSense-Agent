@@ -126,6 +126,11 @@ def load_config(path: Path) -> Config:
         raw = tomllib.load(fh)
 
     screenpipe = ScreenpipeConfig(**raw.get("screenpipe", {}))
+    # spec §12/§15.1：base_url 可由 SCREENPIPE_LOCAL_API_URL 覆盖。
+    # 上游明确存在 fallback port 与开发态实例，写死 3030 会打到另一个实例。
+    env_base_url = os.environ.get("SCREENPIPE_LOCAL_API_URL", "").strip()
+    if env_base_url:
+        screenpipe = replace(screenpipe, base_url=env_base_url)
 
     schedule = ScheduleConfig(**raw.get("schedule", {}))
     if schedule.window_minutes <= 0 or schedule.evaluate_every_minutes <= 0:
