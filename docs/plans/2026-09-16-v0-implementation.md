@@ -10,6 +10,15 @@
 
 **Spec:** `docs/specs/2026-09-16-v0-state-intervention-design.md`（已合并进 `main`）
 
+## 修订记录
+
+| 日期 | 改动 | 影响的任务 |
+|---|---|---|
+| 2026-09-16 | **投递通道从 Windows Toast 改为原生前台弹窗**（真机实测 Toast 全链路失效），并因此新增按钮回执 | Task 1（`NotifyConfig`）、Task 5（schema v2 增加 `user_response`）、Task 8（整节重写，见「Task 8 修订版」）、Task 10（`insert_intervention` 要传 `user_response`） |
+| 2026-09-16 | Task 1 的提交额外纳入 `uv.lock`（依赖可复现） | Task 1 |
+| 2026-09-16 | Task 2 的 `data_status` 保持封闭枚举 `unreachable`，失败原因改走日志（原计划写的是 `unreachable: <原因>`，与测试断言矛盾，以 spec §5.1 为准） | Task 2 |
+| 2026-09-16 | Task 10 的 `check()` 存在缺陷：原计划把 `SystemClock().now()` 同时当作 start 与 end，会读一个零长度窗口 | Task 10 |
+
 ## Global Constraints
 
 每个任务都隐含包含本节。
@@ -2458,7 +2467,17 @@ git commit -m "feat(gate): 模板文案渲染，预留 Wording 接口给后续 L
 
 ---
 
-## Task 8: Notifier（Windows Toast）
+<details>
+<summary>⚠️ <b>Task 8 旧版（Windows Toast）—— 已作废，仅供追溯</b></summary>
+
+> 施行到 Task 8 时，真机实测推翻了 Toast 方案的**每一条**前提：
+> 本机全局通知开关 `ToastEnabled=0`（Toast 被系统整体丢弃，而 `show()` 仍返回成功）、
+> Windows 在全屏应用下抑制通知、Win10 需要已注册的 AUMID 而 winotify 并不自动注册、
+> winotify 用 `Popen(..., stdout=DEVNULL, stderr=DEVNULL)` 把失败信息彻底丢弃。
+>
+> 已改为**原生前台弹窗**。见下方「Task 8 修订版」与 spec §8。
+
+### （旧）Notifier（Windows Toast）
 
 **Files:**
 - Create: `src/statesense/notify/__init__.py`, `src/statesense/notify/base.py`, `src/statesense/notify/windows_toast.py`
@@ -2709,6 +2728,77 @@ Expected: 右下角出现通知，且输出 `DeliveryResult(status='delivered', 
 git add src/statesense/notify tests/test_notifier.py docs/specs/2026-09-16-v0-state-intervention-design.md config/config.example.toml
 git commit -m "feat(notify): Windows Toast 投递（结构化失败）并回填全屏实测结果"
 ```
+
+---
+
+</details>
+
+---
+
+## Task 8 修订版: Notifier（原生前台弹窗）—— 已实施
+
+> 本节记录**实际落地**的版本。实施结果见 commit `220bcea`。
+
+**Files:**
+- Create: `src/statesense/notify/__init__.py`
+- Create: `src/statesense/notify/base.py`
+- Create: `src/statesense/notify/win32_popup.py`
+- Create: `src/statesense/notify/foreground_popup.py`
+- Delete: `src/statesense/notify/windows_toast.py`
+- Test: `tests/test_notifier.py`
+
+**Interfaces:**
+- Consumes: `NotifyConfig`（`channel` / `answer_timeout_seconds` / `foreground_timeout_seconds`）、`Clock`
+- Produces:
+  - `DeliveryResult(status, channel, error, delivered_at, user_response=None)`，类方法 `delivered(channel, at, user_response=None)` / `failed(channel, error)`，属性 `stored_status`
+  - 常量 `RESPONSE_ACCEPTED = "accepted"`、`RESPONSE_DECLINED = "declined"`
+  - `Notifier` 协议；`RecordingNotifier(response=None)`
+  - `Win32Popup()`：`show(title, body) -> int`、`find(title) -> int`、`force_front(title, timeout) -> bool`、`close(title) -> bool`、`beep()`
+  - `ForegroundPopupNotifier(config, clock, popup=None)`，方法 `notify(title, body) -> DeliveryResult`
+
+**关键实现点：**
+
+1. **弹窗必须在独立线程创建** —— `MessageBoxW` 阻塞。
+2. **必须显式抢前台** —— 只加 `MB_TOPMOST | MB_SETFOREGROUND` 时，后台进程会被「前台锁定」挡住，窗口被创建却压在全屏应用后面（只闻其声、不见其形）。实测矩阵：
+
+   | 场景 | 结果 |
+   |---|---|
+   | 窗口模式 | 可见 |
+   | 全屏模式，仅 `MB_TOPMOST` | **不可见** |
+   | 全屏模式，加显式抢前台 | **可见**（`attached=True setforeground=True`） |
+
+   抢前台序列：`FindWindowW` → `ShowWindow(SW_SHOW)` → `SetWindowPos(HWND_TOPMOST)`
+   → `AttachThreadInput` → `BringWindowToTop` → `SetForegroundWindow` → `FlashWindow`。
+
+3. **ctypes 必须声明 `restype`** —— 不声明的话 64 位下 `HWND` 会被截断成 `int`。
+
+4. **一次只留一个窗口** —— 显示前先 `close(title)` 清掉同标题残留。
+
+5. **超时关闭后回执必须是 `None`** —— 程序关闭对话框后返回的按钮 id 不是用户的意思。
+   这是实施中真实踩到的缺陷（第一版把「程序关闭」记成了用户点了「否」）。
+
+6. **关闭顺序**（每试一种都确认窗口是否真的消失）：
+   `WM_COMMAND(IDNO)` → `WM_COMMAND(IDCANCEL)` → `WM_CLOSE` → `WM_SYSCOMMAND(SC_CLOSE)`。
+   只用 `WM_CLOSE` 不够：`MB_YESNO` 没有取消按钮时关闭按钮会被禁用。
+
+**真机验证结果**（2026-09-16）：
+
+```
+弹窗 1（点【是】）  status=delivered user_response=accepted
+弹窗 2（不点）      status=delivered user_response=None 耗时=10.4s 窗口句柄=0
+```
+
+`窗口句柄=0` 是关键证据：程序化关闭确实生效，而不是靠进程退出把窗口带走。
+
+**连带改动：**
+- `pyproject.toml`：运行期依赖降为 `[]`（去掉 winotify）
+- `config.py`：`NotifyConfig` 改为 `channel="foreground_popup"` / `answer_timeout_seconds=180` / `foreground_timeout_seconds=15`
+- `store/schema.sql`：`interventions` 增加 `user_response TEXT`（schema v2）
+- `store/db.py`：`SCHEMA_VERSION = 2`，`_apply_incremental_migrations()` 给 v1 老库补列
+- `store/db.py`：`insert_intervention(..., user_response=None)`，新增 `fetch_intervention()`
+
+**测试覆盖**（`tests/test_notifier.py`，13 项）：按钮映射（`IDYES`/`IDNO`/未知值不猜）、
+残留清理、beep 与抢前台被调用、超时关闭且回执为空、`show()` 抛异常变成结构化失败。
 
 ---
 

@@ -49,7 +49,6 @@ V0 只验证一个问题：
 - 不做跨设备、不做云同步、不做多用户。
 - 不消费屏幕文本（OCR / 聊天记录 / 邮件正文 / 密码页面）。
 - 不替换或重造 Screenpipe 的采集能力。
-- 不做用户反馈按钮（回执走行为推断，见 §9）。
 
 ---
 
@@ -286,39 +285,94 @@ V0 实现 `TemplateWording`，输出形如：
 ```python
 @dataclass(frozen=True)
 class DeliveryResult:
-    status: str          # "delivered" | "failed"
-    channel: str         # "windows_toast"
+    status: str                        # "delivered" | "failed"
+    channel: str                       # "foreground_popup"
     error: str | None
     delivered_at: datetime | None
+    user_response: str | None = None   # "accepted" | "declined" | None（没理会/超时）
 ```
 
 失败必须返回结构化错误，**不许静默吞掉**。
 
-### 8.2 Windows 运行时约束（已实测）
+### 8.2 通道选择：前台弹窗，不是 Windows Toast
 
-| 事实 | 影响 |
+原始设计用 Windows Toast。2026-09-16 的真机实测推翻了它的**每一条**前提：
+
+| 实测事实 | 后果 |
 |---|---|
-| 本机为 **Windows 10 家庭中文版 Build 19045（22H2）** | 不是 Win11 |
-| Win10 的 Toast **必须绑定已注册的 AUMID** | 否则投递静默失败。需要一条带 `AppUserModelID` 的开始菜单快捷方式 |
-| 系统内已有 `win10toast 0.9` | **不使用**。它是 2019 年的库，走托盘气泡而非操作中心 Toast |
-| **Windows 在「全屏应用」下默认抑制通知** | ⚠️ **最高风险**：本项目核心场景正是全屏刷视频，Toast 可能恰在最该生效时被吞掉 |
+| `HKCU\...\PushNotifications\ToastEnabled = 0` | 全局通知开关是关的，Toast 被系统整体丢弃。而 `show()` 仍返回成功 —— 典型的**静默失败** |
+| Windows 在「全屏应用」下抑制通知 | 本项目核心场景正是全屏刷视频，Toast 恰在最该生效时失效 |
+| Win10 的 Toast 需要已注册的 AUMID | `winotify` **并不**自动注册；自定义 `app_id` 的 Toast 不会显示 |
+| `winotify` 用 `Popen(..., stdout=DEVNULL, stderr=DEVNULL)` | 失败信息被彻底丢弃，这正是「API 说成功、屏幕上什么都没有」的来源 |
 
-选用 `winotify`（纯 Python，自动注册带 AUMID 的开始菜单快捷方式，支持 Win10）。
+改用**原生 MessageBox + 显式抢前台**：
 
-### 8.3 降级链
-
-```
-① 主通道  Windows Toast（winotify + 注册 AUMID）
-② 失败    delivery_status = "failed:<原因>"，落一条 pending，下个 tick 重试一次
-③ 兜底    配置开关（V0 默认关）：置顶无边框窗口，N 秒后自动消失
-          —— 唯一不被全屏抑制的方案，代价是更打断
+```python
+flags = MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL
 ```
 
-③ 之所以在 V0 就留出：一旦在全屏状态下连续错过几次提醒，V0 的结论就会失真。**实现前必须实测全屏场景下 Toast 是否可达**，并把实测结果回填本节。
+```
+弹窗在独立线程里创建（MessageBoxW 阻塞，不能挡住调度器）
+        ↓
+主流程轮询 FindWindowW(title) 拿到对话框句柄
+        ↓
+AttachThreadInput → BringWindowToTop → SetForegroundWindow
+        ↓
+SetWindowPos(HWND_TOPMOST) + FlashWindow
+        ↓
+winsound.MessageBeep
+```
+
+**为什么必须显式抢前台**：Windows 有「前台锁定」——后台进程不允许抢前台窗口。只加 `MB_TOPMOST | MB_SETFOREGROUND` 时，窗口会被创建却压在全屏应用后面（只闻其声、不见其形）。
+
+实测矩阵（2026-09-16，本机 Windows 10 19045）：
+
+| 场景 | 结果 |
+|---|---|
+| 窗口模式，仅 `MB_TOPMOST` | 可见 |
+| **全屏模式，仅 `MB_TOPMOST`** | **不可见**，只听到提示音 |
+| **全屏模式，加显式抢前台** | **可见**（`attached=True setforeground=True`） |
+
+收益：运行期第三方依赖降为 **0 个**（只用 `ctypes` 标准库）。
+
+代价：模态窗口会抢焦点、需要一次点击。对「把你从被动消费里拽出来」这个目的，这恰恰是想要的 —— 而且这一次点击顺带给出了显式回执（见 §9）。
+
+### 8.3 一次只留一个窗口
+
+- 显示前先关掉同标题的残留（用户没理会时它会一直挂着）
+- 用户完全不理会时，`answer_timeout_seconds`（默认 180s）后由程序自动关闭
+
+关闭顺序如下，每试一种都要确认窗口是否**真的**消失：
+
+```
+WM_COMMAND(IDNO) → WM_COMMAND(IDCANCEL) → WM_CLOSE → WM_SYSCOMMAND(SC_CLOSE)
+```
+
+只用 `WM_CLOSE` 不够：`MB_YESNO` 没有取消按钮时，关闭按钮会被禁用。
+
+> **超时被程序关闭时，`user_response` 必须是 `None`。**
+> 对话框被程序关闭后返回的按钮 id 不是用户的意思，绝不能当成回执。
+> 这是实测中真实踩到的缺陷（第一版把「程序关闭」记成了用户点了「否」）。
 
 ---
 
-## 9. 行为回执（OutcomeTracker）
+## 9. 回执：显式按钮 + 行为推断（双轨）
+
+### 9.1 显式回执（弹窗按钮）
+
+弹窗带【是】【否】两个按钮，点击结果直接入库到 `interventions.user_response`：
+
+| 值 | 含义 |
+|---|---|
+| `accepted` | 用户点了「是」（愿意去做那个极小动作） |
+| `declined` | 用户点了「否」 |
+| `NULL` | 没理会 / 超时被程序关闭 |
+
+**为什么后来加上了按钮**：原设计不做按钮，理由是「按钮需要注册 AUMID + COM 激活器，成本高」，因而选了纯行为推断。改用前台弹窗后**这个成本消失了**（模态对话框天然能拿到点击结果），于是原取舍的前提不再成立。
+
+按钮回执直接补上了行为推断最大的漏洞（见 §16 风险 6）。
+
+### 9.2 行为回执（OutcomeTracker）
 
 干预发生在 `t`，在 `t + delay_minutes`（默认 10）复查：
 
@@ -336,11 +390,22 @@ outcome = disengaged   entAfter < 0.5 × entBefore
 
 边界：`entBefore == 0` 时不可能发生（干预的前提就是 `ent ≥ 40`），若出现则记 `no_data` 并记一条内部告警。
 
+### 9.3 两轨的分工
+
+行为回执衡量**实际发生了什么**，按钮回执衡量**用户当时怎么想**。两者不一致本身就是有价值的信息：
+
+| `user_response` | `outcome` | 读法 |
+|---|---|---|
+| `accepted` | `disengaged` | 提醒有效，用户配合 |
+| `accepted` | `continued` | 用户想停但停不下来 —— 要调的是**动作门槛**（V1 改动作池） |
+| `declined` | `continued` | 提醒的时机或理由不被认可 —— 要调的是**判定阈值** |
+| `NULL` | 任意 | 用户不在或没看到，**这条样本不能用来评价干预效果** |
+
 ---
 
 ## 10. 数据模型
 
-SQLite，三张表：
+SQLite，四张表（schema 版本由 `PRAGMA user_version` 管理，当前 v2）。
 
 ```sql
 -- 每次评估都写：调阈值、复盘全靠它
@@ -370,7 +435,8 @@ CREATE TABLE interventions (
   action_id TEXT NOT NULL,
   action_text TEXT NOT NULL,        -- 实际投递的原文
   delivery_status TEXT NOT NULL,    -- delivered | failed:<原因>
-  outcome_due_at TEXT NOT NULL
+  outcome_due_at TEXT NOT NULL,
+  user_response TEXT                -- accepted | declined | NULL（没理会/超时）
 );
 
 CREATE TABLE outcomes (
@@ -382,13 +448,23 @@ CREATE TABLE outcomes (
   after_window_minutes REAL NOT NULL
 );
 
+-- kv：少量运行期状态（动作池轮转游标等）
+CREATE TABLE kv (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE INDEX idx_evaluations_at ON evaluations(at);
 CREATE INDEX idx_interventions_due ON interventions(outcome_due_at);
+CREATE INDEX idx_interventions_at ON interventions(at);
 ```
 
-**对 `ref1.md` 的一处有意偏离**：`ref1.md` 说 DB 存 `state_transitions`。本规格不单独建这张表——它完全由 `evaluations` 派生（`state` 与 `prev_state` 不同即为一次迁移）。同一事实存两遍迟早会不一致。
+**对 `ref1.md` 的两处有意偏离**：
 
-schema 版本用 `PRAGMA user_version` 管理，启动时做幂等迁移。
+1. `ref1.md` 说 DB 存 `state_transitions`。本规格不单独建这张表——它完全由 `evaluations` 派生（`state` 与 `prev_state` 不同即为一次迁移）。同一事实存两遍迟早会不一致。
+2. 增加了 `kv` 表，用于存放动作池轮转游标这类跨 tick 的运行期状态。轮转需要记住「上次用了哪个动作」，而它不属于上面任何一张事实表。
+
+**迁移**：`migrate()` 必须幂等。v1 → v2 的迁移是给 `interventions` 补 `user_response` 列（`ALTER TABLE ... ADD COLUMN`），老库要能原地升级。
 
 ---
 
@@ -400,7 +476,9 @@ schema 版本用 `PRAGMA user_version` 管理，启动时做幂等迁移。
 | token 失效（401 / 403） | 启动时校验一次；运行中遇到则记录并跳过本轮，不重试风暴 |
 | `data_status != ok` | 记 `skipped`，**不下任何结论** |
 | 休眠 / 唤醒 | 用 `captured_at` 检测 gap；超过 2× 窗口长度则跳过本轮并重置连续段状态（V1 用） |
-| Toast 投递失败 | `delivery_status = "failed:<原因>"`，**仍然落 `interventions` 行**（否则回执会错配），下个 tick 重试一次 |
+| 弹窗投递失败 | `delivery_status = "failed:<原因>"`，**仍然落 `interventions` 行**（否则回执会错配），下个 tick 重试一次 |
+| 弹窗探不到句柄（抢前台超时） | 仍视为已投递（窗口确实被创建了），但记一条 `log.warning`。这通常意味着前台锁定被更强的东西占住 |
+| 弹窗未能自动关闭 | 记 `log.warning`。它会在下一次干预前被「清理残留」重试关闭 |
 | 回执到期但无数据 | `outcome = 'no_data'`，不猜 |
 | 配置非法 | **启动时 fail fast**，不要跑到半夜才发现阈值填错。特别是 `gate.ratio_min` 缺失时必须报错，绝不静默降级为 0 |
 
@@ -442,11 +520,9 @@ disengaged_ratio = 0.5
 continued_ratio  = 0.8
 
 [notify]
-channel                  = "windows_toast"
-app_id                   = "StateSense.Agent"
-toast_duration           = "short"   # short | long
-fallback_topmost_window  = false
-fallback_window_seconds  = 8
+channel                   = "foreground_popup"
+answer_timeout_seconds    = 180   # 用户不理会的自动关闭时限
+foreground_timeout_seconds = 15   # 轮询句柄、抢前台的最长等待
 
 [store]
 # 相对 config.toml 所在目录解析；可用 --db 命令行参数覆盖
@@ -524,16 +600,19 @@ work          = [ /* §5.2 清单 */ ]
 
 ## 16. 已知风险与未决问题
 
-| # | 风险 / 问题 | 影响 | 处理 |
+| # | 风险 / 问题 | 影响 | 状态 / 处理 |
 |---|---|---|---|
-| 1 | **全屏下通知被抑制** | V0 可能在最该生效时失效，结论失真 | 实现前必须实测；兜底方案见 §8.3 |
-| 2 | Win10 需要 AUMID 才能投递 Toast | 投递静默失败 | 用 `winotify` 自动注册；实现前实测 |
+| 1 | ~~全屏下通知被抑制~~ | — | ✅ **已解决**。改用前台弹窗 + 显式抢前台，全屏实测可见（§8.2） |
+| 2 | ~~Win10 需要 AUMID 才能投递 Toast~~ | — | ✅ **已消除**。不再使用 Toast，无 AUMID 依赖；运行期第三方依赖降为 0 |
 | 3 | `browser_url` 稀疏 | 域名级分类受限 | 已通过 `title` + `app` 匹配缓解 |
 | 4 | `GRAY` 档归属未定（知乎等） | 可能低估被动消费 | 先单独统计，用 V0 数据决定 |
 | 5 | `WORK` 分类准确性未验证 | 影响 ratio 解释（#3 闸门未启用，影响有限） | V0 不依赖它做判定 |
-| 6 | 行为回执把「离开电脑」也算作 `disengaged` | 高估干预效果 | V0 记录原始值，标签口径后续再校准；可对比 `total_active_minutes` 变化 |
-| 7 | `gate.ratio_min` 未定 | 闸门不生效 | **待项目所有者填写** |
+| 6 | 行为回执把「离开电脑」也算作 `disengaged` | 高估干预效果 | ⚠️ **已缓解**。按钮回执可区分「用户配合」与「用户离开」；分析时应先按 `user_response` 分层 |
+| 7 | `gate.ratio_min` 未定 | 闸门不生效 | ✅ **已定：0.75** |
 | 8 | 凌晨干预的文案与强度未定 | `late_night` 只是标记，尚未影响行为 | V1 处理 |
+| 9 | **弹窗是模态的，会抢焦点** | 比 Toast 更打断；若频繁触发会显著影响工作 | 由 `cooldown_minutes`(30) 与 `daily_cap`(8) 约束；V0 观察实际打扰感 |
+| 10 | **弹窗期间调度器会阻塞** | `notify()` 最多阻塞 `answer_timeout_seconds`(180s)，期间不评估、不查回执 | 可接受（tick 间隔 5 分钟）；若实际影响明显，改为异步 + 回调 |
+| 11 | **`ToastEnabled` 曾被关闭** | 说明该用户对通知打扰敏感 | 已尊重用户选择改用主动弹窗；若后续觉得被打扰，优先调 `daily_cap` 而非换通道 |
 
 ---
 
@@ -541,10 +620,12 @@ work          = [ /* §5.2 清单 */ ]
 
 | 项 | `ref1.md` | 本规格 | 理由 |
 |---|---|---|---|
-| V0 形态 | Screenpipe Pipe + LLM | 独立 Python 服务 | 已确定 Windows Toast 与行为回执为必需项，这两者把 V0 从「一个 prompt」变成「一个真程序」；Pipe 形态下发不了 Toast、回执状态也没处放 |
+| V0 形态 | Screenpipe Pipe + LLM | 独立 Python 服务 | 已确定投递与行为回执为必需项，这两者把 V0 从「一个 prompt」变成「一个真程序」；Pipe 形态下发不了通知、回执状态也没处放 |
+| 投递通道 | 「Windows / Screenpipe notification」 | 原生前台弹窗 | Toast 在本机实测**全部失败**（全局开关关闭 + 全屏抑制 + AUMID 未注册 + winotify 丢弃错误）；弹窗绕开通知平台（§8.2） |
 | `LATE_NIGHT` | 与其他状态并列 | 正交布尔标记 | 两个事实独立，压成一维必然丢信息（§5.4） |
-| 占比条件 | 隐含在 `40/50`、`65/75` 里 | 显式化为可插拔闸门，阈值待填 | 判定与是否介入应当分离（§6） |
+| 占比条件 | 隐含在 `40/50`、`65/75` 里 | 显式化为可插拔闸门，取 0.75 | 判定与是否介入应当分离（§6） |
 | `state_transitions` 表 | 单独存 | 由 `evaluations` 派生 | 避免同一事实存两遍（§10） |
+| 用户回执 | 未提按钮 | 显式按钮 + 行为推断双轨 | 改用弹窗后按钮成本消失，且能补上行为推断的歧义（§9.1） |
 | LLM | V0 就用于 Pipe | V0 不用，预留 `Wording` 接口 | §3 非目标 |
 | CLI 用法 | 安装 / 诊断 / 探索 | 同 | 一致 |
 | 读数据走 REST API | 是 | 是 | 一致 |
@@ -584,8 +665,9 @@ src/statesense/
 │  ├─ actions.py          # 动作池 + 轮转
 │  └─ wording.py          # Wording 接口 + 模板实现
 ├─ notify/
-│  ├─ base.py             # Notifier 协议
-│  └─ windows_toast.py    # winotify 实现
+│  ├─ base.py             # Notifier 协议 + DeliveryResult
+│  ├─ win32_popup.py      # ctypes 封装（MessageBox / 抢前台 / 关窗）
+│  └─ foreground_popup.py # 投递实现（含超时与回执映射）
 ├─ outcome/
 │  └─ tracker.py
 ├─ store/
