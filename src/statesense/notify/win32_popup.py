@@ -12,10 +12,18 @@ MessageBox 完全绕开通知平台，不受这两项影响。
 
 from __future__ import annotations
 
-import ctypes
+import sys
 import time
-import winsound
 from ctypes import wintypes
+
+if sys.platform != "win32":
+    raise ImportError(
+        "win32_popup 只在 Windows 上可用。本项目 V0 的投递通道依赖原生 MessageBox；"
+        "换平台需要先换 Notifier 实现（见 spec §8）。"
+    )
+
+import ctypes
+import winsound
 
 # MessageBox 按钮与样式
 MB_YESNO = 0x00000004
@@ -25,7 +33,6 @@ MB_SETFOREGROUND = 0x00010000
 MB_SYSTEMMODAL = 0x00001000
 
 # MessageBox 返回值
-IDOK = 1
 IDCANCEL = 2
 IDYES = 6
 IDNO = 7
@@ -42,7 +49,6 @@ WM_CLOSE = 0x0010
 WM_COMMAND = 0x0111
 WM_SYSCOMMAND = 0x0112
 SC_CLOSE = 0xF060
-BN_CLICKED = 0
 
 POLL_INTERVAL_SECONDS = 0.2
 CLOSE_ATTEMPT_WAIT_SECONDS = 0.5

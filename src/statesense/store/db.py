@@ -8,20 +8,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from statesense._time import iso as _iso
+from statesense._time import parse_iso as _parse
 from statesense.intervention.models import Decision
 from statesense.outcome.models import OutcomeVerdict
 from statesense.state.models import StateVerdict
 
 SCHEMA_VERSION = 3
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-
-
-def _iso(moment: datetime) -> str:
-    return moment.astimezone(tz=None).isoformat()
-
-
-def _parse(value: str | None) -> datetime | None:
-    return datetime.fromisoformat(value) if value else None
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:

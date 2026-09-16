@@ -12,7 +12,7 @@ from datetime import datetime
 from statesense.activity.models import ActivitySnapshot
 from statesense.config import TaxonomyConfig, ThresholdConfig
 from statesense.state.models import State, StateVerdict
-from statesense.state.taxonomy import Category, bucket_minutes
+from statesense.state.taxonomy import Category, bucket_minutes, entertainment_minutes
 
 
 def is_late_night(
@@ -33,7 +33,7 @@ def classify(
     thresholds: ThresholdConfig,
 ) -> StateVerdict:
     buckets = bucket_minutes(snapshot.entries, taxonomy)
-    ent = _round2(buckets[Category.ENTERTAINMENT])
+    ent = entertainment_minutes(snapshot.entries, taxonomy)
     gray = _round2(buckets[Category.GRAY])
     work = _round2(buckets[Category.WORK])
     total = _round2(snapshot.total_active_minutes)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Protocol
+
+from statesense.clock import Clock, SystemClock
 
 #: 用户在弹窗上点了「是」
 RESPONSE_ACCEPTED = "accepted"
@@ -56,12 +58,13 @@ class RecordingNotifier:
 
     channel = "recording"
 
-    def __init__(self, response: str | None = None) -> None:
+    def __init__(self, response: str | None = None, clock: Clock | None = None) -> None:
         self.sent: list[tuple[str, str]] = []
         self._response = response
+        self._clock = clock or SystemClock()
 
     def notify(self, title: str, body: str) -> DeliveryResult:
         self.sent.append((title, body))
         return DeliveryResult.delivered(
-            self.channel, datetime.now(timezone.utc), user_response=self._response
+            self.channel, self._clock.now(), user_response=self._response
         )

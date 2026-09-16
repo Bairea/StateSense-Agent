@@ -18,7 +18,7 @@ from statesense.intervention.wording import TemplateWording, Wording
 from statesense.notify.base import Notifier
 from statesense.outcome.tracker import evaluate as evaluate_outcome
 from statesense.state.engine import classify
-from statesense.state.taxonomy import Category, bucket_minutes
+from statesense.state.taxonomy import entertainment_minutes
 from statesense.store.db import Store
 
 log = logging.getLogger(__name__)
@@ -56,9 +56,8 @@ class Scheduler:
     # ── 对外 ────────────────────────────────────────────────
 
     def ent_minutes(self, snapshot: ActivitySnapshot) -> float:
-        """被动消费分钟数。状态判定与回执比较必须用同一个口径。"""
-        buckets = bucket_minutes(snapshot.entries, self._config.taxonomy)
-        return round(buckets[Category.ENTERTAINMENT], 2)
+        """被动消费分钟数。委托给 taxonomy —— 与状态判定共用同一口径，不另算一份。"""
+        return entertainment_minutes(snapshot.entries, self._config.taxonomy)
 
     def run_once(self) -> TickReport:
         now = self._clock.now()

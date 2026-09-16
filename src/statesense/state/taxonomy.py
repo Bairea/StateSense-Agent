@@ -43,3 +43,13 @@ def bucket_minutes(entries: Iterable[Entry], taxonomy: TaxonomyConfig) -> dict[C
     for entry in entries:
         buckets[classify(entry, taxonomy)] += entry.minutes
     return buckets
+
+
+def entertainment_minutes(entries: Iterable[Entry], taxonomy: TaxonomyConfig) -> float:
+    """被动消费分钟数。
+
+    状态判定与行为回执必须共用这一个口径 —— 审查发现两处各写了一份
+    `round(bucket_minutes(...)[ENTERTAINMENT], 2)`，一旦漂移，
+    「干预前 vs 干预后」就不是同一个量了，回执会失真。
+    """
+    return round(bucket_minutes(entries, taxonomy)[Category.ENTERTAINMENT], 2)

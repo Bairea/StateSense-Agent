@@ -10,6 +10,8 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from datetime import datetime
 
+from statesense._time import iso
+
 from .models import (
     KNOWN_STATUSES,
     UNREACHABLE,
@@ -39,10 +41,6 @@ def urllib_get(url: str, headers: Mapping[str, str], timeout: float) -> tuple[in
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
-
-
-def _iso(moment: datetime) -> str:
-    return moment.astimezone(tz=None).isoformat(timespec="seconds")
 
 
 def _num(value: object) -> float:
@@ -78,7 +76,11 @@ class ActivityReader:
         window_minutes: int,
         captured_at: datetime,
     ) -> ActivitySnapshot:
-        params = {"start_time": _iso(start), "end_time": _iso(end), **_SKIP_TEXT_PARAMS}
+        params = {
+            "start_time": iso(start, seconds_only=True),
+            "end_time": iso(end, seconds_only=True),
+            **_SKIP_TEXT_PARAMS,
+        }
         url = f"{self._base}/activity-summary?{urllib.parse.urlencode(params)}"
         headers = {
             "Authorization": f"Bearer {self._api_key}",

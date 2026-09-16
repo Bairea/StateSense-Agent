@@ -11,7 +11,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from statesense.activity.reader import ActivityReader
-from statesense.clock import SystemClock
+from statesense.clock import Clock, SystemClock
 from statesense.config import Config, ConfigError, load_config
 from statesense.notify.base import Notifier, RecordingNotifier
 from statesense.notify.foreground_popup import ForegroundPopupNotifier
@@ -47,7 +47,7 @@ def resolve_api_key(config: Config) -> str:
     return key
 
 
-def make_reader(config: Config, clock: SystemClock) -> ActivityReader:
+def make_reader(config: Config) -> ActivityReader:
     return ActivityReader(
         base_url=config.screenpipe.base_url,
         api_key=resolve_api_key(config),
@@ -55,21 +55,21 @@ def make_reader(config: Config, clock: SystemClock) -> ActivityReader:
     )
 
 
-def make_notifier(config: Config, dry_run: bool) -> Notifier:
+def make_notifier(config: Config, dry_run: bool, clock: Clock) -> Notifier:
     if dry_run:
-        return RecordingNotifier()
+        return RecordingNotifier(clock=clock)
     if config.notify.channel != "foreground_popup":
         raise ConfigError(f"不支持的 notify.channel: {config.notify.channel}")
-    return ForegroundPopupNotifier(config.notify, SystemClock())
+    return ForegroundPopupNotifier(config.notify, clock)
 
 
-def build_scheduler(config: Config, notifier: Notifier) -> Scheduler:
+def build_scheduler(config: Config, notifier: Notifier, clock: Clock) -> Scheduler:
     store = Store(config.store_path)
     store.migrate()
     return Scheduler(
         config=config,
-        clock=SystemClock(),
-        reader=make_reader(config, SystemClock()),
+        clock=clock,
+        reader=make_reader(config),
         store=store,
         notifier=notifier,
     )
@@ -78,7 +78,7 @@ def build_scheduler(config: Config, notifier: Notifier) -> Scheduler:
 def check(config: Config) -> int:
     """自检：真实取一次数，确认配置与 Screenpipe 都可用。"""
     clock = SystemClock()
-    reader = make_reader(config, clock)
+    reader = make_reader(config)
     now = clock.now()
     window = config.schedule.window_minutes
     snapshot = reader.read(now - timedelta(minutes=window), now, window, now)
@@ -117,9 +117,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
+        clock = SystemClock()
         if args.check:
             return check(config)
-        scheduler = build_scheduler(config, make_notifier(config, args.dry_run))
+        scheduler = build_scheduler(config, make_notifier(config, args.dry_run, clock), clock)
         if args.once:
             report = scheduler.run_once()
             print(
