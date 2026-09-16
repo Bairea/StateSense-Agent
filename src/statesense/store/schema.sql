@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS evaluations (
   -- 1 = 本轮因采集中断未下结论。必须显式存，否则 evaluations.state 里的 NORMAL
   -- 分不清「真的正常」和「根本没采到数据」。
   skipped INTEGER NOT NULL DEFAULT 0,
+  -- 条目分钟数之和。与 total_active_minutes 的差额是「明细缺失」，
+  -- 与 (ent+gray+work) 的差额是「未命中任何规则」。V0.5 漏判视图靠它区分两者。
+  entries_minutes REAL NOT NULL DEFAULT 0,
   prev_state TEXT,
   decision TEXT NOT NULL,
   gate_trace TEXT NOT NULL
@@ -53,3 +56,11 @@ CREATE TABLE IF NOT EXISTS kv (
 CREATE INDEX IF NOT EXISTS idx_evaluations_at ON evaluations(at);
 CREATE INDEX IF NOT EXISTS idx_interventions_due ON interventions(outcome_due_at);
 CREATE INDEX IF NOT EXISTS idx_interventions_at ON interventions(at);
+
+-- run_events：只记录异常轮次，正常存活由 evaluations.at 派生。
+-- 补上这两类事件后，「无记录」只剩「进程死了」一个解释。
+CREATE TABLE IF NOT EXISTS run_events (
+  at     TEXT PRIMARY KEY,
+  kind   TEXT NOT NULL,   -- 封闭枚举：sleep_gap | tick_error
+  detail TEXT NOT NULL    -- sleep_gap: 空档分钟数；tick_error: 异常类名 + 消息首行
+);

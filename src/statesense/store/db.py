@@ -14,8 +14,12 @@ from statesense.intervention.models import Decision
 from statesense.outcome.models import OutcomeVerdict
 from statesense.state.models import StateVerdict
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+
+#: 运行事件的封闭枚举。写入未知类型必须报错 —— 与 gate.enabled 的处理同一原则：
+#: 不认识的取值意味着写入方与 schema 已漂移，静默接受会让观测结论失真。
+RUN_EVENT_KINDS: tuple[str, ...] = ("sleep_gap", "tick_error")
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -54,6 +58,12 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE evaluations ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0"
             )
+        # v3 → v4：evaluations 增加 entries_minutes（区分漏判与明细缺失）。
+        # run_events 由 schema.sql 的 CREATE TABLE IF NOT EXISTS 建出，无需 ALTER 分支。
+        if "entries_minutes" not in _column_names(self._conn, "evaluations"):
+            self._conn.execute(
+                "ALTER TABLE evaluations ADD COLUMN entries_minutes REAL NOT NULL DEFAULT 0"
+            )
 
     def user_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -82,9 +92,9 @@ class Store:
                 """
                 INSERT INTO evaluations (
                   at, window_minutes, total_active_minutes, ent_minutes, gray_minutes,
-                  work_minutes, ent_ratio, state, late_night, data_status, skipped,
-                  prev_state, decision, gate_trace
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  work_minutes, ent_ratio, entries_minutes, state, late_night, data_status,
+                  skipped, prev_state, decision, gate_trace
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _iso(at),
@@ -94,6 +104,7 @@ class Store:
                     verdict.gray_minutes,
                     verdict.work_minutes,
                     verdict.ent_ratio,
+                    verdict.entries_minutes,
                     str(verdict.state),
                     int(verdict.late_night),
                     verdict.data_status,
@@ -163,6 +174,20 @@ class Store:
                     verdict.ent_after,
                     verdict.after_window_minutes,
                 ),
+            )
+
+    def insert_run_event(self, at: datetime, kind: str, detail: str) -> None:
+        """记录一次异常轮次（休眠跳过 / 本轮异常）。
+
+        绝不写 interventions —— 运维信号与干预信号混在一起会占用 daily_cap、
+        消耗 cooldown，并污染 outcomes 的效果分析。
+        """
+        if kind not in RUN_EVENT_KINDS:
+            raise ValueError(f"未知的运行事件类型 {kind!r}；已知：{list(RUN_EVENT_KINDS)}")
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO run_events (at, kind, detail) VALUES (?, ?, ?)",
+                (_iso(at), kind, detail),
             )
 
     def set_kv(self, key: str, value: str) -> None:

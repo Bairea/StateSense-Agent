@@ -49,7 +49,7 @@ def test_migrate_is_idempotent(tmp_path):
     s = Store(tmp_path / "x.db")
     s.migrate()
     s.migrate()
-    assert s.user_version() == 3
+    assert s.user_version() == 4
     s.close()
 
 
@@ -84,11 +84,12 @@ def test_migrates_v1_database_by_adding_user_response(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 3
+    assert s.user_version() == 4
     intervention_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(interventions)")}
     evaluation_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(evaluations)")}
     assert "user_response" in intervention_columns
     assert "skipped" in evaluation_columns
+    assert "entries_minutes" in evaluation_columns
     s.close()
 
 
