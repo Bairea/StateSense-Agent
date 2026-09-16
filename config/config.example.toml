@@ -60,6 +60,12 @@ leak_min_unclassified_ratio = 0.7
 leak_top_n = 10
 
 [taxonomy]
+# ⚠️ 平台名 ≠ 游戏名。
+# Steam / Epic 启动的游戏，进程名与窗口标题都是游戏自身，不含 "steam" 等平台关键词 ——
+# 只写平台名会漏掉它们。实测：刷 Brotato 46.9 分钟被判成 NORMAL（ent=0），
+# 因为清单里有 "steam" 却没有 "brotato"。
+# 所以下面既有平台名（能命中商店页），也要按需补上实际在玩的游戏名。
+# 发现清单缺口的常规手段：python -m statesense --report --views 5
 entertainment = [
   "bilibili", "哔哩哔哩", "B站", "douyin", "抖音", "tiktok", "youtube",
   "iqiyi", "爱奇艺", "youku", "优酷", "v\\.qq\\.com", "腾讯视频", "mgtv", "芒果TV",
