@@ -109,3 +109,18 @@ class TraceRow:
     skipped: bool
     decision: str
     gates: tuple[tuple[str, bool, float | None, float], ...]
+
+
+@dataclass(frozen=True)
+class ReportData:
+    """把各视图的结果捆在一起交给渲染层。渲染层只读它，不再取数。"""
+
+    overview: Overview
+    verdicts: VerdictBreakdown
+    gates: GateBreakdown
+    interventions: InterventionBreakdown
+    outcomes: OutcomeBreakdown
+    leaks: tuple[LeakAnchor, ...] = ()
+    trace: tuple[TraceRow, ...] = ()
+    #: 二级漏判视图的文本行（窗口标题只在这里出现，绝不落库）。可能为空。
+    leak_details: tuple[str, ...] = ()
