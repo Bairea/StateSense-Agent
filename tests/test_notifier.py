@@ -1,92 +1,161 @@
+import threading
+import time
 from datetime import datetime, timezone
 
 from statesense.clock import FrozenClock
 from statesense.config import NotifyConfig
-from statesense.notify.base import DeliveryResult, RecordingNotifier
-from statesense.notify.windows_toast import WindowsToastNotifier
+from statesense.notify.base import (
+    RESPONSE_ACCEPTED,
+    RESPONSE_DECLINED,
+    DeliveryResult,
+    RecordingNotifier,
+)
+from statesense.notify.foreground_popup import ForegroundPopupNotifier
+from statesense.notify.win32_popup import IDNO, IDYES
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
 
 
-def test_delivery_result_helpers():
-    ok = DeliveryResult.delivered("windows_toast", T0)
+class FakePopup:
+    """记录所有调用。show() 的行为可配置：立即返回按钮 id，或一直阻塞到 close()。"""
+
+    def __init__(self, button_id: int | None = IDYES, block_forever: bool = False) -> None:
+        self.button_id = button_id
+        self.block_forever = block_forever
+        self.shown: list[tuple[str, str]] = []
+        self.closed: list[str] = []
+        self.forced: list[tuple[str, float]] = []
+        self.beeps = 0
+        # 每次 show 用新的事件，避免开头的「清理残留」把后续 show 也放行。
+        self._blocking: threading.Event | None = None
+
+    def show(self, title: str, body: str) -> int:
+        self.shown.append((title, body))
+        if self.block_forever:
+            self._blocking = threading.Event()
+            self._blocking.wait(timeout=5.0)
+            return IDNO
+        assert self.button_id is not None
+        return self.button_id
+
+    def force_front(self, title: str, timeout: float) -> bool:
+        self.forced.append((title, timeout))
+        return True
+
+    def close(self, title: str) -> bool:
+        self.closed.append(title)
+        if self._blocking is not None:
+            self._blocking.set()
+        return True
+
+    def beep(self) -> None:
+        self.beeps += 1
+
+
+def _config(**kw) -> NotifyConfig:
+    defaults = {"answer_timeout_seconds": 5.0, "foreground_timeout_seconds": 2.0}
+    defaults.update(kw)
+    return NotifyConfig(**defaults)
+
+
+# ── 契约 ────────────────────────────────────────────────────
+
+def test_delivery_result_delivered_without_response():
+    ok = DeliveryResult.delivered("foreground_popup", T0)
     assert ok.status == "delivered"
     assert ok.error is None
+    assert ok.user_response is None
     assert ok.stored_status == "delivered"
-    bad = DeliveryResult.failed("windows_toast", "toast unavailable")
+
+
+def test_delivery_result_carries_user_response():
+    ok = DeliveryResult.delivered("foreground_popup", T0, user_response=RESPONSE_ACCEPTED)
+    assert ok.user_response == "accepted"
+
+
+def test_delivery_result_failed_has_no_response():
+    bad = DeliveryResult.failed("foreground_popup", "boom")
     assert bad.status == "failed"
-    assert bad.error == "toast unavailable"
     assert bad.delivered_at is None
-    assert bad.stored_status == "failed:toast unavailable"
+    assert bad.user_response is None
+    assert bad.stored_status == "failed:boom"
 
 
-def test_recording_notifier_captures_messages():
+def test_recording_notifier_without_response():
     n = RecordingNotifier()
-    result = n.notify("标题", "正文")
-    assert result.status == "delivered"
+    assert n.notify("标题", "正文").user_response is None
     assert n.sent == [("标题", "正文")]
 
 
-def test_windows_notifier_reports_failure_instead_of_raising(monkeypatch):
-    """投递失败必须变成结构化结果，绝不能让调度器崩掉。"""
-
-    class Boom:
-        def __init__(self, **kwargs):
-            raise RuntimeError("no AppUserModelID")
-
-    monkeypatch.setattr("statesense.notify.windows_toast._notification_class", lambda: Boom)
-    result = WindowsToastNotifier(NotifyConfig(), FrozenClock(T0)).notify("标题", "正文")
-    assert result.status == "failed"
-    assert "no AppUserModelID" in (result.error or "")
-    assert result.delivered_at is None
+def test_recording_notifier_with_canned_response():
+    n = RecordingNotifier(response=RESPONSE_DECLINED)
+    assert n.notify("t", "b").user_response == "declined"
 
 
-def test_windows_notifier_reports_success(monkeypatch):
-    sent: list = []
+# ── 前台弹窗 ────────────────────────────────────────────────
 
-    class Fake:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-        def show(self):
-            sent.append(self.kwargs)
-
-    monkeypatch.setattr("statesense.notify.windows_toast._notification_class", lambda: Fake)
-    result = WindowsToastNotifier(
-        NotifyConfig(app_id="StateSense.Agent"), FrozenClock(T0)
-    ).notify("标题", "正文")
+def test_yes_button_maps_to_accepted():
+    popup = FakePopup(button_id=IDYES)
+    result = ForegroundPopupNotifier(_config(), FrozenClock(T0), popup).notify("标题", "正文")
     assert result.status == "delivered"
+    assert result.user_response == RESPONSE_ACCEPTED
     assert result.delivered_at == T0
-    assert sent[0]["title"] == "标题"
-    assert sent[0]["msg"] == "正文"
-    assert sent[0]["app_id"] == "StateSense.Agent"
-    assert sent[0]["duration"] == "short"
 
 
-def test_windows_notifier_passes_long_duration(monkeypatch):
-    sent: list = []
-
-    class Fake:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-        def show(self):
-            sent.append(self.kwargs)
-
-    monkeypatch.setattr("statesense.notify.windows_toast._notification_class", lambda: Fake)
-    WindowsToastNotifier(NotifyConfig(toast_duration="long"), FrozenClock(T0)).notify("t", "b")
-    assert sent[0]["duration"] == "long"
+def test_no_button_maps_to_declined():
+    popup = FakePopup(button_id=IDNO)
+    result = ForegroundPopupNotifier(_config(), FrozenClock(T0), popup).notify("标题", "正文")
+    assert result.user_response == RESPONSE_DECLINED
 
 
-def test_show_failure_is_reported(monkeypatch):
-    class FailsOnShow:
-        def __init__(self, **kwargs):
-            pass
+def test_unknown_button_id_is_not_guessed():
+    popup = FakePopup(button_id=99)
+    result = ForegroundPopupNotifier(_config(), FrozenClock(T0), popup).notify("标题", "正文")
+    assert result.status == "delivered"
+    assert result.user_response is None
 
-        def show(self):
-            raise OSError("shell not available")
 
-    monkeypatch.setattr("statesense.notify.windows_toast._notification_class", lambda: FailsOnShow)
-    result = WindowsToastNotifier(NotifyConfig(), FrozenClock(T0)).notify("t", "b")
+def test_stale_dialog_is_closed_before_showing():
+    popup = FakePopup()
+    ForegroundPopupNotifier(_config(), FrozenClock(T0), popup).notify("标题", "正文")
+    assert popup.closed == ["标题"]
+
+
+def test_beep_and_force_front_are_used():
+    popup = FakePopup()
+    ForegroundPopupNotifier(_config(), FrozenClock(T0), popup).notify("标题", "正文")
+    assert popup.beeps == 1
+    assert popup.forced == [("标题", 2.0)]
+
+
+def test_show_receives_title_and_body():
+    popup = FakePopup()
+    ForegroundPopupNotifier(_config(), FrozenClock(T0), popup).notify("标题", "正文")
+    assert popup.shown == [("标题", "正文")]
+
+
+def test_unanswered_dialog_is_closed_and_response_is_none():
+    """用户不在时不能永远挂着窗口挡住后续干预。"""
+    popup = FakePopup(block_forever=True)
+    notifier = ForegroundPopupNotifier(
+        _config(answer_timeout_seconds=0.2), FrozenClock(T0), popup
+    )
+    started = time.monotonic()
+    result = notifier.notify("标题", "正文")
+    elapsed = time.monotonic() - started
+    assert result.status == "delivered"
+    assert result.user_response is None
+    assert elapsed < 3.0, "超时后必须及时返回，不能挂在 join 上"
+    # 一次是清残留，一次是超时后关闭
+    assert popup.closed == ["标题", "标题"]
+
+
+def test_show_failure_becomes_structured_error():
+    class Exploding(FakePopup):
+        def show(self, title: str, body: str) -> int:
+            raise OSError("desktop unavailable")
+
+    result = ForegroundPopupNotifier(_config(), FrozenClock(T0), Exploding()).notify("标题", "正文")
     assert result.status == "failed"
-    assert "shell not available" in (result.error or "")
+    assert "desktop unavailable" in (result.error or "")
+    assert "failed:" in result.stored_status

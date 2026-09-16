@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
+#: 用户在弹窗上点了「是」
+RESPONSE_ACCEPTED = "accepted"
+#: 用户在弹窗上点了「否」
+RESPONSE_DECLINED = "declined"
+
 
 @dataclass(frozen=True)
 class DeliveryResult:
@@ -13,10 +18,22 @@ class DeliveryResult:
     channel: str
     error: str | None
     delivered_at: datetime | None
+    user_response: str | None = None
 
     @classmethod
-    def delivered(cls, channel: str, at: datetime) -> "DeliveryResult":
-        return cls(status="delivered", channel=channel, error=None, delivered_at=at)
+    def delivered(
+        cls,
+        channel: str,
+        at: datetime,
+        user_response: str | None = None,
+    ) -> "DeliveryResult":
+        return cls(
+            status="delivered",
+            channel=channel,
+            error=None,
+            delivered_at=at,
+            user_response=user_response,
+        )
 
     @classmethod
     def failed(cls, channel: str, error: str) -> "DeliveryResult":
@@ -39,9 +56,12 @@ class RecordingNotifier:
 
     channel = "recording"
 
-    def __init__(self) -> None:
+    def __init__(self, response: str | None = None) -> None:
         self.sent: list[tuple[str, str]] = []
+        self._response = response
 
     def notify(self, title: str, body: str) -> DeliveryResult:
         self.sent.append((title, body))
-        return DeliveryResult.delivered(self.channel, datetime.now(timezone.utc))
+        return DeliveryResult.delivered(
+            self.channel, datetime.now(timezone.utc), user_response=self._response
+        )

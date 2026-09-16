@@ -48,7 +48,44 @@ def test_migrate_is_idempotent(tmp_path):
     s = Store(tmp_path / "x.db")
     s.migrate()
     s.migrate()
-    assert s.user_version() == 1
+    assert s.user_version() == 2
+    s.close()
+
+
+def test_migrates_v1_database_by_adding_user_response(tmp_path):
+    """老库（user_version=1，interventions 没有 user_response）必须能原地升级。"""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE evaluations (id INTEGER PRIMARY KEY, at TEXT NOT NULL,
+          window_minutes INTEGER NOT NULL, total_active_minutes REAL NOT NULL,
+          ent_minutes REAL NOT NULL, gray_minutes REAL NOT NULL, work_minutes REAL NOT NULL,
+          ent_ratio REAL NOT NULL, state TEXT NOT NULL, late_night INTEGER NOT NULL,
+          data_status TEXT NOT NULL, prev_state TEXT, decision TEXT NOT NULL,
+          gate_trace TEXT NOT NULL);
+        CREATE TABLE interventions (id INTEGER PRIMARY KEY,
+          evaluation_id INTEGER NOT NULL REFERENCES evaluations(id), at TEXT NOT NULL,
+          state TEXT NOT NULL, late_night INTEGER NOT NULL, action_id TEXT NOT NULL,
+          action_text TEXT NOT NULL, delivery_status TEXT NOT NULL,
+          outcome_due_at TEXT NOT NULL);
+        CREATE TABLE outcomes (intervention_id INTEGER PRIMARY KEY,
+          checked_at TEXT NOT NULL, outcome TEXT NOT NULL, ent_before REAL NOT NULL,
+          ent_after REAL NOT NULL, after_window_minutes REAL NOT NULL);
+        CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        PRAGMA user_version = 1;
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.migrate()
+    assert s.user_version() == 2
+    columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(interventions)")}
+    assert "user_response" in columns
     s.close()
 
 
@@ -187,3 +224,21 @@ def test_kv_roundtrip_and_default(store):
     assert store.get_kv("action_cursor") == "calligraphy"
     store.set_kv("action_cursor", "stretch")
     assert store.get_kv("action_cursor") == "stretch"
+
+
+def test_user_response_roundtrip(store):
+    eid = store.insert_evaluation(T0, _verdict(), _decision())
+    iid = store.insert_intervention(
+        eid, T0, "PASSIVE_CONSUMPTION", False, "walk5", "走 5 分钟", "delivered",
+        T0 + timedelta(minutes=10), user_response="accepted",
+    )
+    assert store.fetch_intervention(iid)["user_response"] == "accepted"
+
+
+def test_user_response_defaults_to_null(store):
+    eid = store.insert_evaluation(T0, _verdict(), _decision())
+    iid = store.insert_intervention(
+        eid, T0, "PASSIVE_CONSUMPTION", False, "walk5", "走 5 分钟", "delivered",
+        T0 + timedelta(minutes=10),
+    )
+    assert store.fetch_intervention(iid)["user_response"] is None

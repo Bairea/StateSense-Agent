@@ -34,11 +34,14 @@ disengaged_ratio = 0.5
 continued_ratio = 0.8
 
 [notify]
-channel = "windows_toast"
-app_id = "StateSense.Agent"
-toast_duration = "short"
-fallback_topmost_window = false
-fallback_window_seconds = 8
+# 前台弹窗。不用 Windows Toast 的原因：本机全局通知开关是关的，
+# 且 Windows 在全屏应用下默认抑制通知 —— 而本项目核心场景正是全屏刷视频。
+# MessageBox 绕开通知平台，加显式抢前台后全屏可见，且不需要注册 AUMID。
+channel = "foreground_popup"
+# 用户完全不理会时，多久自动关掉弹窗（秒）
+answer_timeout_seconds = 180
+# 轮询对话框句柄、强行抢前台的最长等待（秒）
+foreground_timeout_seconds = 15
 
 [store]
 path = "statesense.db"

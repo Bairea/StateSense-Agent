@@ -53,11 +53,11 @@ class OutcomeConfig:
 
 @dataclass(frozen=True)
 class NotifyConfig:
-    channel: str = "windows_toast"
-    app_id: str = "StateSense.Agent"
-    toast_duration: str = "short"
-    fallback_topmost_window: bool = False
-    fallback_window_seconds: int = 8
+    channel: str = "foreground_popup"
+    #: 用户完全不理会时，多久自动关掉弹窗（秒）。避免它永远挡住后续干预。
+    answer_timeout_seconds: float = 180.0
+    #: 轮询对话框句柄、强行抢前台的最长等待（秒）。
+    foreground_timeout_seconds: float = 15.0
 
 
 @dataclass(frozen=True)

@@ -3,7 +3,7 @@ name = "statesense-agent"
 version = "0.0.1"
 description = "持续感知活动状态、在正确时机轻推一下的个人状态智能体"
 requires-python = ">=3.12"
-dependencies = ["winotify>=1.1.0; sys_platform == 'win32'"]
+dependencies = []
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

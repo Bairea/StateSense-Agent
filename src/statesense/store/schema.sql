@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS interventions (
   action_id TEXT NOT NULL,
   action_text TEXT NOT NULL,
   delivery_status TEXT NOT NULL,
-  outcome_due_at TEXT NOT NULL
+  outcome_due_at TEXT NOT NULL,
+  -- 弹窗上用户点的按钮：accepted / declined / NULL（没理会或超时）
+  user_response TEXT
 );
 
 -- outcomes：一次干预对应一行回执

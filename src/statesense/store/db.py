@@ -12,7 +12,7 @@ from statesense.intervention.models import Decision
 from statesense.outcome.models import OutcomeVerdict
 from statesense.state.models import StateVerdict
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
@@ -22,6 +22,10 @@ def _iso(moment: datetime) -> str:
 
 def _parse(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
 @dataclass(frozen=True)
@@ -43,7 +47,14 @@ class Store:
     def migrate(self) -> None:
         with self._conn:
             self._conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
+            self._apply_incremental_migrations()
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _apply_incremental_migrations(self) -> None:
+        """v1 → v2：interventions 增加 user_response（弹窗按钮回执）。"""
+        columns = _column_names(self._conn, "interventions")
+        if "user_response" not in columns:
+            self._conn.execute("ALTER TABLE interventions ADD COLUMN user_response TEXT")
 
     def user_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -104,14 +115,15 @@ class Store:
         action_text: str,
         delivery_status: str,
         outcome_due_at: datetime,
+        user_response: str | None = None,
     ) -> int:
         with self._conn:
             cur = self._conn.execute(
                 """
                 INSERT INTO interventions (
                   evaluation_id, at, state, late_night, action_id, action_text,
-                  delivery_status, outcome_due_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  delivery_status, outcome_due_at, user_response
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     evaluation_id,
@@ -122,9 +134,15 @@ class Store:
                     action_text,
                     delivery_status,
                     _iso(outcome_due_at),
+                    user_response,
                 ),
             )
             return int(cur.lastrowid)
+
+    def fetch_intervention(self, intervention_id: int) -> sqlite3.Row:
+        return self._conn.execute(
+            "SELECT * FROM interventions WHERE id = ?", (intervention_id,)
+        ).fetchone()
 
     def insert_outcome(
         self, intervention_id: int, checked_at: datetime, verdict: OutcomeVerdict

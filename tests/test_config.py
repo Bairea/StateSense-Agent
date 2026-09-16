@@ -82,5 +82,5 @@ def test_defaults_are_applied(tmp_path):
     assert cfg.gate.cooldown_minutes == 30
     assert cfg.gate.daily_cap == 8
     assert cfg.outcome.delay_minutes == 10
-    assert cfg.notify.channel == "windows_toast"
+    assert cfg.notify.channel == "foreground_popup"
     assert cfg.store_path == (tmp_path / "statesense.db").resolve()
