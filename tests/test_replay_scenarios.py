@@ -42,6 +42,33 @@ def test_scenarios_do_not_touch_the_configured_database(config):
     assert not Path(config.store_path).exists()
 
 
+def test_check_scenario_is_repeatable(config):
+    """跑两次必须一样。
+
+    端到端跑第二遍时发现过这个缺陷：上一轮的库文件还在，行数累加，
+    `degraded` 从 6 行变成 12 行。一个不可重复的验证工具会给出假结果。
+    """
+    first = check_scenario("degraded", config)
+    second = check_scenario("degraded", config)
+    assert first == []
+    assert second == []
+
+
+def test_repeat_runs_do_not_accumulate_rows(config):
+    """sleep_gap 每次只写 1 行评估 + 1 条运行事件；跑两遍后必须还是 1+1。"""
+    from statesense.store.db import Store
+
+    check_scenario("sleep_gap", config)
+    check_scenario("sleep_gap", config)
+    db = Path(config.store_path).parent / "replay" / "sleep_gap" / "replay-sleep-gap.db"
+    store = Store(db)
+    try:
+        assert store._conn.execute("SELECT COUNT(*) AS n FROM evaluations").fetchone()["n"] == 1
+        assert store._conn.execute("SELECT COUNT(*) AS n FROM run_events").fetchone()["n"] == 1
+    finally:
+        store.close()
+
+
 def test_structural_findings_flag_the_unreachable_high_risk_threshold(config):
     """window=60 而 high_risk=65 时，ent 不可能到 65，该状态是死代码。
 

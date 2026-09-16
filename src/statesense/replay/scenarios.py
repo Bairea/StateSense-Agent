@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -245,9 +246,17 @@ DRIVERS: dict[str, Callable[[Config, Path], list[str]]] = {
 def check_scenario(name: str, config: Config) -> list[str]:
     """在独立的库上跑一个剧本，返回失败原因（空列表 = 通过）。
 
-    每个剧本用自己的 db 文件，绝不碰 config 指向的生产库。
+    每个剧本有自己的工作目录，且**每次从干净状态开始** —— 否则跑第二遍会
+    在上次的库上累加行数，同一命令给出不同结果。一个不可重复的验证工具
+    比没有验证工具更糟：它会在你第二次运行时给你一个假的失败或假的通过。
+
+    库文件跑完保留在 `replay/<剧本>/` 下，可以用
+    `--report --db <该目录里的库>` 继续读它。
     """
     if name not in DRIVERS:
         raise KeyError(f"未知剧本 {name!r}")
-    workdir = Path(config.store_path).parent
+    workdir = Path(config.store_path).parent / "replay" / name
+    if workdir.exists():
+        shutil.rmtree(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
     return DRIVERS[name](config, workdir)
