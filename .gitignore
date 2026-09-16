@@ -9,6 +9,9 @@ secrets/
 credentials/
 .credentials/
 
+# 本地实际使用的配置（随仓库提供的是 config.example.toml）
+config/config.toml
+
 # --- Python ---
 __pycache__/
 *.py[cod]
