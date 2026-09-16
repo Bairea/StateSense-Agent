@@ -36,7 +36,9 @@ def test_scripted_reader_satisfies_activity_source():
 
 
 def test_synthesize_clips_segments_to_window():
-    snap = snapshot_at(SCENARIO, T0 + timedelta(minutes=10), 10, T0)
+    snap = snapshot_at(
+        SCENARIO, T0, T0 + timedelta(minutes=10), 10, T0 + timedelta(minutes=10), T0
+    )
     assert snap.data_status == "ok"
     assert snap.is_trustworthy is True
     assert len(snap.entries) == 1
@@ -47,9 +49,33 @@ def test_synthesize_clips_segments_to_window():
 
 
 def test_synthesize_omits_segments_outside_window():
-    snap = snapshot_at(SCENARIO, T0 + timedelta(minutes=110), 10, T0)
+    snap = snapshot_at(
+        SCENARIO,
+        T0 + timedelta(minutes=100),
+        T0 + timedelta(minutes=110),
+        10,
+        T0 + timedelta(minutes=110),
+        T0,
+    )
     assert snap.entries == ()
     assert snap.total_active_minutes == 0.0
+
+
+def test_synthesize_uses_start_and_end_not_captured_at():
+    """回执的 before/after 两次回查共用同一个 captured_at，只有 start/end 不同。
+
+    若用 captured_at 当窗口末端，两次回查会算成同一段 —— 回执就永远失真。
+    """
+    before = snapshot_at(
+        SCENARIO, T0 - timedelta(minutes=10), T0, 10, T0 + timedelta(minutes=10), T0
+    )
+    after = snapshot_at(
+        SCENARIO, T0, T0 + timedelta(minutes=10), 10, T0 + timedelta(minutes=10), T0
+    )
+    assert before.total_active_minutes == pytest.approx(0.0)
+    assert after.total_active_minutes == pytest.approx(10.0)
+    assert before.window_start == T0 - timedelta(minutes=10)
+    assert after.window_start == T0
 
 
 def test_synthesize_merges_overlapping_segments():
@@ -61,14 +87,18 @@ def test_synthesize_merges_overlapping_segments():
             Segment(0, 30, "Code.exe", "GitHub"),
         ),
     )
-    snap = snapshot_at(scenario, T0 + timedelta(minutes=30), 60, T0)
+    snap = snapshot_at(
+        scenario, T0, T0 + timedelta(minutes=30), 60, T0 + timedelta(minutes=30), T0
+    )
     assert len(snap.entries) == 2
     assert snap.total_active_minutes == pytest.approx(60.0)
 
 
 def test_degraded_scenario_produces_untrustworthy_snapshot():
     scenario = Scenario(name="deg", minutes=10, data_status="unreachable")
-    snap = snapshot_at(scenario, T0 + timedelta(minutes=10), 10, T0)
+    snap = snapshot_at(
+        scenario, T0, T0 + timedelta(minutes=10), 10, T0 + timedelta(minutes=10), T0
+    )
     assert snap.data_status == "unreachable"
     assert snap.is_trustworthy is False
     assert snap.entries == ()

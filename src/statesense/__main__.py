@@ -15,6 +15,7 @@ from statesense.clock import Clock, SystemClock
 from statesense.config import Config, ConfigError, load_config
 from statesense.notify.base import Notifier, RecordingNotifier
 from statesense.notify.foreground_popup import ForegroundPopupNotifier
+from statesense.replay.scenarios import SCENARIOS, check_scenario, structural_findings
 from statesense.report import queries, render
 from statesense.report.models import ReportData
 from statesense.scheduler import Scheduler
@@ -36,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--once", action="store_true", help="跑一轮评估")
     group.add_argument("--daemon", action="store_true", help="常驻运行")
     group.add_argument("--report", action="store_true", help="只读汇报历史评估（绝不写库）")
+    group.add_argument(
+        "--replay", metavar="剧本", default=None, help="回放剧本：ladder/outcome/gates/degraded/sleep_gap/all"
+    )
     parser.add_argument("--dry-run", action="store_true", help="不真弹窗，只记录")
     parser.add_argument("--since", default="7d", help="report 回看区间：7d / 24h / ISO 时刻")
     parser.add_argument("--format", choices=("text", "json"), default="text")
@@ -240,6 +244,40 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
         store.close()
 
 
+def run_replay(name: str, config: Config) -> int:
+    """在独立的库上跑剧本。绝不触碰配置指向的生产库。
+
+    `structural_findings` 打印为 WARN 而不是 FAIL：它描述的是配置本身能让
+    哪段代码成为死路，不是剧本断言失败。
+    """
+    findings = structural_findings(config)
+
+    if name == "all":
+        failed = False
+        for scenario_name in SCENARIOS:
+            failures = check_scenario(scenario_name, config)
+            print(f"{'FAIL' if failures else 'PASS'}  {scenario_name}")
+            for reason in failures:
+                print(f"      {reason}")
+            failed = failed or bool(failures)
+        for finding in findings:
+            print(f"WARN  {finding}")
+        return 1 if failed else 0
+
+    if name not in SCENARIOS:
+        available = ", ".join(sorted(SCENARIOS))
+        print(f"未知剧本 {name!r}；可用：{available} 或 all", file=sys.stderr)
+        return 2
+
+    failures = check_scenario(name, config)
+    print(f"{'FAIL' if failures else 'PASS'}  {name}")
+    for reason in failures:
+        print(f"      {reason}")
+    for finding in findings:
+        print(f"WARN  {finding}")
+    return 1 if failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -260,6 +298,8 @@ def main(argv: list[str] | None = None) -> int:
             return check(config)
         if args.report:
             return run_report(config, args, clock)
+        if args.replay is not None:
+            return run_replay(args.replay, config)
         scheduler = build_scheduler(config, make_notifier(config, args.dry_run, clock), clock)
         if args.once:
             report = scheduler.run_once()

@@ -34,7 +34,9 @@ class ScriptedReader:
         captured_at: datetime,
     ) -> ActivitySnapshot:
         self.calls.append((start, end))
-        return snapshot_at(self._scenario, captured_at, window_minutes, self._origin)
+        return snapshot_at(
+            self._scenario, start, end, window_minutes, captured_at, self._origin
+        )
 
 
 @dataclass

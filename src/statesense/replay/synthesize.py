@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from statesense.activity.models import ActivitySnapshot, Entry
 from statesense.replay.scenario import Scenario
@@ -14,30 +14,33 @@ from statesense.replay.scenario import Scenario
 
 def snapshot_at(
     scenario: Scenario,
-    now: datetime,
+    start: datetime,
+    end: datetime,
     window_minutes: int,
+    captured_at: datetime,
     origin: datetime,
 ) -> ActivitySnapshot:
-    """取 [now - window, now] 内与剧本有交集的部分。
+    """取 [start, end] 内与剧本有交集的部分。
 
-    段超出窗口的部分被裁掉，交叠部分按分钟计入条目。
+    **窗口由 start/end 决定，不是 captured_at。** 真实的
+    `ActivityReader.read(start, end, window_minutes, captured_at)` 就是这么用的 ——
+    回执的 before/after 两次回查用的是同一 captured_at 但不同的 start/end，
+    用 captured_at 当窗口末端会把两次回查算成同一段。
     """
-    start = now - timedelta(minutes=window_minutes)
-
     if scenario.data_status != "ok":
         # 降级场景：这一轮压根没取到数据，条目不成立。
         return ActivitySnapshot(
             window_start=start,
-            window_end=now,
+            window_end=end,
             window_minutes=window_minutes,
             total_active_minutes=0.0,
             entries=(),
             data_status=scenario.data_status,
-            captured_at=now,
+            captured_at=captured_at,
         )
 
     window_start = (start - origin).total_seconds() / 60
-    window_end = (now - origin).total_seconds() / 60
+    window_end = (end - origin).total_seconds() / 60
 
     entries: list[Entry] = []
     for segment in scenario.segments:
@@ -58,10 +61,10 @@ def snapshot_at(
     total = round(sum(e.minutes for e in entries), 2)
     return ActivitySnapshot(
         window_start=start,
-        window_end=now,
+        window_end=end,
         window_minutes=window_minutes,
         total_active_minutes=total,
         entries=tuple(entries),
         data_status=scenario.data_status,
-        captured_at=now,
+        captured_at=captured_at,
     )
