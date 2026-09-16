@@ -237,3 +237,36 @@ class Store:
             (_iso(moment),),
         ).fetchone()
         return int(row["n"])
+
+    # ── 只读查询（report 用） ────────────────────────────────
+    # 一律以 list_ 开头，便于评审时一眼确认 report 路径不写库。
+    # 时间过滤走 SQL 字符串比较：_iso() 统一转本地时区后序列化，所有落库
+    # 字符串的偏移量一致，字典序即时间序。since 必须先经 _iso() 转换。
+
+    def list_evaluations(self, since: datetime | None = None) -> list[sqlite3.Row]:
+        if since is None:
+            return self._conn.execute("SELECT * FROM evaluations ORDER BY at").fetchall()
+        return self._conn.execute(
+            "SELECT * FROM evaluations WHERE at >= ? ORDER BY at", (_iso(since),)
+        ).fetchall()
+
+    def list_interventions(self, since: datetime | None = None) -> list[sqlite3.Row]:
+        if since is None:
+            return self._conn.execute("SELECT * FROM interventions ORDER BY at").fetchall()
+        return self._conn.execute(
+            "SELECT * FROM interventions WHERE at >= ? ORDER BY at", (_iso(since),)
+        ).fetchall()
+
+    def list_outcomes(self, since: datetime | None = None) -> list[sqlite3.Row]:
+        if since is None:
+            return self._conn.execute("SELECT * FROM outcomes ORDER BY checked_at").fetchall()
+        return self._conn.execute(
+            "SELECT * FROM outcomes WHERE checked_at >= ? ORDER BY checked_at", (_iso(since),)
+        ).fetchall()
+
+    def list_run_events(self, since: datetime | None = None) -> list[sqlite3.Row]:
+        if since is None:
+            return self._conn.execute("SELECT * FROM run_events ORDER BY at").fetchall()
+        return self._conn.execute(
+            "SELECT * FROM run_events WHERE at >= ? ORDER BY at", (_iso(since),)
+        ).fetchall()
