@@ -589,7 +589,7 @@ work          = [ /* §5.2 清单 */ ]
 | **localhost 不豁免鉴权**，无 token 返回 403 | 本机实测 |
 | `key_texts` / `snippets` 默认随响应返回，且包含屏幕上的正文 | 本机实测（响应里能看到窗口内的实际文本） |
 | 可在请求中关闭：`include_key_texts=false`、`include_snippets=false`、`include_memories=false`、`include_guidance=false` | 上游 API 文档参数表 |
-| **`browser_url` 稀疏**：115 帧样本中仅 1 帧非空 | 本机实测 |
+| **`browser_url` 稀疏但不可替代** | 115 帧样本中仅 1 帧非空；但后来实测到一条**只有 URL 能命中**的记录：窗口标题「三角洲烽火联赛夏季赛」不含任何娱乐关键词，是 URL 里的 `bilibili` 命中规则 |
 | `window_name` 才是稳定信号，含页面标题（如 `Usage - Command Code - Google Chrome`） | 本机实测 |
 | `data_status` 取值 `ok` / `empty_but_recording` / `no_capture_in_range` / `not_recording` | 上游 API 文档 |
 | 不要用 frame count 估算时间 | 上游 API 文档明确警告 |

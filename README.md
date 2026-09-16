@@ -52,16 +52,16 @@ Notification          ← 轻推一下
 
 ## 当前状态
 
-**设计阶段 —— 仓库中还没有任何代码。**
-
-已有的两份文档就是全部内容：
+**V0 已实现并通过端到端验证**（详见验证日志）。
 
 | 文档 | 内容 |
 | --- | --- |
 | [`prd1.md`](./prd1.md) | 项目背景与核心循环（问题陈述） |
 | [`ref1.md`](./ref1.md) | 技术方案讨论：为什么用 Screenpipe、v1 架构、迭代路线、坑位 |
 | [`docs/project-understanding.md`](./docs/project-understanding.md) | 项目理解整理 + 对上游 Screenpipe 文档的核对结果与偏差修正 |
-| [`docs/specs/2026-09-16-v0-state-intervention-design.md`](./docs/specs/2026-09-16-v0-state-intervention-design.md) | **V0 技术规格（待评审）**：架构、状态模型、介入闸门、投递与回执、数据模型、测试与部署 |
+| [`docs/specs/2026-09-16-v0-state-intervention-design.md`](./docs/specs/2026-09-16-v0-state-intervention-design.md) | **V0 技术规格**：架构、状态模型、介入闸门、投递与回执、数据模型、测试与部署 |
+| [`docs/plans/2026-09-16-v0-implementation.md`](./docs/plans/2026-09-16-v0-implementation.md) | V0 实现计划（11 任务 / 56 步 / TDD） |
+| [`docs/plans/2026-09-16-v0-verification-log.md`](./docs/plans/2026-09-16-v0-verification-log.md) | **V0 验证日志**：端到端实测结果、投递通道实测矩阵、实施中发现的缺陷 |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | 协作仓库布局、分支策略与 PR 流程 |
 
 ## 迭代路线
