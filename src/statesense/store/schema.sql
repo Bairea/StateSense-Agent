@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS evaluations (
   state TEXT NOT NULL,
   late_night INTEGER NOT NULL,
   data_status TEXT NOT NULL,
+  -- 1 = 本轮因采集中断未下结论。必须显式存，否则 evaluations.state 里的 NORMAL
+  -- 分不清「真的正常」和「根本没采到数据」。
+  skipped INTEGER NOT NULL DEFAULT 0,
   prev_state TEXT,
   decision TEXT NOT NULL,
   gate_trace TEXT NOT NULL

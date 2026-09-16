@@ -12,7 +12,7 @@ from statesense.intervention.models import Decision
 from statesense.outcome.models import OutcomeVerdict
 from statesense.state.models import StateVerdict
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
@@ -51,10 +51,15 @@ class Store:
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _apply_incremental_migrations(self) -> None:
-        """v1 → v2：interventions 增加 user_response（弹窗按钮回执）。"""
-        columns = _column_names(self._conn, "interventions")
-        if "user_response" not in columns:
+        """按列是否存在逐项补齐，老库原地升级。"""
+        # v1 → v2：interventions 增加 user_response（弹窗按钮回执）
+        if "user_response" not in _column_names(self._conn, "interventions"):
             self._conn.execute("ALTER TABLE interventions ADD COLUMN user_response TEXT")
+        # v2 → v3：evaluations 增加 skipped（区分「真的正常」与「根本没采到数据」）
+        if "skipped" not in _column_names(self._conn, "evaluations"):
+            self._conn.execute(
+                "ALTER TABLE evaluations ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0"
+            )
 
     def user_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -83,9 +88,9 @@ class Store:
                 """
                 INSERT INTO evaluations (
                   at, window_minutes, total_active_minutes, ent_minutes, gray_minutes,
-                  work_minutes, ent_ratio, state, late_night, data_status, prev_state,
-                  decision, gate_trace
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  work_minutes, ent_ratio, state, late_night, data_status, skipped,
+                  prev_state, decision, gate_trace
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _iso(at),
@@ -97,7 +102,8 @@ class Store:
                     verdict.ent_ratio,
                     str(verdict.state),
                     int(verdict.late_night),
-                    verdict.skip_reason or verdict.data_status,
+                    verdict.data_status,
+                    int(verdict.skipped),
                     self._previous_state(),
                     "intervene" if decision.intervene else "skip",
                     trace,

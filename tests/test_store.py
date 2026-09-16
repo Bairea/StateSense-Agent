@@ -48,7 +48,7 @@ def test_migrate_is_idempotent(tmp_path):
     s = Store(tmp_path / "x.db")
     s.migrate()
     s.migrate()
-    assert s.user_version() == 2
+    assert s.user_version() == 3
     s.close()
 
 
@@ -83,9 +83,11 @@ def test_migrates_v1_database_by_adding_user_response(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 2
-    columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(interventions)")}
-    assert "user_response" in columns
+    assert s.user_version() == 3
+    intervention_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(interventions)")}
+    evaluation_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(evaluations)")}
+    assert "user_response" in intervention_columns
+    assert "skipped" in evaluation_columns
     s.close()
 
 
@@ -112,6 +114,25 @@ def test_insert_evaluation_roundtrips(store):
 def test_skip_decision_is_recorded_as_skip(store):
     eid = store.insert_evaluation(T0, _verdict(), _decision(intervene=False))
     assert store.fetch_evaluation(eid)["decision"] == "skip"
+
+
+def test_skipped_flag_distinguishes_no_data_from_truly_normal(store):
+    """这条是审查发现的缺陷：单看 state=NORMAL 分不清「真正常」与「没采到数据」。"""
+    normal = store.insert_evaluation(T0, _verdict(state=State.NORMAL), _decision(False))
+    skipped_verdict = StateVerdict(
+        state=State.NORMAL, late_night=False, total_active_minutes=0.0, ent_minutes=0.0,
+        gray_minutes=0.0, work_minutes=0.0, ent_ratio=0.0, window_minutes=60,
+        data_status="no_capture_in_range", skipped=True,
+        skip_reason="no_capture_in_range",
+    )
+    skipped = store.insert_evaluation(T0, skipped_verdict, _decision(False))
+
+    normal_row = store.fetch_evaluation(normal)
+    skipped_row = store.fetch_evaluation(skipped)
+    assert normal_row["state"] == skipped_row["state"] == "NORMAL"
+    assert normal_row["skipped"] == 0
+    assert skipped_row["skipped"] == 1
+    assert skipped_row["data_status"] == "no_capture_in_range"
 
 
 def test_prev_state_chain(store):

@@ -105,6 +105,7 @@ def test_data_status_not_ok_skips_without_concluding(config, store):
     assert report.intervened is False
     row = store.fetch_evaluation(report.evaluation_id)
     assert row["data_status"] == "no_capture_in_range"
+    assert row["skipped"] == 1, "必须能与「真的 NORMAL」区分开"
     assert row["decision"] == "skip"
 
 
