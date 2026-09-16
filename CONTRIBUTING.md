@@ -1,6 +1,6 @@
 # 协作开发指南
 
-本仓库当前处于**设计阶段**，代码尚未开始。这份文档说明远程协作的仓库布局、分支策略与提交/评审流程。
+本仓库已进入实现阶段：`main` 上已有协作脚手架与 V0 技术规格（PR #1 已合并），V0 实现见 PR #2。这份文档说明远程协作的仓库布局、分支策略与提交/评审流程。
 
 ---
 
@@ -11,12 +11,12 @@
 | 上游（canonical） | https://github.com/Bairea/StateSense-Agent |
 | 默认分支 | `main` |
 | 可见性 | Public |
-| 当前协作账号 | `SilhouetteQA`（`viewerPermission: READ`） |
+| 当前协作账号 | `SilhouetteQA`（**collaborator，Write 权限**） |
 | 本仓库 fork | https://github.com/SilhouetteQA/StateSense-Agent |
 
-> **重要：`SilhouetteQA` 目前对上游只有只读权限，无法直接 push 到 `Bairea/StateSense-Agent`。**
+> `SilhouetteQA` 已被加为 collaborator，可直接向 `Bairea/StateSense-Agent` 推送分支。`origin`（fork）保留作备份，两条路径都可用，见第 6 节。
 
-因此本仓库采用标准的 **Fork + Pull Request** 协作模型。如果后续 Bairea 把 `SilhouetteQA` 加为 collaborator（Write 权限），可以切换为「直接推分支」模式，见第 6 节。
+本仓库采用标准的 **Fork + Pull Request** 协作模型。所有改动仍经由 PR 评审进入 `main`。
 
 ---
 
@@ -47,7 +47,14 @@ git pull            # = 从 Bairea 拉取最新 main
 ## 3. 分支策略
 
 - `main` **永不直接提交**，只用于同步上游。
-- 所有工作都在 feature 分支上进行，从最新的 `upstream/main` 切出。
+- 所有工作都在 feature 分支上进行，**默认**从最新的 `upstream/main` 切出。
+- 当一个功能依赖尚未合并的前序功能分支时（V0.5 依赖 V0 即属此例），允许基于该功能分支切出。但**开 PR 前必须摘干净**，否则 PR 会带上不属于它的提交：
+
+  ```bash
+  # 前序分支合并进 main 之后
+  git rebase --onto main feat/v0-implementation docs/v0.5-spec
+  git push --force-with-lease origin docs/v0.5-spec
+  ```
 
 命名约定：
 
@@ -110,13 +117,13 @@ git push --force-with-lease origin feat/activity-reader
 ```
 
 `type`：`feat` / `fix` / `docs` / `refactor` / `test` / `chore` / `perf`。
-`scope` 建议使用架构组件名：`reader` / `state` / `rules` / `notify` / `store` / `screenpipe`。
+`scope` 取架构组件名。当前实际在用的：`config` / `reader` / `state` / `gate` / `store` / `notify` / `outcome` / `scheduler`；V0.5 起新增 `report` / `replay`。新组件引入时请同步更新这一行。
 
 示例：
 
 ```
-feat(state): 新增 LATE_NIGHT 状态判定
-fix(rules): 修复 cooldown 跨天未重置的问题
+feat(state): 新增被动消费状态判定
+fix(gate): 修复 cooldown 跨天未重置的问题
 docs(ref): 修正 ref1 中 /search 的 browser_url 描述
 ```
 
@@ -124,16 +131,16 @@ docs(ref): 修正 ref1 中 /search 的 browser_url 描述
 
 ---
 
-## 6. 若获得上游 Write 权限
+## 6. 推分支到上游（已具备权限）
 
-拿到 collaborator 权限后，可简化为「推分支到上游」：
+`SilhouetteQA` 已是 collaborator，可以直接把分支推到上游：
 
 ```bash
 git remote set-url --push upstream https://github.com/Bairea/StateSense-Agent.git
-git push -u upstream feat/activity-reader
+git push -u upstream docs/v0.5-spec
 ```
 
-并把 `origin` 降级为纯备份 fork。是否切换由仓库 owner 决定。
+`origin`（fork）继续作为备份，推 `origin` 开 PR 同样可行 —— 两条路径产生的 PR 等价。选哪条由提交者决定。
 
 ---
 
@@ -146,8 +153,16 @@ git push -u upstream feat/activity-reader
 | Python | 3.12.10 |
 | uv | 0.11.6 |
 | Node | v24.14.1 |
-| bun | **未安装**（Screenpipe CLI 的 fallback 通道需要） |
-| Screenpipe | **未安装**，本地 `localhost:3030` 无 recorder 运行 |
+| bun | 已安装（`D:\DevTools\bun`，`BUN_INSTALL` 已写入用户环境变量） |
+| Screenpipe | 已安装（v0.4.50），数据目录 `D:\Screenpipe`，recorder 监听 `localhost:3030` |
+
+Screenpipe 的启动命令（V0 实测可用）：
+
+```bash
+screenpipe record --data-dir "D:\Screenpipe" --disable-audio --retention-days 14
+```
+
+> 访问 `localhost:3030` **即使从本机发起也需要** `Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY`，否则返回 403。见第 8 节。
 
 ### 关于 `ghfast.top` 镜像
 
