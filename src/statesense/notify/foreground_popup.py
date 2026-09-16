@@ -52,7 +52,9 @@ class ForegroundPopupNotifier:
         thread.start()
 
         self._popup.beep()
-        self._popup.force_front(title, self._config.foreground_timeout_seconds)
+        if not self._popup.force_front(title, self._config.foreground_timeout_seconds):
+            # 抢前台失败通常意味着被更强的前台锁定占住。窗口仍被创建了，但可能看不见。
+            log.warning("未能把弹窗抢到前台，用户可能看不到：%s", title)
         thread.join(timeout=self._config.answer_timeout_seconds)
 
         timed_out = thread.is_alive()

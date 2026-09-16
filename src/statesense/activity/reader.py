@@ -10,9 +10,17 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from datetime import datetime
 
-from .models import ActivitySnapshot, Entry
+from .models import (
+    KNOWN_STATUSES,
+    UNREACHABLE,
+    ActivitySnapshot,
+    Entry,
+)
 
 log = logging.getLogger(__name__)
+
+#: 连续失败多少轮之后才写一条告警日志。每轮都写会变成日志风暴。
+FAILURES_BEFORE_WARNING = 5
 
 HttpGet = Callable[[str, Mapping[str, str], float], "tuple[int, bytes]"]
 
@@ -61,6 +69,7 @@ class ActivityReader:
         self._api_key = api_key
         self._timeout = timeout
         self._http_get = http_get
+        self._consecutive_failures = 0
 
     def read(
         self,
@@ -93,10 +102,9 @@ class ActivityReader:
         if not isinstance(payload, dict):
             return self._degraded(start, end, window_minutes, captured_at, "unexpected payload")
 
-        windows = payload.get("windows") or []
-        apps = payload.get("apps") or []
+        windows = payload.get("windows")
         entries: list[Entry] = []
-        if isinstance(windows, list) and windows:
+        if isinstance(windows, list):
             for row in windows:
                 if not isinstance(row, dict):
                     continue
@@ -108,35 +116,36 @@ class ActivityReader:
                         minutes=_num(row.get("minutes")),
                     )
                 )
-        elif isinstance(apps, list):
-            for row in apps:
-                if not isinstance(row, dict):
-                    continue
-                entries.append(
-                    Entry(
-                        app=_text(row.get("name")),
-                        title="",
-                        url="",
-                        minutes=_num(row.get("minutes")),
-                    )
-                )
 
         total = _num(payload.get("total_active_minutes"))
-        if total == 0.0 and entries:
-            total = round(sum(e.minutes for e in entries), 1)
+        # 只在 windows 缺失/空但声称有活动时才提示。绝不拿 entries 之和去估算总时长 ——
+        # entries 是窗口粒度的记录，用它估时间正是 spec §15.1 明令禁止的做法。
+        if not entries and total > 0:
+            log.warning(
+                "activity-summary 有 %s 分钟活动却没有 windows 明细；本轮将无法识别任何状态",
+                total,
+            )
 
+        raw_status = _text(payload.get("data_status"))
+        if raw_status not in KNOWN_STATUSES:
+            # 不认识的 data_status 说明响应结构与预期不符，按读不到处理。
+            return self._degraded(
+                start, end, window_minutes, captured_at, f"unrecognized data_status {raw_status!r}"
+            )
+
+        self._consecutive_failures = 0
         return ActivitySnapshot(
             window_start=start,
             window_end=end,
             window_minutes=window_minutes,
             total_active_minutes=total,
             entries=tuple(entries),
-            data_status=_text(payload.get("data_status")) or "unknown",
+            data_status=raw_status,
             captured_at=captured_at,
         )
 
-    @staticmethod
     def _degraded(
+        self,
         start: datetime,
         end: datetime,
         window_minutes: int,
@@ -144,13 +153,22 @@ class ActivityReader:
         reason: str,
     ) -> ActivitySnapshot:
         """data_status 是封闭枚举，原因走日志 —— 它要入库并被相等比较，不能掺自由文本。"""
-        log.warning("activity-summary 不可用：%s", reason)
+        self._consecutive_failures += 1
+        # 每轮都写会变成日志风暴；按 spec §11 只在连续失败累积到阈值时提示。
+        if self._consecutive_failures >= FAILURES_BEFORE_WARNING and (
+            self._consecutive_failures % FAILURES_BEFORE_WARNING == 0
+        ):
+            log.warning(
+                "activity-summary 连续 %d 轮不可用：%s", self._consecutive_failures, reason
+            )
+        else:
+            log.debug("activity-summary 不可用（第 %d 轮）：%s", self._consecutive_failures, reason)
         return ActivitySnapshot(
             window_start=start,
             window_end=end,
             window_minutes=window_minutes,
             total_active_minutes=0.0,
             entries=(),
-            data_status="unreachable",
+            data_status=UNREACHABLE,
             captured_at=captured_at,
         )

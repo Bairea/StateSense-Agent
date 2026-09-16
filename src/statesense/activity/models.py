@@ -7,6 +7,18 @@ from datetime import datetime
 
 TRUSTWORTHY_STATUSES = frozenset({"ok"})
 
+#: 服务端可能明确告知的「明确不可信」状态。
+KNOWN_UNTRUSTWORTHY_STATUSES = frozenset(
+    {"empty_but_recording", "no_capture_in_range", "not_recording"}
+)
+
+#: 本地判定出的「读不到」。
+UNREACHABLE = "unreachable"
+
+#: data_status 的封闭枚举。读到枚举外的值一律按 unreachable 处理 ——
+#: 不认识的字段意味着响应结构与预期不符，此时任何「没有活动」的结论都不成立。
+KNOWN_STATUSES = TRUSTWORTHY_STATUSES | KNOWN_UNTRUSTWORTHY_STATUSES | {UNREACHABLE}
+
 
 @dataclass(frozen=True)
 class Entry:
