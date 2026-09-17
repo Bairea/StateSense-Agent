@@ -141,8 +141,17 @@ def load_config(path: Path) -> Config:
     if not path.is_file():
         raise ConfigError(f"配置文件不存在: {path}")
 
-    with path.open("rb") as fh:
-        raw = tomllib.load(fh)
+    raw_bytes = path.read_bytes()
+    # Windows 记事本默认写 UTF-8 BOM。tomllib 会因此报
+    # "Invalid statement (at line 1, column 1)" —— 位置指向文件开头，
+    # 用户完全看不出原因。显式剥掉。
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        raw_bytes = raw_bytes[3:]
+    try:
+        raw = tomllib.loads(raw_bytes.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        # 必须包成 ConfigError：main 只接这一种，否则用户看到的是 traceback 加退出码 1。
+        raise ConfigError(f"配置文件解析失败：{path}（{exc}）") from exc
 
     screenpipe = ScreenpipeConfig(**raw.get("screenpipe", {}))
     # spec §12/§15.1：base_url 可由 SCREENPIPE_LOCAL_API_URL 覆盖。

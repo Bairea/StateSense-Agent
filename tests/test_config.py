@@ -38,6 +38,34 @@ def test_loads_example_config_shipped_with_repo():
     assert cfg.actions
 
 
+def test_utf8_bom_is_tolerated(tmp_path):
+    """Windows 记事本默认写 UTF-8 BOM，而 tomllib 会报「Invalid statement（第 1 行第 1 列）」。
+
+    实测踩到过：位置指向文件开头，用户完全看不出原因。
+    """
+    p = tmp_path / "config.toml"
+    p.write_bytes(b"\xef\xbb\xbf" + MINIMAL.encode("utf-8"))
+    cfg = load_config(p)
+    assert cfg.gate.ratio_min == 0.75
+
+
+def test_malformed_toml_raises_config_error_not_a_traceback(tmp_path):
+    """TOML 语法错误必须包成 ConfigError —— main 只接这一种。
+
+    否则用户看到的是 Python traceback 加退出码 1，而不是「配置错误：…」加退出码 2。
+    """
+    p = _write(tmp_path, MINIMAL + "\nthis is not toml\n")
+    with pytest.raises(ConfigError, match="配置文件解析失败"):
+        load_config(p)
+
+
+def test_invalid_utf8_raises_config_error(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_bytes(b"[screenpipe]\nbase_url = \"\xff\xfe\x00\"\n")
+    with pytest.raises(ConfigError, match="配置文件解析失败"):
+        load_config(p)
+
+
 def test_missing_ratio_min_fails_fast(tmp_path):
     with pytest.raises(ConfigError, match="ratio_min"):
         load_config(_write(tmp_path, MINIMAL.replace("ratio_min = 0.75\n", "")))

@@ -127,3 +127,13 @@ def test_outdated_schema_is_refused_without_writing(tmp_path, capsys):
     cfg = _config_file(tmp_path)
     assert main(["--report", "--config", str(cfg)]) == 2
     assert "先跑一次 --once" in capsys.readouterr().err
+
+
+def test_malformed_config_exits_2_without_a_traceback(tmp_path, capsys):
+    """配置语法错误必须是干净的「配置错误：…」+ 退出码 2，而不是 traceback + 1。"""
+    cfg = _config_file(tmp_path)
+    cfg.write_text(cfg.read_text(encoding="utf-8") + "\nthis is not toml\n", encoding="utf-8")
+    assert main(["--report", "--config", str(cfg)]) == 2
+    err = capsys.readouterr().err
+    assert "配置错误" in err
+    assert "Traceback" not in err
