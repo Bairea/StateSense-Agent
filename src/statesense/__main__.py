@@ -15,6 +15,7 @@ from statesense.clock import Clock, SystemClock
 from statesense.config import Config, ConfigError, load_config
 from statesense.notify.base import Notifier, RecordingNotifier
 from statesense.notify.foreground_popup import ForegroundPopupNotifier
+from statesense.perception import default_probe, describe
 from statesense.replay.scenarios import SCENARIOS, check_scenario, structural_findings
 from statesense.report import queries, render
 from statesense.report.models import ReportData
@@ -103,6 +104,8 @@ def check(config: Config) -> int:
     print(f"ratio_min   {config.gate.ratio_min}")
     print(f"回看窗口    最近 {window} 分钟")
     print(f"data_status {snapshot.data_status}")
+    fullscreen = default_probe().state()
+    print(f"全屏信号    {fullscreen}  {describe(fullscreen)}")
     print(f"取到 {len(snapshot.entries)} 条窗口记录，总活跃 {snapshot.total_active_minutes} 分钟")
     for entry in sorted(snapshot.entries, key=lambda e: e.minutes, reverse=True)[:5]:
         print(f"  {entry.minutes:>6.1f} 分钟  {entry.title or entry.app}")

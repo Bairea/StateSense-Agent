@@ -256,3 +256,75 @@ def test_db_option_is_accepted():
 
     args = build_parser().parse_args(["--check", "--db", "custom.db"])
     assert args.db == Path("custom.db")
+
+
+# ── 全屏信号端到端（带对照组）────────────────────────────────
+
+QUNS_RUNNING_D3D_FULL_SCREEN = 3
+
+
+class _StubProbe:
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def state(self):
+        self.calls += 1
+        return self.value
+
+
+def _unnamed_game(ent_minutes: float, total: float = 60.0) -> bytes:
+    """一个**没进配置清单**的游戏：窗口标题与进程名都是游戏自身。
+
+    实测就是 Brotato 的形状（`Brotato.exe` / `Brotato`）—— 平台名抓不到它。
+    """
+    return json.dumps(
+        {
+            "total_active_minutes": total,
+            "data_status": "ok",
+            "windows": [
+                {
+                    "app_name": "SomeGame.exe",
+                    "window_name": "SomeGame",
+                    "browser_url": "",
+                    "minutes": ent_minutes,
+                }
+            ],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _probe_scheduler(config, store, body: bytes, probe):
+    return Scheduler(
+        config=config,
+        clock=FrozenClock(T0),
+        reader=ActivityReader("http://localhost:3030", "k", 10.0, lambda *a: (200, body)),
+        store=store,
+        notifier=RecordingNotifier(),
+        fullscreen=probe,
+    )
+
+
+def test_fullscreen_signal_rescues_an_unnamed_game(config, store):
+    """没进清单的游戏在旧逻辑下判 NORMAL。全屏信号在跑时它应当被识别并触发。"""
+    probe = _StubProbe(QUNS_RUNNING_D3D_FULL_SCREEN)
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), probe)
+    report = sch.run_once()
+
+    assert report.state == "PASSIVE_CONSUMPTION", "全屏信号应当让未命名的游戏被识别"
+    assert report.intervened is True
+    assert probe.calls >= 1, "每轮应当真的探测一次"
+    row = store.fetch_evaluation(report.evaluation_id)
+    assert row["fullscreen_state"] == QUNS_RUNNING_D3D_FULL_SCREEN
+    assert row["ent_minutes"] == 45.0
+
+
+def test_without_fullscreen_signal_the_same_game_is_missed(config, store):
+    """对照组：把信号关掉，同一个游戏完全不被识别 —— 这就是要解决的问题。"""
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), _StubProbe(None))
+    report = sch.run_once()
+
+    assert report.state == "NORMAL"
+    assert report.intervened is False
+    assert store.fetch_evaluation(report.evaluation_id)["fullscreen_state"] is None

@@ -73,6 +73,8 @@ def _verdict_lines(data: ReportData) -> list[str]:
         f"  data_status {_pairs(v.data_statuses)}",
         f"  skipped     {v.skipped}（这些轮的 state 不代表「真的正常」）",
         f"  late_night  {v.late_night}",
+        f"  全屏信号    {_pairs(v.fullscreen_states)}",
+        "              （2/3=判为游戏；1/4/5/6/7=未判为游戏；unknown=无法判定）",
     ]
 
 

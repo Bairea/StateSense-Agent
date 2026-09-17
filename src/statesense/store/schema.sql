@@ -17,6 +17,10 @@ CREATE TABLE IF NOT EXISTS evaluations (
   -- 条目分钟数之和。与 total_active_minutes 的差额是「明细缺失」，
   -- 与 (ent+gray+work) 的差额是「未命中任何规则」。V0.5 漏判视图靠它区分两者。
   entries_minutes REAL NOT NULL DEFAULT 0,
+  -- SHQueryUserNotificationState 的原始返回值；NULL = 无法判定。
+  -- 记原始值而不是布尔：这条「自动推断」需要事后审计准确率，
+  -- 只存 true/false 就再也答不上「它当时到底看到了什么」。
+  fullscreen_state INTEGER,
   prev_state TEXT,
   decision TEXT NOT NULL,
   gate_trace TEXT NOT NULL

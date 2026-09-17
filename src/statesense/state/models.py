@@ -30,3 +30,7 @@ class StateVerdict:
     #: 与 (ent+gray+work) 的差额是「未命中任何规则」。刻意不给默认值 ——
     #: 0.0 本身就是可疑信号，静默默认会让漏判检测失效。
     entries_minutes: float
+    #: SHQueryUserNotificationState 的原始返回值；None = 无法判定。
+    #: 刻意不给默认值：`None` 是「不知道」，与「不是全屏」是两件事，
+    #: 而忘记传它会让整条全屏信号静默失效。
+    fullscreen_state: int | None

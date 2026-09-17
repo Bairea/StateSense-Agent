@@ -14,7 +14,7 @@ from statesense.intervention.models import Decision
 from statesense.outcome.models import OutcomeVerdict
 from statesense.state.models import StateVerdict
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 #: 运行事件的封闭枚举。写入未知类型必须报错 —— 与 gate.enabled 的处理同一原则：
@@ -64,6 +64,10 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE evaluations ADD COLUMN entries_minutes REAL NOT NULL DEFAULT 0"
             )
+        # v4 → v5：evaluations 增加 fullscreen_state（全屏 D3D 信号）。
+        # 旧行留 NULL = 「无法判定」—— 不伪造「当时不是全屏」。
+        if "fullscreen_state" not in _column_names(self._conn, "evaluations"):
+            self._conn.execute("ALTER TABLE evaluations ADD COLUMN fullscreen_state INTEGER")
 
     def user_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -92,9 +96,9 @@ class Store:
                 """
                 INSERT INTO evaluations (
                   at, window_minutes, total_active_minutes, ent_minutes, gray_minutes,
-                  work_minutes, ent_ratio, entries_minutes, state, late_night, data_status,
-                  skipped, prev_state, decision, gate_trace
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  work_minutes, ent_ratio, entries_minutes, fullscreen_state, state, late_night,
+                  data_status, skipped, prev_state, decision, gate_trace
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _iso(at),
@@ -105,6 +109,7 @@ class Store:
                     verdict.work_minutes,
                     verdict.ent_ratio,
                     verdict.entries_minutes,
+                    verdict.fullscreen_state,
                     str(verdict.state),
                     int(verdict.late_night),
                     verdict.data_status,

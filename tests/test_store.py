@@ -29,6 +29,7 @@ def _verdict(state=State.PASSIVE_CONSUMPTION) -> StateVerdict:
         work_minutes=10.0,
         ent_ratio=0.75,
         entries_minutes=60.0,
+        fullscreen_state=None,
         window_minutes=60,
         data_status="ok",
         skipped=False,
@@ -49,7 +50,7 @@ def test_migrate_is_idempotent(tmp_path):
     s = Store(tmp_path / "x.db")
     s.migrate()
     s.migrate()
-    assert s.user_version() == 4
+    assert s.user_version() == 5
     s.close()
 
 
@@ -84,12 +85,13 @@ def test_migrates_v1_database_by_adding_user_response(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 4
+    assert s.user_version() == 5
     intervention_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(interventions)")}
     evaluation_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(evaluations)")}
     assert "user_response" in intervention_columns
     assert "skipped" in evaluation_columns
     assert "entries_minutes" in evaluation_columns
+    assert "fullscreen_state" in evaluation_columns
     s.close()
 
 
@@ -124,6 +126,7 @@ def test_skipped_flag_distinguishes_no_data_from_truly_normal(store):
     skipped_verdict = StateVerdict(
         state=State.NORMAL, late_night=False, total_active_minutes=0.0, ent_minutes=0.0,
         gray_minutes=0.0, work_minutes=0.0, ent_ratio=0.0, entries_minutes=0.0,
+        fullscreen_state=None,
         window_minutes=60,
         data_status="no_capture_in_range", skipped=True,
         skip_reason="no_capture_in_range",

@@ -43,6 +43,9 @@ class VerdictBreakdown:
     data_statuses: tuple[tuple[str, int], ...]
     skipped: int
     late_night: int
+    #: 全屏信号的原始取值分布（含 "unknown" 一档）。
+    #: 这条「自动推断」的准确率只能靠它事后审计 —— 只存布尔就审不动了。
+    fullscreen_states: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)

@@ -110,6 +110,20 @@ def test_views_flag_adds_sections():
     assert "效果面" in out
 
 
+def test_verdict_section_shows_fullscreen_distribution():
+    """这条自动推断的准确率只能靠分布审计 —— 必须能看见它取过哪些值，
+    以及「无法判定」占了多大比例。"""
+    data = _data(
+        verdicts=VerdictBreakdown(
+            3, (("NORMAL", 3),), (("ok", 3),), 0, 0, (("2", 2), ("unknown", 1))
+        )
+    )
+    out = render.render_text(data, views=("1",))
+    assert "全屏信号" in out
+    assert "2=2" in out
+    assert "unknown=1" in out
+
+
 def test_views_flag_is_selective():
     out = render.render_text(_data(), views=("1",))
     assert "判定面" in out

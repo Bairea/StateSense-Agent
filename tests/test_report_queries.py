@@ -30,6 +30,7 @@ def _verdict(ent: float = 45.0) -> StateVerdict:
         work_minutes=10.0,
         ent_ratio=ent / 60.0,
         entries_minutes=60.0,
+        fullscreen_state=None,
         window_minutes=60,
         data_status="ok",
         skipped=False,
@@ -84,7 +85,8 @@ def test_list_methods_work_when_tables_are_empty(store):
 # ── 聚合纯函数 ──────────────────────────────────────────────
 
 def _eval_row(store, at, *, ent=45.0, total=60.0, state="PASSIVE_CONSUMPTION",
-              data_status="ok", skipped=0, entries=None, gates=None):
+              data_status="ok", skipped=0, entries=None, gates=None,
+              fullscreen_state=None):
     verdict = StateVerdict(
         state=State(state),
         late_night=False,
@@ -94,6 +96,7 @@ def _eval_row(store, at, *, ent=45.0, total=60.0, state="PASSIVE_CONSUMPTION",
         work_minutes=0.0,
         ent_ratio=(ent / total if total > 0 else 0.0),
         entries_minutes=(total if entries is None else entries),
+        fullscreen_state=fullscreen_state,
         window_minutes=60,
         data_status=data_status,
         skipped=bool(skipped),

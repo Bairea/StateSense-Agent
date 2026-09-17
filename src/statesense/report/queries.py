@@ -87,10 +87,15 @@ def build_overview(
 def build_verdict_breakdown(evaluations: Sequence[Any]) -> VerdictBreakdown:
     states: Counter[str] = Counter()
     statuses: Counter[str] = Counter()
+    fullscreen: Counter[str] = Counter()
     skipped = late_night = 0
     for row in evaluations:
         states[row["state"]] += 1
         statuses[row["data_status"]] += 1
+        # 键用字符串：None（无法判定）要能与 5（正常）区分开，
+        # 混成一个数就再也答不上「到底探测成功过几次」。
+        value = row["fullscreen_state"] if "fullscreen_state" in row.keys() else None
+        fullscreen["unknown" if value is None else str(value)] += 1
         skipped += int(row["skipped"])
         late_night += int(row["late_night"])
     return VerdictBreakdown(
@@ -99,6 +104,7 @@ def build_verdict_breakdown(evaluations: Sequence[Any]) -> VerdictBreakdown:
         data_statuses=_ranked(statuses),
         skipped=skipped,
         late_night=late_night,
+        fullscreen_states=_ranked(fullscreen),
     )
 
 

@@ -1,9 +1,11 @@
 import re
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from statesense.activity.models import ActivitySnapshot, Entry
 from statesense.config import TaxonomyConfig, ThresholdConfig
-from statesense.state.engine import classify, is_late_night
+from statesense.state.engine import classify, effective_entertainment_minutes, is_late_night
 from statesense.state.models import State
 
 T0 = datetime(2026, 9, 16, 6, 0, tzinfo=timezone.utc)
@@ -178,3 +180,93 @@ def test_entries_minutes_is_present_on_skipped_verdict_too():
     v = classify(_snap([], 0.0, data_status="unreachable"), TAX, TH)
     assert v.skipped is True
     assert v.entries_minutes == 0.0
+
+
+# ── 全屏 D3D 信号（唯一一处自动推断）────────────────────────
+
+GAMING = 3   # QUNS_RUNNING_D3D_FULL_SCREEN
+BUSY = 2     # QUNS_BUSY —— 本机实测游戏在前台时返回的就是它
+NORMAL = 5   # QUNS_ACCEPTS_NOTIFICATIONS
+
+
+def test_fullscreen_gaming_promotes_other_to_entertainment():
+    """游戏窗口就是游戏自身（Brotato.exe / Brotato），规则命中不了 ——
+    全屏信号把「未命中任何规则」的条目提权为娱乐。"""
+    v = classify(_snap([_other(45.0)], 45.0), TAX, TH, fullscreen_state=GAMING)
+    assert v.ent_minutes == 45.0
+    assert v.state is State.PASSIVE_CONSUMPTION
+
+
+def test_fullscreen_gaming_does_not_promote_work():
+    """边打游戏边开终端时，终端时间不该算娱乐 —— 只提权 OTHER。"""
+    v = classify(_snap([_work(45.0)], 45.0), TAX, TH, fullscreen_state=GAMING)
+    assert v.ent_minutes == 0.0
+    assert v.work_minutes == 45.0
+    assert v.state is State.NORMAL
+
+
+def test_fullscreen_gaming_does_not_promote_gray():
+    v = classify(
+        _snap([Entry("chrome.exe", "某问题 - 知乎", "", 45.0)], 45.0),
+        TAX,
+        TH,
+        fullscreen_state=GAMING,
+    )
+    assert v.ent_minutes == 0.0
+    assert v.gray_minutes == 45.0
+    assert v.state is State.NORMAL
+
+
+def test_fullscreen_gaming_adds_to_existing_entertainment():
+    v = classify(_snap([_ent(10.0), _other(35.0)], 45.0), TAX, TH, fullscreen_state=GAMING)
+    assert v.ent_minutes == 45.0
+
+
+def test_busy_state_also_counts_as_gaming():
+    """实测：三角洲行动在前台时返回 2，不是 3。只接受 3 会让信号在本机永不触发。"""
+    v = classify(_snap([_other(45.0)], 45.0), TAX, TH, fullscreen_state=BUSY)
+    assert v.ent_minutes == 45.0
+    assert v.state is State.PASSIVE_CONSUMPTION
+
+
+@pytest.mark.parametrize("state", [None, 1, NORMAL, 4, 6, 7])
+def test_non_gaming_states_do_not_promote(state):
+    v = classify(_snap([_other(45.0)], 45.0), TAX, TH, fullscreen_state=state)
+    assert v.ent_minutes == 0.0
+    assert v.state is State.NORMAL
+
+
+def test_gaming_does_not_promote_when_data_is_untrustworthy():
+    """数据都不可信时，连 ent 本身都不该有结论，更不该提权。"""
+    v = classify(
+        _snap([_other(45.0)], 45.0, data_status="unreachable"),
+        TAX,
+        TH,
+        fullscreen_state=GAMING,
+    )
+    assert v.skipped is True
+    assert v.ent_minutes == 0.0
+
+
+def test_fullscreen_state_is_recorded_verbatim():
+    """记原始值而不是布尔 —— 只存 true/false 就再也答不上「它当时看到了什么」。"""
+    assert classify(_snap([_other(5.0)], 60.0), TAX, TH, fullscreen_state=GAMING).fullscreen_state == GAMING
+    assert classify(_snap([_other(5.0)], 60.0), TAX, TH, fullscreen_state=None).fullscreen_state is None
+
+
+def test_classify_defaults_to_unknown_fullscreen():
+    """省略该参数 = 无法判定 = 保守不提权。与 StateVerdict 字段不给默认值是两回事：
+    那是「被记录的事实」，这是「可选的输入」。"""
+    v = classify(_snap([_other(45.0)], 45.0), TAX, TH)
+    assert v.ent_minutes == 0.0
+    assert v.fullscreen_state is None
+
+
+def test_effective_entertainment_minutes_matches_classify():
+    """状态判定与行为回执必须共用同一口径 —— 一旦漂移，「干预前 vs 干预后」
+    就不是同一个量，回执会失真。V0 审查发现过两处各算一份。"""
+    for fullscreen in (GAMING, BUSY, None):
+        snap = _snap([_ent(10.0), _other(35.0), _work(5.0)], 50.0)
+        assert effective_entertainment_minutes(
+            snap, TAX, fullscreen_state=fullscreen
+        ) == classify(snap, TAX, TH, fullscreen_state=fullscreen).ent_minutes

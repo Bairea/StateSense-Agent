@@ -17,8 +17,8 @@ from statesense.intervention.gates import GateContext
 from statesense.intervention.wording import TemplateWording, Wording
 from statesense.notify.base import Notifier
 from statesense.outcome.tracker import evaluate as evaluate_outcome
-from statesense.state.engine import classify
-from statesense.state.taxonomy import entertainment_minutes
+from statesense.perception import FullscreenProbe, default_probe
+from statesense.state.engine import classify, effective_entertainment_minutes
 from statesense.store.db import Store
 
 log = logging.getLogger(__name__)
@@ -44,6 +44,7 @@ class Scheduler:
         store: Store,
         notifier: Notifier,
         wording: Wording | None = None,
+        fullscreen: FullscreenProbe | None = None,
     ) -> None:
         self._config = config
         self._clock = clock
@@ -51,13 +52,20 @@ class Scheduler:
         self._store = store
         self._notifier = notifier
         self._wording = wording or TemplateWording()
+        self._fullscreen = fullscreen or default_probe()
         self._last_evaluation_at: datetime | None = None
 
     # ── 对外 ────────────────────────────────────────────────
 
     def ent_minutes(self, snapshot: ActivitySnapshot) -> float:
-        """被动消费分钟数。委托给 taxonomy —— 与状态判定共用同一口径，不另算一份。"""
-        return entertainment_minutes(snapshot.entries, self._config.taxonomy)
+        """被动消费分钟数。与状态判定共用同一口径 —— **包括全屏提权**。
+
+        若这里退回原始 taxonomy 口径，全屏识别出的游戏会在回执里 ent_before=0，
+        回执直接落成 no_data —— 刚加的信号会自己把反馈回路切断。
+        """
+        return effective_entertainment_minutes(
+            snapshot, self._config.taxonomy, fullscreen_state=self._fullscreen.state()
+        )
 
     def run_once(self) -> TickReport:
         now = self._clock.now()
@@ -132,7 +140,12 @@ class Scheduler:
         self._last_evaluation_at = now
 
         snapshot = self._reader.read(now - timedelta(minutes=window), now, window, now)
-        verdict = classify(snapshot, self._config.taxonomy, self._config.thresholds)
+        verdict = classify(
+            snapshot,
+            self._config.taxonomy,
+            self._config.thresholds,
+            fullscreen_state=self._fullscreen.state(),
+        )
 
         day_start = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
         ctx = GateContext(

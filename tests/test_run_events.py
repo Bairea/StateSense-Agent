@@ -24,15 +24,24 @@ def store(tmp_path):
     s.close()
 
 
-# ── schema v4 ───────────────────────────────────────────────
+# ── schema 版本与迁移 ───────────────────────────────────────
 
-def test_user_version_is_4(store):
-    assert store.user_version() == 4
+def test_user_version_is_current(store):
+    assert store.user_version() == 5
 
 
 def test_entries_minutes_column_exists(store):
     columns = {r["name"] for r in store._conn.execute("PRAGMA table_info(evaluations)")}
     assert "entries_minutes" in columns
+
+
+def test_fullscreen_state_column_is_nullable(store):
+    """NULL 表示「无法判定」，必须允许 —— 不能拿 0 假装「当时不是全屏」。"""
+    columns = {
+        r["name"]: r for r in store._conn.execute("PRAGMA table_info(evaluations)")
+    }
+    assert "fullscreen_state" in columns
+    assert columns["fullscreen_state"]["notnull"] == 0
 
 
 def test_insert_run_event_roundtrips(store):
@@ -99,19 +108,24 @@ def test_v3_database_upgrades_in_place(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 4
+    assert s.user_version() == 5
 
     columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(evaluations)")}
     assert "entries_minutes" in columns
+    assert "fullscreen_state" in columns
     tables = {
         r["name"] for r in s._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert "run_events" in tables
 
-    # 旧行保留，新列取 DEFAULT 0 —— 不伪造数据。
-    row = s._conn.execute("SELECT state, entries_minutes FROM evaluations").fetchone()
+    # 旧行保留，新列取 DEFAULT 0 / NULL —— 不伪造数据。
+    row = s._conn.execute(
+        "SELECT state, entries_minutes, fullscreen_state FROM evaluations"
+    ).fetchone()
     assert row["state"] == "NORMAL"
     assert row["entries_minutes"] == 0.0
+    # 旧行没观测过全屏状态，只能是 NULL（无法判定），不能是 0 或 5。
+    assert row["fullscreen_state"] is None
     s.close()
 
 
