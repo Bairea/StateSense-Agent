@@ -168,3 +168,44 @@ def test_json_output_serializes_datetimes():
         )
     )
     assert isinstance(payload["overview"]["gaps"][0]["minutes"], float)
+
+
+def _strict_loads(text: str):
+    """拒绝 Infinity / NaN 的解析器 —— jq、JavaScript、Go 都是这么干的。"""
+
+    def reject(constant: str):
+        raise ValueError(f"non-finite constant: {constant}")
+
+    return json.loads(text, parse_constant=reject)
+
+
+def test_json_output_never_emits_non_finite_constants():
+    """实测踩到过：旧版本往 gate_trace 里写过 Infinity（表示「从未干预过」），
+    原样输出会让 `--format json` 变成非法 JSON，而规格说它正是给 jq 用的。
+    """
+    from statesense.report.models import TraceRow
+
+    data = _data(
+        trace=(
+            TraceRow(
+                T0,
+                "WATCH",
+                0.47,
+                26.4,
+                56.5,
+                False,
+                "skip",
+                (("cooldown", True, float("inf"), 30.0),),
+            ),
+        )
+    )
+    text = render.render_json(data)
+    assert "Infinity" not in text
+    assert _strict_loads(text)["trace"][0]["gates"][0][2] is None
+
+
+def test_json_output_replaces_nan_too():
+    data = _data(overview=Overview(T0, T0, 1, 1, float("nan"), ()))
+    text = render.render_json(data)
+    assert "NaN" not in text
+    assert _strict_loads(text)["overview"]["coverage"] is None

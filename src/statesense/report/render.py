@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Collection
 from dataclasses import asdict
+from typing import Any
 
 from statesense.report.models import ContinuityGap, ReportData
 
@@ -183,5 +185,27 @@ def render_text(data: ReportData, *, views: Collection[str] = ()) -> str:
     return "\n".join(lines)
 
 
+def _jsonable(value: Any) -> Any:
+    """把非有限浮点数换成 null。
+
+    JSON 没有 inf / NaN 的表示。旧版本的代码往 `gate_trace` 里写过 `Infinity`
+    （表示「从未干预过」），`json.dumps` 默认会把它原样输出成裸 `Infinity` ——
+    那不是合法 JSON，`jq`、JavaScript、Go 的严格解析器都会直接拒绝。
+
+    report 读的是库里的历史行，包括旧版本写的行，所以这里必须挡住了再输出。
+    转成 null 也正好对应 `GateResult.value = None` 的既有语义：「这个概念此刻不适用」。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
 def render_json(data: ReportData) -> str:
-    return json.dumps(asdict(data), ensure_ascii=False, indent=2, default=str)
+    # allow_nan=False 是断言：上面已清干净，若还有非有限值漏过来，宁可当场炸。
+    return json.dumps(
+        _jsonable(asdict(data)), ensure_ascii=False, indent=2, default=str, allow_nan=False
+    )
