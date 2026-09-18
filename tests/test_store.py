@@ -28,6 +28,8 @@ def _verdict(state=State.PASSIVE_CONSUMPTION) -> StateVerdict:
         gray_minutes=5.0,
         work_minutes=10.0,
         ent_ratio=0.75,
+        entries_minutes=60.0,
+        fullscreen_state=None,
         window_minutes=60,
         data_status="ok",
         skipped=False,
@@ -48,7 +50,7 @@ def test_migrate_is_idempotent(tmp_path):
     s = Store(tmp_path / "x.db")
     s.migrate()
     s.migrate()
-    assert s.user_version() == 3
+    assert s.user_version() == 6
     s.close()
 
 
@@ -83,11 +85,13 @@ def test_migrates_v1_database_by_adding_user_response(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 3
+    assert s.user_version() == 6
     intervention_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(interventions)")}
     evaluation_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(evaluations)")}
     assert "user_response" in intervention_columns
     assert "skipped" in evaluation_columns
+    assert "entries_minutes" in evaluation_columns
+    assert "fullscreen_state" in evaluation_columns
     s.close()
 
 
@@ -121,7 +125,9 @@ def test_skipped_flag_distinguishes_no_data_from_truly_normal(store):
     normal = store.insert_evaluation(T0, _verdict(state=State.NORMAL), _decision(False))
     skipped_verdict = StateVerdict(
         state=State.NORMAL, late_night=False, total_active_minutes=0.0, ent_minutes=0.0,
-        gray_minutes=0.0, work_minutes=0.0, ent_ratio=0.0, window_minutes=60,
+        gray_minutes=0.0, work_minutes=0.0, ent_ratio=0.0, entries_minutes=0.0,
+        fullscreen_state=None,
+        window_minutes=60,
         data_status="no_capture_in_range", skipped=True,
         skip_reason="no_capture_in_range",
     )
@@ -158,6 +164,7 @@ def test_intervention_and_due_lookup(store):
         action_text="离开电脑走 5 分钟",
         delivery_status="delivered",
         outcome_due_at=due,
+        channel="foreground_popup",
     )
     assert store.due_interventions(T0 + timedelta(minutes=9)) == []
     pending = store.due_interventions(due)
@@ -170,7 +177,8 @@ def test_due_interventions_excludes_already_checked(store):
     eid = store.insert_evaluation(T0, _verdict(), _decision())
     due = T0 + timedelta(minutes=10)
     iid = store.insert_intervention(
-        eid, T0, "PASSIVE_CONSUMPTION", False, "walk5", "走 5 分钟", "delivered", due
+        eid, T0, "PASSIVE_CONSUMPTION", False, "walk5", "走 5 分钟", "delivered", due,
+        channel="foreground_popup",
     )
     store.insert_outcome(iid, due, OutcomeVerdict("disengaged", 45.0, 3.0, 10.0))
     assert store.due_interventions(due + timedelta(minutes=60)) == []
@@ -187,6 +195,7 @@ def test_outcome_roundtrip(store):
         "走 5 分钟",
         "delivered",
         T0 + timedelta(minutes=10),
+        channel="foreground_popup",
     )
     store.insert_outcome(iid, T0 + timedelta(minutes=10), OutcomeVerdict("partial", 45.0, 30.0, 10.0))
     row = store.fetch_outcome(iid)
@@ -207,6 +216,7 @@ def test_last_intervention_at_ignores_failed_delivery(store):
         "走 5 分钟",
         "failed: toast unavailable",
         T0 + timedelta(minutes=10),
+        channel="foreground_popup",
     )
     assert store.last_intervention_at() is None
     store.insert_intervention(
@@ -218,6 +228,7 @@ def test_last_intervention_at_ignores_failed_delivery(store):
         "走 5 分钟",
         "delivered",
         T0 + timedelta(minutes=11),
+        channel="foreground_popup",
     )
     assert store.last_intervention_at() == T0 + timedelta(minutes=1)
 
@@ -234,6 +245,7 @@ def test_intervention_count_since(store):
             "走 5 分钟",
             "delivered",
             T0 + timedelta(minutes=10 + i),
+            channel="foreground_popup",
         )
     assert store.intervention_count_since(T0) == 3
     assert store.intervention_count_since(T0 + timedelta(minutes=1)) == 2
@@ -252,6 +264,7 @@ def test_user_response_roundtrip(store):
     iid = store.insert_intervention(
         eid, T0, "PASSIVE_CONSUMPTION", False, "walk5", "走 5 分钟", "delivered",
         T0 + timedelta(minutes=10), user_response="accepted",
+        channel="foreground_popup",
     )
     assert store.fetch_intervention(iid)["user_response"] == "accepted"
 
@@ -261,5 +274,6 @@ def test_user_response_defaults_to_null(store):
     iid = store.insert_intervention(
         eid, T0, "PASSIVE_CONSUMPTION", False, "walk5", "走 5 分钟", "delivered",
         T0 + timedelta(minutes=10),
+        channel="foreground_popup",
     )
     assert store.fetch_intervention(iid)["user_response"] is None

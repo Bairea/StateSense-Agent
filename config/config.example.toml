@@ -2,6 +2,12 @@
 # 复制为 config/config.toml 后按需修改。密钥不放这里，走环境变量。
 
 [screenpipe]
+# 端口必须与 recorder 实际的 --port 一致。
+# 3030 是 Screenpipe 的默认端口，但它**可能被别的软件占着** —— 本机实测被
+# Docker Desktop 的 com.docker.backend 占过。被占时的现象极具误导性：
+# Screenpipe 绑不上却仍有进程，端口确实在监听，但 /activity-summary 返回 404，
+# 于是每轮评估都记成 data_status=unreachable，而一切看起来都"在跑"。
+# 排查手段：Get-NetTCPConnection -LocalPort 3030 -State Listen 看 OwningProcess 是谁。
 base_url = "http://localhost:3030"
 api_key_env = "SCREENPIPE_LOCAL_API_KEY"
 request_timeout_sec = 10
@@ -14,7 +20,11 @@ window_minutes = 60
 [thresholds]
 watch_minutes = 20
 passive_minutes = 40
-high_risk_minutes = 65
+# 必须 <= schedule.window_minutes。ent 是窗口内条目分钟数之和，上界就是窗口长度
+# （60），所以 65 这条线永远够不到 —— HIGH_RISK_PASSIVE_CONSUMPTION 会成为死状态，
+# 它专属的动作（reading）永远不会被选中，而配置看起来一切正常。
+# 现在这种组合会在启动时被直接拒绝，不再靠运行时 WARN 提示。
+high_risk_minutes = 55
 late_night_start_hour = 1
 late_night_end_hour = 6
 late_night_min_active_minutes = 10
@@ -46,7 +56,26 @@ foreground_timeout_seconds = 15
 [store]
 path = "statesense.db"
 
+[report]
+# 连续性阈值，同时用于两个判定（语义不同但阈值相同，故不设两个键）：
+#   · 回看历史：相邻评估的间隔超过它 → 记为一处缺口
+#   · 判断当下：最后一条评估距今超过它 → 视为掉线
+# 默认 = 3 × schedule.evaluate_every_minutes
+gap_threshold_minutes = 15
+# 漏判锚点：窗口活跃至少这么多分钟，才值得怀疑规则漏掉了什么
+leak_min_active_minutes = 30
+# 漏判锚点：未归类占比至少这么高
+leak_min_unclassified_ratio = 0.7
+# 二级漏判视图最多列几条明细
+leak_top_n = 10
+
 [taxonomy]
+# ⚠️ 平台名 ≠ 游戏名。
+# Steam / Epic 启动的游戏，进程名与窗口标题都是游戏自身，不含 "steam" 等平台关键词 ——
+# 只写平台名会漏掉它们。实测：刷 Brotato 46.9 分钟被判成 NORMAL（ent=0），
+# 因为清单里有 "steam" 却没有 "brotato"。
+# 所以下面既有平台名（能命中商店页），也要按需补上实际在玩的游戏名。
+# 发现清单缺口的常规手段：python -m statesense --report --views 5
 entertainment = [
   "bilibili", "哔哩哔哩", "B站", "douyin", "抖音", "tiktok", "youtube",
   "iqiyi", "爱奇艺", "youku", "优酷", "v\\.qq\\.com", "腾讯视频", "mgtv", "芒果TV",

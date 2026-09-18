@@ -15,6 +15,8 @@ def _verdict(state=State.PASSIVE_CONSUMPTION, *, ent=45.0, total=60.0, ratio=0.7
         gray_minutes=5.0,
         work_minutes=10.0,
         ent_ratio=ratio,
+        entries_minutes=total,
+        fullscreen_state=None,
         window_minutes=window,
         data_status="ok",
         skipped=False,

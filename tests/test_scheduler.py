@@ -6,13 +6,11 @@ import pytest
 
 from statesense.activity.reader import ActivityReader
 from statesense.clock import FrozenClock
-from statesense.config import load_config
 from statesense.notify.base import RESPONSE_ACCEPTED, RecordingNotifier
 from statesense.scheduler import Scheduler
 from statesense.store.db import Store
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
-REPO = Path(__file__).resolve().parents[1]
 
 
 def _body(ent_minutes: float, total: float = 60.0, status: str = "ok") -> bytes:
@@ -35,17 +33,6 @@ def _body(ent_minutes: float, total: float = 60.0, status: str = "ok") -> bytes:
         ],
     }
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-
-@pytest.fixture()
-def config(tmp_path):
-    src = (REPO / "config" / "config.example.toml").read_text(encoding="utf-8")
-    # TOML 基本字符串里反斜杠是转义符，Windows 路径必须用正斜杠。
-    db_path = (tmp_path / "s.db").as_posix()
-    src = src.replace('path = "statesense.db"', f'path = "{db_path}"')
-    target = tmp_path / "config.toml"
-    target.write_text(src, encoding="utf-8")
-    return load_config(target)
 
 
 @pytest.fixture()
@@ -256,3 +243,133 @@ def test_db_option_is_accepted():
 
     args = build_parser().parse_args(["--check", "--db", "custom.db"])
     assert args.db == Path("custom.db")
+
+
+# ── 全屏信号端到端（带对照组）────────────────────────────────
+
+QUNS_RUNNING_D3D_FULL_SCREEN = 3
+
+
+class _StubProbe:
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def state(self):
+        self.calls += 1
+        return self.value
+
+
+def _unnamed_game(ent_minutes: float, total: float = 60.0) -> bytes:
+    """一个**没进配置清单**的游戏：窗口标题与进程名都是游戏自身。
+
+    实测就是 Brotato 的形状（`Brotato.exe` / `Brotato`）—— 平台名抓不到它。
+    """
+    return json.dumps(
+        {
+            "total_active_minutes": total,
+            "data_status": "ok",
+            "windows": [
+                {
+                    "app_name": "SomeGame.exe",
+                    "window_name": "SomeGame",
+                    "browser_url": "",
+                    "minutes": ent_minutes,
+                }
+            ],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _probe_scheduler(config, store, body: bytes, probe):
+    return Scheduler(
+        config=config,
+        clock=FrozenClock(T0),
+        reader=ActivityReader("http://localhost:3030", "k", 10.0, lambda *a: (200, body)),
+        store=store,
+        notifier=RecordingNotifier(),
+        fullscreen=probe,
+    )
+
+
+def test_fullscreen_signal_rescues_an_unnamed_game(config, store):
+    """没进清单的游戏在旧逻辑下判 NORMAL。全屏信号在跑时它应当被识别并触发。"""
+    probe = _StubProbe(QUNS_RUNNING_D3D_FULL_SCREEN)
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), probe)
+    report = sch.run_once()
+
+    assert report.state == "PASSIVE_CONSUMPTION", "全屏信号应当让未命名的游戏被识别"
+    assert report.intervened is True
+    # **恰好一次**，不是「至少一次」：一轮里探两次，状态判定与行为回执就可能
+    # 用上两个不同的取值 —— 那样差出来的不是「效果」而是「探测时机」。
+    assert probe.calls == 1, "一轮只应探测一次"
+    row = store.fetch_evaluation(report.evaluation_id)
+    assert row["fullscreen_state"] == QUNS_RUNNING_D3D_FULL_SCREEN
+    assert row["ent_minutes"] == 45.0
+
+
+def test_fullscreen_is_sampled_once_even_when_an_outcome_is_due(config, store):
+    """回执到期那一轮，两次取数（判定 + 回执前后两侧）必须共用同一个探测结果。"""
+    probe = _StubProbe(QUNS_RUNNING_D3D_FULL_SCREEN)
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), probe)
+    first = sch.run_once()
+    assert first.intervened is True
+    probe.calls = 0
+
+    # 推进到回执到期那一轮：这一轮既要评估，又要结算上一轮的回执。
+    sch._clock.advance(minutes=15)  # noqa: SLF001 - 测试需要推进冻结时钟
+    sch.run_once()
+
+    assert probe.calls == 1, "判定与回执必须共用同一次探测"
+
+
+def test_run_forever_logs_start_abort_and_end(config, store, monkeypatch, caplog):
+    """`run_forever` 是死循环 —— **它返回这件事本身必须留下记录。**
+
+    实测踩到过：任务计划程序报 `LastTaskResult=0`（成功），进程却不见了，日志里
+    一句话没有，库里也没有 `run_events`（那两处补丁只覆盖 `run_tick_guarded`
+    抓到的异常，覆盖不了进程级退出）。唯一线索是一轮 tick 的间隔只有 2.8 分钟。
+    """
+    import logging
+
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), _StubProbe(None))
+
+    def explode(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("statesense.scheduler.time.sleep", explode)
+    with caplog.at_level(logging.INFO), pytest.raises(KeyboardInterrupt):
+        sch.run_forever()
+
+    assert "常驻循环开始" in caplog.text
+    assert "常驻循环异常中止：KeyboardInterrupt" in caplog.text
+    assert "常驻循环结束" in caplog.text
+
+
+def test_run_forever_logs_its_identity(config, store, monkeypatch, caplog):
+    """启动行要能区分两次运行：pid + 间隔 + 窗口 + 库路径。"""
+    import logging
+    import os
+
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), _StubProbe(None))
+
+    def explode(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("statesense.scheduler.time.sleep", explode)
+    with caplog.at_level(logging.INFO), pytest.raises(KeyboardInterrupt):
+        sch.run_forever()
+
+    assert f"pid={os.getpid()}" in caplog.text
+    assert str(config.store_path) in caplog.text
+
+
+def test_without_fullscreen_signal_the_same_game_is_missed(config, store):
+    """对照组：把信号关掉，同一个游戏完全不被识别 —— 这就是要解决的问题。"""
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), _StubProbe(None))
+    report = sch.run_once()
+
+    assert report.state == "NORMAL"
+    assert report.intervened is False
+    assert store.fetch_evaluation(report.evaluation_id)["fullscreen_state"] is None

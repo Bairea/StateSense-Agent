@@ -22,6 +22,8 @@ def _ctx(state=State.PASSIVE_CONSUMPTION, ratio=0.75) -> GateContext:
             gray_minutes=5.0,
             work_minutes=10.0,
             ent_ratio=ratio,
+            entries_minutes=60.0,
+            fullscreen_state=None,
             window_minutes=60,
             data_status="ok",
             skipped=False,

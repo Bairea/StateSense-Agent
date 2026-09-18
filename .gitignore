@@ -47,6 +47,13 @@ logs/
 out/
 tmp/
 
+# --- 审查 / 调试用的临时转储 ---
+# 踩过：审查子代理把 1748 行 diff 转储写进仓库，被 `git add -A` 扫进了提交。
+# 兜底一条规则，并请优先用显式路径而不是 `git add -A`。
+.review_*
+.scratch_*
+*_diff.txt
+
 # --- 编辑器 / 操作系统 ---
 .idea/
 .vscode/*

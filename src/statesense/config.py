@@ -7,6 +7,9 @@ import re
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any, TypeVar
+
+T = TypeVar("T")
 
 
 class ConfigError(Exception):
@@ -40,7 +43,8 @@ class ScheduleConfig:
 class ThresholdConfig:
     watch_minutes: float = 20
     passive_minutes: float = 40
-    high_risk_minutes: float = 65
+    #: 必须 <= schedule.window_minutes，否则该状态永远不可达（load_config 会拒绝）。
+    high_risk_minutes: float = 55
     late_night_start_hour: int = 1
     late_night_end_hour: int = 6
     late_night_min_active_minutes: float = 10
@@ -81,6 +85,24 @@ class NotifyConfig:
 
 
 @dataclass(frozen=True)
+class ReportConfig:
+    """观测层的判据阈值。
+
+    gap_threshold_minutes 同时用于两个语义不同、阈值相同的判定：
+    回看历史时「相邻评估的间隔」，与判断当下时「最后一条评估距今」。
+    合成一个键是有意的 —— 分两个键会让配置项翻倍，而它们本来就是一回事。
+    """
+
+    gap_threshold_minutes: float = 15
+    #: 漏判锚点：窗口活跃至少这么多分钟，才值得怀疑规则漏掉了什么。
+    leak_min_active_minutes: float = 30
+    #: 漏判锚点：未归类占比至少这么高。0.7 是起点，用真实分布再调。
+    leak_min_unclassified_ratio: float = 0.7
+    #: 二级漏判视图最多列几条明细。
+    leak_top_n: int = 10
+
+
+@dataclass(frozen=True)
 class TaxonomyConfig:
     entertainment: tuple[re.Pattern[str], ...] = ()
     gray: tuple[re.Pattern[str], ...] = ()
@@ -103,8 +125,24 @@ class Config:
     outcome: OutcomeConfig
     notify: NotifyConfig
     store_path: Path
+    report: ReportConfig
     taxonomy: TaxonomyConfig
     actions: tuple[Action, ...] = field(default_factory=tuple)
+
+
+def _section(cls: type[T], raw: dict[str, Any], name: str) -> T:
+    """按节构造配置 dataclass，把「键名拼错」翻译成启动期报错。
+
+    不做这一步的话，`[screenpipe] base_uri = "..."` 会在构造 dataclass 时抛
+    `TypeError` —— 它不是 `ConfigError`，`main` 接不住，用户看到的是 traceback
+    加退出码 1，与「配置非法」应有的干净报错（退出码 2）完全不同。
+
+    这与 BOM 那次是同一类缺陷：错误本身没错，错在它没有被翻译成用户能看懂的形式。
+    """
+    try:
+        return cls(**raw.get(name, {}))
+    except TypeError as exc:
+        raise ConfigError(f"[{name}] 节的键有问题：{exc}") from exc
 
 
 def _compile(patterns: list[str], where: str) -> tuple[re.Pattern[str], ...]:
@@ -122,28 +160,48 @@ def load_config(path: Path) -> Config:
     if not path.is_file():
         raise ConfigError(f"配置文件不存在: {path}")
 
-    with path.open("rb") as fh:
-        raw = tomllib.load(fh)
+    raw_bytes = path.read_bytes()
+    # Windows 记事本默认写 UTF-8 BOM。tomllib 会因此报
+    # "Invalid statement (at line 1, column 1)" —— 位置指向文件开头，
+    # 用户完全看不出原因。显式剥掉。
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        raw_bytes = raw_bytes[3:]
+    try:
+        raw = tomllib.loads(raw_bytes.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        # 必须包成 ConfigError：main 只接这一种，否则用户看到的是 traceback 加退出码 1。
+        raise ConfigError(f"配置文件解析失败：{path}（{exc}）") from exc
 
-    screenpipe = ScreenpipeConfig(**raw.get("screenpipe", {}))
+    screenpipe = _section(ScreenpipeConfig, raw, "screenpipe")
     # spec §12/§15.1：base_url 可由 SCREENPIPE_LOCAL_API_URL 覆盖。
     # 上游明确存在 fallback port 与开发态实例，写死 3030 会打到另一个实例。
     env_base_url = os.environ.get("SCREENPIPE_LOCAL_API_URL", "").strip()
     if env_base_url:
         screenpipe = replace(screenpipe, base_url=env_base_url)
 
-    schedule = ScheduleConfig(**raw.get("schedule", {}))
+    schedule = _section(ScheduleConfig, raw, "schedule")
     if schedule.window_minutes <= 0 or schedule.evaluate_every_minutes <= 0:
         raise ConfigError("schedule.window_minutes 与 evaluate_every_minutes 必须为正数")
 
-    thresholds = ThresholdConfig(**raw.get("thresholds", {}))
+    thresholds = _section(ThresholdConfig, raw, "thresholds")
     if not (thresholds.watch_minutes <= thresholds.passive_minutes <= thresholds.high_risk_minutes):
         raise ConfigError("thresholds 必须满足 watch <= passive <= high_risk")
+    # ent 是**窗口内**条目分钟数之和，其上界就是 window_minutes。阈值超过窗口
+    # 意味着这个状态永远不可达 —— 它专属的动作永远不会被选中，而配置看起来
+    # 一切正常，剧本也只能悄悄少断言一档。这类"能写但永远不生效"的值必须
+    # 在启动时就被拒绝（与 gate.enabled 里拼错闸门名同一原则）。
+    if thresholds.high_risk_minutes > schedule.window_minutes:
+        raise ConfigError(
+            f"thresholds.high_risk_minutes={thresholds.high_risk_minutes:g} 超过 "
+            f"schedule.window_minutes={schedule.window_minutes:g}：ent 是窗口内条目"
+            "分钟数之和，不可能超过窗口长度，该状态因此永远不可达。"
+            "要么把 high_risk_minutes 降到窗口以内，要么加长 window_minutes。"
+        )
 
     gate_raw = dict(raw.get("gate", {}))
     if "enabled" in gate_raw:
         gate_raw["enabled"] = tuple(gate_raw["enabled"])
-    gate = GateConfig(**gate_raw)
+    gate = _section(GateConfig, {"gate": gate_raw}, "gate")
     # 闸门名必须逐一可识别 —— 静默丢弃未知名字会让安全属性无声失效。
     if not gate.enabled:
         raise ConfigError("gate.enabled 不能为空；至少要启用 state_min")
@@ -165,11 +223,24 @@ def load_config(path: Path) -> Config:
         if not (0.0 < gate.ratio_min <= 1.0):
             raise ConfigError(f"gate.ratio_min 必须在 (0, 1] 区间内，当前为 {gate.ratio_min}")
 
-    outcome = OutcomeConfig(**raw.get("outcome", {}))
-    notify = NotifyConfig(**raw.get("notify", {}))
+    outcome = _section(OutcomeConfig, raw, "outcome")
+    notify = _section(NotifyConfig, raw, "notify")
 
     store_raw = raw.get("store", {})
     store_path = (path.parent / store_raw.get("path", "statesense.db")).resolve()
+
+    report = _section(ReportConfig, raw, "report")
+    if report.gap_threshold_minutes <= 0:
+        raise ConfigError("report.gap_threshold_minutes 必须为正数")
+    if report.leak_min_active_minutes < 0:
+        raise ConfigError("report.leak_min_active_minutes 不能为负")
+    if not (0.0 < report.leak_min_unclassified_ratio <= 1.0):
+        raise ConfigError(
+            f"report.leak_min_unclassified_ratio 必须在 (0, 1] 区间内，"
+            f"当前为 {report.leak_min_unclassified_ratio}"
+        )
+    if report.leak_top_n <= 0:
+        raise ConfigError("report.leak_top_n 必须为正数")
 
     tax_raw = raw.get("taxonomy", {})
     taxonomy = TaxonomyConfig(
@@ -203,6 +274,7 @@ def load_config(path: Path) -> Config:
         outcome=outcome,
         notify=notify,
         store_path=store_path,
+        report=report,
         taxonomy=taxonomy,
         actions=tuple(actions),
     )

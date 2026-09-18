@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,12 +9,27 @@ from pathlib import Path
 
 from statesense._time import iso as _iso
 from statesense._time import parse_iso as _parse
-from statesense.intervention.models import Decision
+from statesense.intervention.models import Decision, dump_gate_trace
 from statesense.outcome.models import OutcomeVerdict
 from statesense.state.models import StateVerdict
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+
+#: 运行事件的封闭枚举。写入未知类型必须报错 —— 与 gate.enabled 的处理同一原则：
+#: 不认识的取值意味着写入方与 schema 已漂移，静默接受会让观测结论失真。
+RUN_EVENT_KINDS: tuple[str, ...] = ("sleep_gap", "tick_error")
+
+#: report 的只读查询能读的表 → 该表的时间列。写成封闭字面量表而不是让调用方
+#: 传表名：表名不来自外部输入，拼进 SQL 才是安全的。
+#: 时间过滤走 SQL 字符串比较 —— `_iso()` 统一转本地时区后序列化，所有落库
+#: 字符串的偏移量一致，字典序即时间序。`since` 必须先经 `_iso()` 转换。
+_LISTABLE: dict[str, str] = {
+    "evaluations": "at",
+    "interventions": "at",
+    "outcomes": "checked_at",
+    "run_events": "at",
+}
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -54,6 +68,23 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE evaluations ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0"
             )
+        # v3 → v4：evaluations 增加 entries_minutes（区分漏判与明细缺失）。
+        # run_events 由 schema.sql 的 CREATE TABLE IF NOT EXISTS 建出，无需 ALTER 分支。
+        if "entries_minutes" not in _column_names(self._conn, "evaluations"):
+            self._conn.execute(
+                "ALTER TABLE evaluations ADD COLUMN entries_minutes REAL NOT NULL DEFAULT 0"
+            )
+        # v4 → v5：evaluations 增加 fullscreen_state（全屏 D3D 信号）。
+        # 旧行留 NULL = 「无法判定」—— 不伪造「当时不是全屏」。
+        if "fullscreen_state" not in _column_names(self._conn, "evaluations"):
+            self._conn.execute("ALTER TABLE evaluations ADD COLUMN fullscreen_state INTEGER")
+        # v5 → v6：interventions 增加 channel（投递通道）。
+        # 旧行留 NULL = 「通道未知」。加这一列是因为 `--dry-run` 走 RecordingNotifier，
+        # 它同样返回 status='delivered'，于是排练出来的干预与真实干预在库里一模一样 ——
+        # 「今晚到底有没有真的弹过窗」这个最基本的问题将永远答不上来。
+        # 通道本来就在 DeliveryResult 上，只是过去没有被落库。
+        if "channel" not in _column_names(self._conn, "interventions"):
+            self._conn.execute("ALTER TABLE interventions ADD COLUMN channel TEXT")
 
     def user_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -70,21 +101,15 @@ class Store:
         return row["state"] if row else None
 
     def insert_evaluation(self, at: datetime, verdict: StateVerdict, decision: Decision) -> int:
-        trace = json.dumps(
-            [
-                {"name": g.name, "passed": g.passed, "value": g.value, "threshold": g.threshold}
-                for g in decision.gate_trace
-            ],
-            ensure_ascii=False,
-        )
+        trace = dump_gate_trace(decision.gate_trace)
         with self._conn:
             cur = self._conn.execute(
                 """
                 INSERT INTO evaluations (
                   at, window_minutes, total_active_minutes, ent_minutes, gray_minutes,
-                  work_minutes, ent_ratio, state, late_night, data_status, skipped,
-                  prev_state, decision, gate_trace
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  work_minutes, ent_ratio, entries_minutes, fullscreen_state, state, late_night,
+                  data_status, skipped, prev_state, decision, gate_trace
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _iso(at),
@@ -94,6 +119,8 @@ class Store:
                     verdict.gray_minutes,
                     verdict.work_minutes,
                     verdict.ent_ratio,
+                    verdict.entries_minutes,
+                    verdict.fullscreen_state,
                     str(verdict.state),
                     int(verdict.late_night),
                     verdict.data_status,
@@ -115,15 +142,24 @@ class Store:
         action_text: str,
         delivery_status: str,
         outcome_due_at: datetime,
+        *,
+        channel: str,
         user_response: str | None = None,
     ) -> int:
+        """`channel` 与 `user_response` 一样是**记录下来的事实**，因此不给默认值，
+        并且强制写成关键字 —— 位置参数里夹一个会悄悄取默认值的通道，
+        正是让「排练」与「真弹窗」混在一起的那种写法。
+
+        少了 channel，`--dry-run` 排练出的干预与真实干预在库里无法区分，
+        视图 3 / 视图 4 的结论会同时被两种数据污染。
+        """
         with self._conn:
             cur = self._conn.execute(
                 """
                 INSERT INTO interventions (
                   evaluation_id, at, state, late_night, action_id, action_text,
-                  delivery_status, outcome_due_at, user_response
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  delivery_status, channel, outcome_due_at, user_response
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     evaluation_id,
@@ -133,6 +169,7 @@ class Store:
                     action_id,
                     action_text,
                     delivery_status,
+                    channel,
                     _iso(outcome_due_at),
                     user_response,
                 ),
@@ -163,6 +200,20 @@ class Store:
                     verdict.ent_after,
                     verdict.after_window_minutes,
                 ),
+            )
+
+    def insert_run_event(self, at: datetime, kind: str, detail: str) -> None:
+        """记录一次异常轮次（休眠跳过 / 本轮异常）。
+
+        绝不写 interventions —— 运维信号与干预信号混在一起会占用 daily_cap、
+        消耗 cooldown，并污染 outcomes 的效果分析。
+        """
+        if kind not in RUN_EVENT_KINDS:
+            raise ValueError(f"未知的运行事件类型 {kind!r}；已知：{list(RUN_EVENT_KINDS)}")
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO run_events (at, kind, detail) VALUES (?, ?, ?)",
+                (_iso(at), kind, detail),
             )
 
     def set_kv(self, key: str, value: str) -> None:
@@ -212,3 +263,28 @@ class Store:
             (_iso(moment),),
         ).fetchone()
         return int(row["n"])
+
+    # ── 只读查询（report 用） ────────────────────────────────
+    # 一律以 list_ 开头，便于评审时一眼确认 report 路径不写库。
+
+    def _list(self, table: str, since: datetime | None) -> list[sqlite3.Row]:
+        column = _LISTABLE[table]
+        if since is None:
+            return self._conn.execute(
+                f"SELECT * FROM {table} ORDER BY {column}"
+            ).fetchall()
+        return self._conn.execute(
+            f"SELECT * FROM {table} WHERE {column} >= ? ORDER BY {column}", (_iso(since),)
+        ).fetchall()
+
+    def list_evaluations(self, since: datetime | None = None) -> list[sqlite3.Row]:
+        return self._list("evaluations", since)
+
+    def list_interventions(self, since: datetime | None = None) -> list[sqlite3.Row]:
+        return self._list("interventions", since)
+
+    def list_outcomes(self, since: datetime | None = None) -> list[sqlite3.Row]:
+        return self._list("outcomes", since)
+
+    def list_run_events(self, since: datetime | None = None) -> list[sqlite3.Row]:
+        return self._list("run_events", since)
