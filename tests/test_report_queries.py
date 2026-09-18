@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from statesense.intervention.models import Decision, GateResult
+from statesense.intervention.models import Decision, GateResult, parse_gate_trace
 from statesense.outcome.models import OutcomeVerdict
 from statesense.report import queries
 from statesense.state.models import State, StateVerdict
@@ -284,6 +284,42 @@ def test_gate_breakdown_survives_corrupt_trace(store):
     gb = queries.build_gate_breakdown(store.list_evaluations())
     assert dict(gb.blocked_by)["ratio_min"] == 1
     assert len(gb.state_min_passed_then_blocked) == 1
+    assert gb.corrupt_rows == 1
+    # spec §5.2：损坏行从视图 2 的**全部**统计中剔除 —— 直方图也不例外，
+    # 否则渲染层的「已剔除」说明就成了谎话。
+    assert sum(dict(gb.ratio_histogram).values()) == 1
+
+
+def test_parse_gate_trace_skips_element_missing_threshold_instead_of_crashing():
+    """缺 threshold 的元素按畸形处理：跳过本条，绝不抛 KeyError。
+
+    §12 的底线是「不中断整份报告」—— 一条都读不出时返回 None 计入损坏，
+    混合时保留可读的那条。
+    """
+    only_broken = json.dumps([{"name": "ratio_min", "passed": False, "value": 0.7}])
+    assert parse_gate_trace(only_broken) is None
+
+    mixed = json.dumps(
+        [
+            {"name": "ratio_min", "passed": False, "value": 0.7},
+            {"name": "cooldown", "passed": True, "value": 30.0, "threshold": 60.0},
+        ]
+    )
+    parsed = parse_gate_trace(mixed)
+    assert parsed is not None
+    assert [g.name for g in parsed] == ["cooldown"]
+
+
+def test_gate_breakdown_survives_trace_element_missing_threshold(store):
+    """端到端：库里躺着缺 threshold 键的留痕，报告要数出损坏并跑完全程。"""
+    _eval_row(store, T0, gates=[("state_min", True, 2.0, 1.0)])
+    at = store.list_evaluations()[0]["at"]
+    with store._conn:
+        store._conn.execute(
+            "UPDATE evaluations SET gate_trace = ? WHERE at = ?",
+            (json.dumps([{"name": "ratio_min", "passed": False, "value": 0.7}]), at),
+        )
+    gb = queries.build_gate_breakdown(store.list_evaluations())
     assert gb.corrupt_rows == 1
 
 

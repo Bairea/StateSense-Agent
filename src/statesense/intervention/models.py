@@ -56,6 +56,8 @@ def parse_gate_trace(text: str) -> tuple[GateResult, ...] | None:
         if not isinstance(item, dict) or "name" not in item or "passed" not in item:
             continue
         try:
+            # threshold 必须存在而不是 .get 兜默认值：缺它就无法如实
+            # 说出「被谁挡在多少阈值上」，这一条只能按畸形元素跳过。
             gates.append(
                 GateResult(
                     name=str(item["name"]),
@@ -64,7 +66,7 @@ def parse_gate_trace(text: str) -> tuple[GateResult, ...] | None:
                     threshold=float(item["threshold"]),
                 )
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, KeyError):
             continue
     if raw and not gates:
         return None

@@ -172,16 +172,17 @@ def build_gate_breakdown(
     ratio_min_passed = ratio_min_blocked = corrupt = 0
 
     for row in evaluations:
-        # 分布用的是 ent_ratio 列，与闸门留痕无关 —— 坏行同样计入。
-        if row["total_active_minutes"] > 0:
-            histogram[_ratio_bucket(row["ent_ratio"], ratio_buckets)] += 1
-
         trace = parse_gate_trace(row["gate_trace"])
         if trace is None:
             # 读不出任何一条闸门：计数后跳过。既不能当「没有闸门」，
             # 也不能让整份报告中断 —— 数据坏掉的时候更需要报告能跑完。
             corrupt += 1
             continue
+
+        # 分布用的是 ent_ratio 列 —— 与视图 2 其余统计同进同退：
+        # 损坏行一律剔除，否则渲染层「已从上面的统计中剔除」就成了谎话（spec §5.2）。
+        if row["total_active_minutes"] > 0:
+            histogram[_ratio_bucket(row["ent_ratio"], ratio_buckets)] += 1
 
         # 「每一个未通过的闸门」都要计数：一轮可以同时被 cooldown 与 daily_cap 挡下，
         # 只看第一个会把 daily_cap 的触达次数少算。
