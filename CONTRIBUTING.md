@@ -117,7 +117,7 @@ git push --force-with-lease origin feat/activity-reader
 ```
 
 `type`：`feat` / `fix` / `docs` / `refactor` / `test` / `chore` / `perf`。
-`scope` 取架构组件名。当前实际在用的：`config` / `reader` / `state` / `gate` / `store` / `notify` / `outcome` / `scheduler` / `perception`；V0.5 起新增 `report` / `replay`。新组件引入时请同步更新这一行。
+`scope` 取架构组件名。当前实际在用的：`config` / `reader` / `state` / `intervention` / `store` / `notify` / `outcome` / `scheduler` / `perception` / `cli`（入口层 `__main__.py`）；V0.5 起新增 `report` / `replay`。`docs` / `chore` 类提交往往不对应单一组件，用宽泛 scope（如 `spec` / `plan` / `gitignore`）或省略不写均可。新组件引入时请同步更新这一行。
 
 示例：
 

@@ -234,6 +234,13 @@ def _drive_degraded(config: Config, workdir: Path) -> list[str]:
         for row in rows:
             if row["skipped"] != 1:
                 failures.append(f"{row['at']} 的 data_status 不可信，却没有标记 skipped")
+            # 成对断言（spec §6.4）：skipped=1 证明没被当成可信结论；
+            # state 恰为 NORMAL 占位，证明谁也读不出结论。
+            if row["state"] != "NORMAL":
+                failures.append(
+                    f"{row['at']} 不可信轮次的 state 列出现了 {row['state']} —— "
+                    "降级轮次的取值只能是 NORMAL 占位，出现别的值说明它被当成了结论"
+                )
             if row["data_status"] != "unreachable":
                 failures.append(f"{row['at']} 的 data_status 被改成了 {row['data_status']}")
         if run.store.list_interventions():
