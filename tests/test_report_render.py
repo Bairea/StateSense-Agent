@@ -349,9 +349,28 @@ def test_leak_section_states_its_blind_spot():
 
 
 def test_leak_detail_lines_are_rendered_when_present():
-    data = _data(leak_details=("  Brotato.exe  46.9 分钟",))
+    """渲染层从结构化结果组文本（spec §4.2）—— 三个分支各有各的说法。"""
+    from statesense.report.models import (
+        LeakDetailStatus,
+        LeakEntryLine,
+        LeakWindowDetail,
+    )
+
+    data = _data(
+        leak_details=(
+            LeakWindowDetail(
+                T0, LeakDetailStatus.AVAILABLE, "ok",
+                (LeakEntryLine(46.9, "Brotato.exe"),),
+            ),
+            LeakWindowDetail(T0, LeakDetailStatus.UNAVAILABLE, "unreachable", ()),
+            LeakWindowDetail(T0, LeakDetailStatus.EMPTY, "ok", ()),
+        )
+    )
     out = render.render_text(data, views=("5",))
-    assert "Brotato.exe" in out
+    lines = out.splitlines()
+    assert f"    {T0}    46.9 分钟  Brotato.exe" in lines
+    assert f"    {T0}  明细不可用（data_status=unreachable）" in lines
+    assert any("未命中条目为空（更可能是明细缺失，不是漏判）" in line for line in lines)
 
 
 # ── 轨迹 ────────────────────────────────────────────────────

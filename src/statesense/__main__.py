@@ -18,9 +18,8 @@ from statesense.notify.foreground_popup import ForegroundPopupNotifier
 from statesense.perception import default_probe, describe
 from statesense.replay.scenarios import SCENARIOS, check_scenario
 from statesense.report import queries, render
-from statesense.report.models import ReportData
+from statesense.report.models import LeakWindowDetail, ReportData
 from statesense.scheduler import Scheduler
-from statesense.state.taxonomy import Category, classify
 from statesense.store.db import SCHEMA_VERSION, Store
 
 #: 固定的 logger 名。用 `__name__` 的话，`python -m statesense` 下它是 `__main__`，
@@ -248,12 +247,14 @@ def _requested_views(spec: str) -> tuple[str, ...]:
     return views
 
 
-def _leak_details(config: Config, anchors) -> tuple[str, ...]:
-    """漏判二级视图：按需回查 Screenpipe 拿窗口明细。
+def _leak_details(config: Config, anchors) -> tuple[LeakWindowDetail, ...]:
+    """漏判二级视图的回查半边：逐锚点问 Screenpipe 要窗口明细。
 
     Screenpipe 本来就是那份数据的 owner，且有留存期 —— 按需去查而不是抄一份
     存起来，同时满足数据最小化与「不重造采集能力」。
 
+    这里只做 IO 与提示语；分类、排序、截断在 `queries.aggregate_leak_details`，
+    组文本在 `render._leak_lines`（spec §4.2：入口层不做聚合渲染）。
     明细只打印到 stdout，绝不落库。
     """
     try:
@@ -268,27 +269,18 @@ def _leak_details(config: Config, anchors) -> tuple[str, ...]:
         return ()
 
     window = config.schedule.window_minutes
-    lines: list[str] = []
-    for anchor in anchors:
-        snapshot = reader.read(
+    snapshots = tuple(
+        reader.read(
             anchor.at - timedelta(minutes=window), anchor.at, window, anchor.at
         )
-        if snapshot.data_status != "ok":
-            lines.append(f"    {anchor.at}  明细不可用（data_status={snapshot.data_status}）")
-            continue
-        others = sorted(
-            (e for e in snapshot.entries if classify(e, config.taxonomy) is Category.OTHER),
-            key=lambda e: e.minutes,
-            reverse=True,
-        )[: config.report.leak_top_n]
-        if not others:
-            lines.append(f"    {anchor.at}  未命中条目为空（更可能是明细缺失，不是漏判）")
-            continue
-        for entry in others:
-            lines.append(
-                f"    {anchor.at}  {entry.minutes:>6.1f} 分钟  {entry.title or entry.app}"
-            )
-    return tuple(lines)
+        for anchor in anchors
+    )
+    return queries.aggregate_leak_details(
+        anchors,
+        snapshots,
+        taxonomy=config.taxonomy,
+        top_n=config.report.leak_top_n,
+    )
 
 
 def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:

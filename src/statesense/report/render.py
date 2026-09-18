@@ -17,6 +17,7 @@ from typing import Any
 
 from statesense.report.models import (
     ContinuityGap,
+    LeakDetailStatus,
     Liveness,
     ReportData,
     VerdictBreakdown,
@@ -235,7 +236,16 @@ def _leak_lines(data: ReportData) -> list[str]:
         )
     if data.leak_details:
         lines.append("  窗口明细（仅打印，不落库）：")
-        lines.extend(data.leak_details)
+        for d in data.leak_details:
+            if d.status is LeakDetailStatus.UNAVAILABLE:
+                lines.append(f"    {d.at}  明细不可用（data_status={d.data_status}）")
+            elif d.status is LeakDetailStatus.EMPTY:
+                lines.append(f"    {d.at}  未命中条目为空（更可能是明细缺失，不是漏判）")
+            else:
+                for entry in d.entries:
+                    lines.append(
+                        f"    {d.at}  {entry.minutes:>6.1f} 分钟  {entry.label}"
+                    )
     return lines
 
 

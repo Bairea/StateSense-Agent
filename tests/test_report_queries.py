@@ -323,6 +323,77 @@ def test_gate_breakdown_survives_trace_element_missing_threshold(store):
     assert gb.corrupt_rows == 1
 
 
+# ── 漏判二级视图聚合（原在入口层，零测试） ──────────────────
+
+def _anchor(at):
+    from statesense.report.models import LeakAnchor
+
+    return LeakAnchor(
+        at=at, total_active_minutes=60.0, ent_minutes=0.0, gray_minutes=0.0,
+        work_minutes=0.0, unclassified_minutes=60.0, unclassified_ratio=1.0,
+        missing_detail_minutes=0.0,
+    )
+
+
+def _snap(end, *, status="ok", entries=()):
+    from statesense.activity.models import ActivitySnapshot
+
+    return ActivitySnapshot(
+        window_start=end - timedelta(minutes=60), window_end=end,
+        window_minutes=60, total_active_minutes=60.0,
+        entries=entries, data_status=status, captured_at=end,
+    )
+
+
+def _entry(app, minutes, title=""):
+    from statesense.activity.models import Entry
+
+    return Entry(app=app, title=title or app, url="", minutes=minutes)
+
+
+def test_aggregate_leak_details_keeps_only_other_and_sorts_desc(config):
+    from statesense.report.models import LeakDetailStatus
+
+    details = queries.aggregate_leak_details(
+        [_anchor(T0)],
+        [_snap(T0, entries=(_entry("cursor", 40.0), _entry("神秘软件", 5.0),
+                            _entry("bilibili", 15.0)))],
+        taxonomy=config.taxonomy, top_n=10,
+    )
+    assert details[0].status is LeakDetailStatus.AVAILABLE
+    assert [(e.label, e.minutes) for e in details[0].entries] == [("神秘软件", 5.0)]
+    # label 取 title or app 的既有语义
+    assert details[0].data_status == "ok"
+
+
+def test_aggregate_leak_details_truncates_to_top_n(config):
+    entries = tuple(_entry(f"神秘软件{i}", 10.0 - i) for i in range(5))
+    details = queries.aggregate_leak_details(
+        [_anchor(T0)], [_snap(T0, entries=entries)],
+        taxonomy=config.taxonomy, top_n=2,
+    )
+    assert [e.label for e in details[0].entries] == ["神秘软件0", "神秘软件1"]
+
+
+def test_aggregate_leak_details_distinguishes_unavailable_from_empty(config):
+    """「取不到明细」与「没查到未命中条目」必须分家 —— 后者更可能还是明细缺失。"""
+    from statesense.report.models import LeakDetailStatus
+
+    unavailable, empty = queries.aggregate_leak_details(
+        [_anchor(T0), _anchor(T0 + timedelta(minutes=5))],
+        [
+            _snap(T0, status="unreachable"),
+            _snap(T0 + timedelta(minutes=5), entries=(_entry("terminal", 50.0),)),
+        ],
+        taxonomy=config.taxonomy, top_n=10,
+    )
+    assert unavailable.status is LeakDetailStatus.UNAVAILABLE
+    assert unavailable.data_status == "unreachable"
+    assert unavailable.entries == ()
+    assert empty.status is LeakDetailStatus.EMPTY
+    assert empty.data_status == "ok"
+
+
 def test_gate_breakdown_counts_ratio_min_passed_and_blocked(store):
     """判据 4 要的是**对照**：只看「被挡多少次」推不出该不该调 ratio_min。"""
     _eval_row(store, T0, gates=[("state_min", True, 1.0, 1.0), ("ratio_min", True, 0.9, 0.75)])

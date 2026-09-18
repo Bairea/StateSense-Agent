@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any
 
 from statesense._time import parse_iso as _parse
+from statesense.config import TaxonomyConfig
 from statesense.intervention.models import first_failed, parse_gate_trace
 from statesense.report.models import (
     ContinuityGap,
@@ -20,6 +21,9 @@ from statesense.report.models import (
     GateBreakdown,
     InterventionBreakdown,
     LeakAnchor,
+    LeakDetailStatus,
+    LeakEntryLine,
+    LeakWindowDetail,
     Liveness,
     OutcomeBreakdown,
     Overview,
@@ -27,6 +31,7 @@ from statesense.report.models import (
     TraceRow,
     VerdictBreakdown,
 )
+from statesense.state.taxonomy import Category, classify
 
 #: 干预行存在，但用户压根没理会弹窗（`user_response IS NULL`）。
 #: 名字直接写 "null"，与库里的 SQL NULL 对齐 —— 报告的使用者要能把这一行
@@ -333,6 +338,49 @@ def find_leak_anchors(
             )
         )
     return tuple(anchors)
+
+
+def aggregate_leak_details(
+    anchors: Sequence[LeakAnchor],
+    snapshots: Sequence[Any],
+    *,
+    taxonomy: TaxonomyConfig,
+    top_n: int,
+) -> tuple[LeakWindowDetail, ...]:
+    """漏判二级视图的聚合：锚点 ↔ 已回查到的窗口快照，一一对位。
+
+    回查是 IO，归入口层；这里的分类、排序、截断是纯函数（spec §4.2）。
+    `data_status` 不是 ok 的窗口如实标成 unavailable —— 取不到明细
+    与「没有未命中条目」是两回事，混在一起就成了本版本要消灭的二义。
+    """
+    details: list[LeakWindowDetail] = []
+    for anchor, snapshot in zip(anchors, snapshots):
+        if snapshot.data_status != "ok":
+            details.append(
+                LeakWindowDetail(
+                    anchor.at, LeakDetailStatus.UNAVAILABLE, snapshot.data_status, ()
+                )
+            )
+            continue
+        others = sorted(
+            (e for e in snapshot.entries if classify(e, taxonomy) is Category.OTHER),
+            key=lambda e: e.minutes,
+            reverse=True,
+        )[:top_n]
+        if not others:
+            details.append(
+                LeakWindowDetail(anchor.at, LeakDetailStatus.EMPTY, "ok", ())
+            )
+            continue
+        details.append(
+            LeakWindowDetail(
+                anchor.at,
+                LeakDetailStatus.AVAILABLE,
+                "ok",
+                tuple(LeakEntryLine(e.minutes, e.title or e.app) for e in others),
+            )
+        )
+    return tuple(details)
 
 
 def build_trace(

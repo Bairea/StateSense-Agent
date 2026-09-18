@@ -159,7 +159,107 @@ def test_report_survives_a_gbk_only_stdout(make_config, tmp_path):
     assert "闸门数据损坏 1 轮" in text
 
 
-# ── 端到端 ──────────────────────────────────────────────────
+# ── --views 5 --from-screenpipe 的输出金样例 ────────────────
+#
+# B 项重构（`_leak_details` 下沉 report 层）前先给现状拍照：
+# 输出文本一个字都不许变，重构只许动代码位置。
+
+def _leak_anchor_row(store, at):
+    """总活跃 60、三类归类全 0、明细 60 —— 未归类比例 1.0，必成锚点。"""
+    from statesense.intervention.models import Decision
+    from statesense.state.models import State, StateVerdict
+
+    verdict = StateVerdict(
+        state=State.NORMAL, late_night=False,
+        total_active_minutes=60.0, ent_minutes=0.0, gray_minutes=0.0,
+        work_minutes=0.0, ent_ratio=0.0, entries_minutes=60.0,
+        fullscreen_state=None, window_minutes=60, data_status="ok",
+        skipped=False, skip_reason=None,
+    )
+    store.insert_evaluation(
+        at, verdict,
+        Decision(intervene=False, action_id=None, reason="t", gate_trace=()),
+    )
+
+
+def _snapshot(end, *, status="ok", entries=()):
+    from statesense.activity.models import ActivitySnapshot
+
+    return ActivitySnapshot(
+        window_start=end - timedelta(minutes=60), window_end=end,
+        window_minutes=60, total_active_minutes=60.0,
+        entries=entries, data_status=status, captured_at=end,
+    )
+
+
+def test_views5_from_screenpipe_output_is_golden(make_config, tmp_path, capsys, monkeypatch):
+    from statesense import __main__ as cli
+    from statesense.activity.models import Entry
+    from statesense.store.db import Store
+
+    moments = [T0, T0 + timedelta(minutes=5), T0 + timedelta(minutes=10)]
+    store = Store(tmp_path / "statesense.db")
+    store.migrate()
+    for moment in moments:
+        _leak_anchor_row(store, moment)
+    store.close()
+
+    by_end = {
+        moments[0]: _snapshot(moments[0], entries=(
+            Entry(app="神秘软件", title="神秘窗口", url="", minutes=12.0),
+            Entry(app="另一个", title="另一个窗口", url="", minutes=35.5),
+            Entry(app="cursor", title="写代码", url="", minutes=10.0),  # WORK：不进明细
+            Entry(app="还有", title="还有它", url="", minutes=3.0),
+            Entry(app="更小的", title="更小窗口", url="", minutes=1.0),
+        )),
+        moments[1]: _snapshot(moments[1], status="unreachable"),
+        moments[2]: _snapshot(moments[2], entries=(
+            Entry(app="terminal", title="powershell", url="", minutes=50.0),
+        )),
+    }
+
+    class StubReader:
+        def read(self, start, end, window_minutes, captured_at):
+            return by_end[end]
+
+    monkeypatch.setenv("SCREENPIPE_LOCAL_API_KEY", "test-key")
+    monkeypatch.setattr(cli, "make_reader", lambda config: StubReader())
+
+    assert main([
+        "--report", "--config", str(make_config()),
+        "--views", "5", "--from-screenpipe",
+    ]) == 0
+    out = capsys.readouterr().out
+
+    # 锚点行本身（视图 5 既有产物），以及三窗口的明细各按各的分支输出。
+    # top_n=10 不截断这里；排序必须按分钟降序；WORK 条目不得出现。
+    lines = out.splitlines()
+    detail = [line for line in lines if "分钟 " in line]
+    for line in detail[:4]:
+        # 渲染走 astimezone()，断言也要落到本地时区再比。
+        assert line.startswith(f"    {moments[0].astimezone()}  ")
+    assert " 35.5 分钟  另一个窗口" in detail[0]
+    assert " 12.0 分钟  神秘窗口" in detail[1]
+    assert "  3.0 分钟  还有它" in detail[2]
+    assert "  1.0 分钟  更小窗口" in detail[3]
+    assert not any("写代码" in line for line in lines)
+    assert f"    {moments[1].astimezone()}  明细不可用（data_status=unreachable）" in lines
+    assert any("未命中条目为空（更可能是明细缺失，不是漏判）" in line for line in lines)
+    assert "窗口明细（仅打印，不落库）：" in out
+
+
+def test_views5_without_from_screenpipe_has_no_detail_section(make_config, tmp_path, capsys):
+    """不加 --from-screenpipe 就不该有任何回查痕迹。"""
+    from statesense.store.db import Store
+
+    store = Store(tmp_path / "statesense.db")
+    store.migrate()
+    _leak_anchor_row(store, T0)
+    store.close()
+    assert main(["--report", "--config", str(make_config()), "--views", "5"]) == 0
+    out = capsys.readouterr().out
+    assert "窗口明细" not in out
+    assert "神秘" not in out
 
 def test_missing_database_returns_2_with_actionable_message(make_config, capsys):
     assert main(["--report", "--config", str(make_config(db_name="nope.db"))]) == 2

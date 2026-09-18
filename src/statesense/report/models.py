@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 
 
 @dataclass(frozen=True)
@@ -153,6 +154,30 @@ class LeakAnchor:
 
 
 @dataclass(frozen=True)
+class LeakEntryLine:
+    minutes: float
+    label: str
+
+
+class LeakDetailStatus(StrEnum):
+    #: 封闭三态。empty（没查到未命中条目）与 unavailable（根本没查到）
+    #: 是两回事 —— 混在一起就成了本版本要消灭的那类二义。
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    EMPTY = "empty"
+
+
+@dataclass(frozen=True)
+class LeakWindowDetail:
+    """一个锚点那一轮回查 Screenpipe 的结构化结果 —— 文本归渲染层，这里只放意思。"""
+
+    at: datetime
+    status: LeakDetailStatus
+    data_status: str
+    entries: tuple[LeakEntryLine, ...]
+
+
+@dataclass(frozen=True)
 class TraceRow:
     at: datetime
     state: str
@@ -176,5 +201,5 @@ class ReportData:
     outcomes: OutcomeBreakdown
     leaks: tuple[LeakAnchor, ...] = ()
     trace: tuple[TraceRow, ...] = ()
-    #: 二级漏判视图的文本行（窗口标题只在这里出现，绝不落库）。可能为空。
-    leak_details: tuple[str, ...] = ()
+    #: 二级漏判视图的回查结果（窗口标题只在这里出现，绝不落库）。可能为空。
+    leak_details: tuple[LeakWindowDetail, ...] = ()
