@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -93,15 +94,44 @@ class Scheduler:
         closed = self._close_due_outcomes(now, fullscreen)
         return self._evaluate_tick(now, closed, fullscreen)
 
-    def run_forever(self) -> None:  # pragma: no cover - 常驻路径靠手动验证
+    def run_forever(self) -> None:
+        """死循环。**「它返回了」这件事本身必须留下记录。**
+
+        实测踩到过：任务计划程序报 `LastTaskResult=0`（成功），而 `run_forever`
+        是死循环、本不该返回 —— 进程不见了，日志里一句话没有，库里也没有
+        `run_events`（那两处补丁只覆盖 `run_tick_guarded` 抓到的异常，覆盖不了
+        进程级退出）。唯一线索是一轮 tick 的间隔只有 2.8 分钟而不是 5.0。
+
+        对比之下，这里的两行日志把三种结局分开了：
+          · 有「异常中止」→ 是代码/环境抛出来的，原因就在同一行；
+          · 只有「结束」而没有「异常中止」→ 循环自己走完了（那就是缺陷本身）；
+          · 两句都没有 → 进程被外力杀掉，日志来不及写。
+        """
         interval = timedelta(minutes=self._config.schedule.evaluate_every_minutes)
+        log.info(
+            "常驻循环开始 pid=%d：每 %d 分钟一轮，回看窗口 %d 分钟，库=%s",
+            os.getpid(),
+            self._config.schedule.evaluate_every_minutes,
+            self._config.schedule.window_minutes,
+            self._store.path,
+        )
         last: datetime | None = None
-        while True:
-            now = self._clock.now()
-            if last is None or now - last >= interval:
-                self.run_tick_guarded(now)
-                last = now
-            time.sleep(self._config.schedule.tick_seconds)
+        try:
+            while True:
+                now = self._clock.now()
+                if last is None or now - last >= interval:
+                    self.run_tick_guarded(now)
+                    last = now
+                time.sleep(self._config.schedule.tick_seconds)
+        except BaseException as exc:  # noqa: BLE001 - 记录后原样抛出，绝不吞
+            log.warning("常驻循环异常中止：%s: %s", type(exc).__name__, exc)
+            raise
+        finally:
+            log.warning(
+                "常驻循环结束 pid=%d（这条之后若没有新的「常驻循环开始」，"
+                "说明它没有被重启）",
+                os.getpid(),
+            )
 
     def run_tick_guarded(self, now: datetime) -> TickReport | None:
         """常驻循环的单轮：异常必须落库，不能只留在日志里。

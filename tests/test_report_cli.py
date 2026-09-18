@@ -173,3 +173,101 @@ def test_unknown_config_key_exits_2_without_a_traceback(make_config, capsys):
     assert "配置错误" in err
     assert "[screenpipe]" in err
     assert "Traceback" not in err
+
+
+# ── 常驻启动行：让重启可见 ──────────────────────────────────
+
+def test_current_branch_reads_a_normal_git_dir(tmp_path):
+    from statesense.__main__ import _current_branch
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text(
+        "ref: refs/heads/feat/cool\n", encoding="utf-8"
+    )
+    assert _current_branch(tmp_path / "src") == "feat/cool"
+
+
+def test_current_branch_reads_a_worktree_git_file(tmp_path):
+    """worktree 里 `.git` 是个文件（`gitdir: …`），不是目录。"""
+    from statesense.__main__ import _current_branch
+
+    real = tmp_path / "real-gitdir"
+    real.mkdir()
+    (real / "HEAD").write_text("ref: refs/heads/wt\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {real}\n", encoding="utf-8")
+    assert _current_branch(wt) == "wt"
+
+
+def test_current_branch_reports_a_detached_head(tmp_path):
+    from statesense.__main__ import _current_branch
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("a" * 40 + "\n", encoding="utf-8")
+    assert _current_branch(tmp_path) == "detached@" + "a" * 12
+
+
+def test_current_branch_is_none_outside_a_repository(tmp_path):
+    """读不到就返回 None —— 一行日志不能因为读不到分支就让 daemon 起不来。"""
+    from statesense.__main__ import _current_branch
+
+    assert _current_branch(tmp_path) is None
+
+
+def test_log_startup_records_what_is_running(config, caplog):
+    """启动行存在的唯一理由是**让重启可见**。
+
+    daemon 在健康的一轮里什么都不打印（记录落在库里），所以一份空日志既可能是
+    「一切正常」，也可能是「刚被重启过」—— 这两件事必须能分开。
+    """
+    import logging
+    import os
+
+    from statesense.__main__ import log_startup
+
+    with caplog.at_level(logging.INFO):
+        log_startup(config, dry_run=True)
+
+    text = caplog.text
+    assert "常驻启动" in text
+    assert f"pid={os.getpid()}" in text
+    assert "分支=" in text          # 曾经从错误分支起过 daemon，分支必须可见
+    assert "schema=v6" in text
+    assert "recording(dry-run)" in text
+    assert config.screenpipe.base_url in text
+
+
+def test_log_startup_reports_the_real_channel_when_not_dry_run(config, caplog):
+    """不 dry-run 时必须报出真实通道 —— 这正是区分排练与真事的那一项。"""
+    import logging
+
+    from statesense.__main__ import log_startup
+
+    with caplog.at_level(logging.INFO):
+        log_startup(config, dry_run=False)
+
+    assert "foreground_popup" in caplog.text
+    assert "recording(dry-run)" not in caplog.text
+
+
+def test_main_writes_the_startup_line_before_entering_the_loop(
+    make_config, monkeypatch, caplog
+):
+    """接线测试：启动行必须在进入死循环**之前**写出来。
+
+    只让 run_forever 打日志是不够的 —— 那样「进程起来了」与「第一轮评估」
+    之间仍有一段什么都没有的窗口，而重启恰好就发生在那里。
+    """
+    import logging
+
+    from statesense import __main__ as cli
+    from statesense.scheduler import Scheduler
+
+    monkeypatch.setenv("SCREENPIPE_LOCAL_API_KEY", "test-key")
+    monkeypatch.setattr(Scheduler, "run_forever", lambda self: None)
+
+    with caplog.at_level(logging.INFO, logger="statesense.cli"):
+        assert cli.main(["--daemon", "--dry-run", "--config", str(make_config())]) == 0
+
+    assert "常驻启动" in caplog.text

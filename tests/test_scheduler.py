@@ -301,10 +301,68 @@ def test_fullscreen_signal_rescues_an_unnamed_game(config, store):
 
     assert report.state == "PASSIVE_CONSUMPTION", "全屏信号应当让未命名的游戏被识别"
     assert report.intervened is True
-    assert probe.calls >= 1, "每轮应当真的探测一次"
+    # **恰好一次**，不是「至少一次」：一轮里探两次，状态判定与行为回执就可能
+    # 用上两个不同的取值 —— 那样差出来的不是「效果」而是「探测时机」。
+    assert probe.calls == 1, "一轮只应探测一次"
     row = store.fetch_evaluation(report.evaluation_id)
     assert row["fullscreen_state"] == QUNS_RUNNING_D3D_FULL_SCREEN
     assert row["ent_minutes"] == 45.0
+
+
+def test_fullscreen_is_sampled_once_even_when_an_outcome_is_due(config, store):
+    """回执到期那一轮，两次取数（判定 + 回执前后两侧）必须共用同一个探测结果。"""
+    probe = _StubProbe(QUNS_RUNNING_D3D_FULL_SCREEN)
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), probe)
+    first = sch.run_once()
+    assert first.intervened is True
+    probe.calls = 0
+
+    # 推进到回执到期那一轮：这一轮既要评估，又要结算上一轮的回执。
+    sch._clock.advance(minutes=15)  # noqa: SLF001 - 测试需要推进冻结时钟
+    sch.run_once()
+
+    assert probe.calls == 1, "判定与回执必须共用同一次探测"
+
+
+def test_run_forever_logs_start_abort_and_end(config, store, monkeypatch, caplog):
+    """`run_forever` 是死循环 —— **它返回这件事本身必须留下记录。**
+
+    实测踩到过：任务计划程序报 `LastTaskResult=0`（成功），进程却不见了，日志里
+    一句话没有，库里也没有 `run_events`（那两处补丁只覆盖 `run_tick_guarded`
+    抓到的异常，覆盖不了进程级退出）。唯一线索是一轮 tick 的间隔只有 2.8 分钟。
+    """
+    import logging
+
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), _StubProbe(None))
+
+    def explode(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("statesense.scheduler.time.sleep", explode)
+    with caplog.at_level(logging.INFO), pytest.raises(KeyboardInterrupt):
+        sch.run_forever()
+
+    assert "常驻循环开始" in caplog.text
+    assert "常驻循环异常中止：KeyboardInterrupt" in caplog.text
+    assert "常驻循环结束" in caplog.text
+
+
+def test_run_forever_logs_its_identity(config, store, monkeypatch, caplog):
+    """启动行要能区分两次运行：pid + 间隔 + 窗口 + 库路径。"""
+    import logging
+    import os
+
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), _StubProbe(None))
+
+    def explode(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("statesense.scheduler.time.sleep", explode)
+    with caplog.at_level(logging.INFO), pytest.raises(KeyboardInterrupt):
+        sch.run_forever()
+
+    assert f"pid={os.getpid()}" in caplog.text
+    assert str(config.store_path) in caplog.text
 
 
 def test_without_fullscreen_signal_the_same_game_is_missed(config, store):

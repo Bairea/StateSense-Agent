@@ -23,6 +23,10 @@ from statesense.scheduler import Scheduler
 from statesense.state.taxonomy import Category, classify
 from statesense.store.db import SCHEMA_VERSION, Store
 
+#: 固定的 logger 名。用 `__name__` 的话，`python -m statesense` 下它是 `__main__`，
+#: 日志前缀看起来像个内部模块名；而换个启动方式前缀又会变。
+log = logging.getLogger("statesense.cli")
+
 #: 只有 `--report` 认的参数，写在 help 里以免被当成通用参数。
 _REPORT_ONLY = "（仅 --report 有效）"
 _DRIVEN_ONLY = "（仅 --once / --daemon 有效；--replay 恒为不弹窗）"
@@ -96,6 +100,69 @@ def make_notifier(config: Config, dry_run: bool, clock: Clock) -> Notifier:
     if config.notify.channel != "foreground_popup":
         raise ConfigError(f"不支持的 notify.channel: {config.notify.channel}")
     return ForegroundPopupNotifier(config.notify, clock)
+
+
+def _current_branch(start: Path | None = None) -> str | None:
+    """从 `.git/HEAD` 直接读分支名，**不起子进程**。
+
+    分支落进启动日志有具体理由：实测从错误的分支起过一次 daemon，它把库的
+    `user_version` 降级回 3、并写了一堆 `entries_minutes=0` 的假行。当时是靠
+    事后对库才发现。启动行里带分支名，这种事一眼就能看见。
+
+    读不到就返回 `None`（非仓库、`.git` 形态不认识、权限不足）—— 这只是一行日志，
+    不能因为它让 daemon 起不来。
+
+    `start` 只为测试而存在：真实调用永远从本文件所在目录往上找。
+    """
+    root = start if start is not None else Path(__file__).resolve().parent
+    head: Path | None = None
+    for parent in (root, *root.parents):
+        candidate = parent / ".git"
+        if candidate.is_dir():
+            head = candidate / "HEAD"
+            break
+        if candidate.is_file():
+            # worktree：`.git` 是一个指向真实 gitdir 的文件
+            try:
+                text = candidate.read_text(encoding="utf-8").strip()
+            except OSError:
+                return None
+            if text.startswith("gitdir:"):
+                head = Path(text.split(":", 1)[1].strip()) / "HEAD"
+            break
+    if head is None:
+        return None
+    try:
+        content = head.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    prefix = "ref: refs/heads/"
+    if content.startswith(prefix):
+        return content[len(prefix) :]
+    # detached HEAD：给出短哈希，总比写「未知」有用。
+    return f"detached@{content[:12]}"
+
+
+def log_startup(config: Config, *, dry_run: bool) -> None:
+    """常驻启动行。**它存在的唯一理由是让重启可见。**
+
+    daemon 在健康的一轮里什么都不打印（记录落在库里，不重复存两遍），
+    所以一份空的日志既可能是「一切正常」，也可能是「刚被重启过」——
+    这两件事完全不同，却长得一样。加上这一行之后，每次重启都会留下一条
+    带时间戳和 pid 的启动记录，重启历史变成可读的。
+    """
+    log.info(
+        "常驻启动 pid=%d 分支=%s schema=v%d 库=%s screenpipe=%s 通道=%s "
+        "每 %d 分钟一轮/窗口 %d 分钟",
+        os.getpid(),
+        _current_branch() or "未知",
+        SCHEMA_VERSION,
+        config.store_path,
+        config.screenpipe.base_url,
+        "recording(dry-run)" if dry_run else config.notify.channel,
+        config.schedule.evaluate_every_minutes,
+        config.schedule.window_minutes,
+    )
 
 
 def build_scheduler(config: Config, notifier: Notifier, clock: Clock) -> Scheduler:
@@ -333,9 +400,17 @@ def run_replay(name: str, config: Config, *, keep_db: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # 常驻模式的日志走 **stdout**，其余模式走 stderr。两条理由：
+    #   · daemon 的日志就是它的输出，落在 daemon.out.log 里名正言顺；落在
+    #     .err.log 里会让人以为「err 是空的就没事」，而它其实是唯一的日志。
+    #   · 其余模式必须在 stderr 上：`--report --format json` 的 stdout 是给 jq 的，
+    #     往里混一行日志就是一份非法 JSON。
+    # 于是 stderr 在常驻模式下变成纯粹的「意外通道」—— Python 层的 traceback
+    # 会落在那儿。它空着，就等于「没有未捕获的异常」。
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stdout if args.daemon else sys.stderr,
     )
     try:
         config = load_config(args.config)
@@ -361,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"outcomes_closed={report.outcomes_closed} note={report.note}"
             )
             return 0
+        log_startup(config, dry_run=args.dry_run)
         scheduler.run_forever()
         return 0
     except ConfigError as exc:
