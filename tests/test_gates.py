@@ -103,3 +103,19 @@ def test_gate_trace_has_all_entries_even_when_everything_is_blocked():
 def test_disabled_gate_is_not_run():
     gate = GateConfig(enabled=("state_min",), ratio_min=0.75)
     assert [r.name for r in run_gates(_ctx(gate=gate))] == ["state_min"]
+
+
+def test_gate_name_constants_known_gates_and_registry_agree():
+    """三处必须同一拼法：config 的 GATE_* 常量、KNOWN_GATES、gates 的注册表。
+    任何一处单独改名都要在这里红，而不是运行时静默少跑一条闸门。"""
+    from statesense.config import (
+        GATE_COOLDOWN,
+        GATE_DAILY_CAP,
+        GATE_RATIO_MIN,
+        GATE_STATE_MIN,
+        KNOWN_GATES,
+    )
+    from statesense.intervention.gates import GATE_REGISTRY
+
+    assert {GATE_STATE_MIN, GATE_RATIO_MIN, GATE_COOLDOWN, GATE_DAILY_CAP} == set(KNOWN_GATES)
+    assert set(GATE_REGISTRY) == set(KNOWN_GATES)
