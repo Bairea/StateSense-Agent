@@ -1,4 +1,4 @@
-"""本地环境感知。当前只有一项：是否正在跑全屏 D3D 应用。
+"""本地环境感知。当前只有一项：是否正在跑全屏应用。
 
 **为什么需要它**：游戏窗口的标题与进程名就是游戏自身（实测 `Brotato.exe` / `Brotato`），
 配置里的平台名（`steam` / `wegame`）抓不到它 —— 而按游戏名逐个维护清单没有普适性。
@@ -94,7 +94,12 @@ def default_probe() -> FullscreenProbe:
 
 
 def is_gaming(state: int | None) -> bool:
-    """只有明确的全屏 D3D 才算。`None` 与其它取值都不算。"""
+    """取值落在 `GAMING_STATES` 里才算。`None`（无法判定）与其余取值都不算。
+
+    注意 `GAMING_STATES` 含 2（`QUNS_BUSY`）而不只是 3
+    （`QUNS_RUNNING_D3D_FULL_SCREEN`）—— 这是实测决定，不是照抄文档；
+    理由与兜底方式见 `GAMING_STATES` 上方的注释。
+    """
     return state in GAMING_STATES
 
 

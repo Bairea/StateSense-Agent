@@ -1,19 +1,16 @@
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
 from statesense.activity.reader import ActivityReader
 from statesense.clock import FrozenClock
-from statesense.config import load_config
 from statesense.notify.base import RecordingNotifier
 from statesense.scheduler import Scheduler
 from statesense.store.db import RUN_EVENT_KINDS, Store
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
-REPO = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture()
@@ -27,12 +24,25 @@ def store(tmp_path):
 # ── schema 版本与迁移 ───────────────────────────────────────
 
 def test_user_version_is_current(store):
-    assert store.user_version() == 5
+    assert store.user_version() == 6
 
 
 def test_entries_minutes_column_exists(store):
     columns = {r["name"] for r in store._conn.execute("PRAGMA table_info(evaluations)")}
     assert "entries_minutes" in columns
+
+
+def test_intervention_channel_column_is_nullable(store):
+    """NULL 表示「迁移前写入的行，通道未知」，必须允许。
+
+    `--dry-run` 走 RecordingNotifier，它同样返回 delivered —— 不记通道，
+    排练出来的干预与真实弹窗在库里就完全一样。
+    """
+    columns = {
+        r["name"]: r for r in store._conn.execute("PRAGMA table_info(interventions)")
+    }
+    assert "channel" in columns
+    assert columns["channel"]["notnull"] == 0
 
 
 def test_fullscreen_state_column_is_nullable(store):
@@ -108,11 +118,15 @@ def test_v3_database_upgrades_in_place(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 5
+    assert s.user_version() == 6
 
     columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(evaluations)")}
     assert "entries_minutes" in columns
     assert "fullscreen_state" in columns
+    intervention_columns = {
+        r["name"] for r in s._conn.execute("PRAGMA table_info(interventions)")
+    }
+    assert "channel" in intervention_columns
     tables = {
         r["name"] for r in s._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
@@ -147,16 +161,6 @@ def _body(ent_minutes: float, total: float = 60.0, status: str = "ok") -> bytes:
         },
         ensure_ascii=False,
     ).encode("utf-8")
-
-
-@pytest.fixture()
-def config(tmp_path):
-    src = (REPO / "config" / "config.example.toml").read_text(encoding="utf-8")
-    # TOML 基本字符串里反斜杠是转义符，Windows 路径必须用正斜杠。
-    src = src.replace('path = "statesense.db"', f'path = "{(tmp_path / "s.db").as_posix()}"')
-    target = tmp_path / "config.toml"
-    target.write_text(src, encoding="utf-8")
-    return load_config(target)
 
 
 @pytest.fixture()
@@ -251,6 +255,46 @@ def test_tick_error_detail_is_truncated(config, cfg_store):
     )
     sch.run_tick_guarded(T0)
     assert len(_run_events(cfg_store)[0]["detail"]) <= 200
+
+
+def test_tick_error_detail_keeps_only_the_first_line(config, cfg_store):
+    """spec §7.2 要的是「异常类名 + 消息首行」。
+
+    包装过的异常消息里往往重复堆叠同一条信息，换行还会把报告缺口视图
+    「一行一条运行事件」的版式冲掉。
+    """
+
+    class Exploding:
+        def read(self, *args, **kwargs):
+            raise RuntimeError("第一行说明问题\n第二行是包装出来的重复内容\n第三行也是")
+
+    sch = Scheduler(
+        config=config,
+        clock=FrozenClock(T0),
+        reader=Exploding(),
+        store=cfg_store,
+        notifier=RecordingNotifier(),
+    )
+    sch.run_tick_guarded(T0)
+    detail = _run_events(cfg_store)[0]["detail"]
+    assert detail == "RuntimeError: 第一行说明问题"
+
+
+def test_dry_run_intervention_records_its_channel(config, cfg_store):
+    """`--dry-run` 必须留下痕迹，否则「到底有没有真的弹过窗」永远答不上来。
+
+    RecordingNotifier 与真弹窗返回的都是 `delivered`，通道是唯一能分开两者的东西。
+    """
+    clock = FrozenClock(T0)
+    sch = _scheduler(config, cfg_store, [_body(45.0)], clock)
+    report = sch.run_once()
+    assert report.intervened is True
+
+    row = cfg_store._conn.execute("SELECT * FROM interventions").fetchone()
+    assert row["channel"] == "recording"
+    assert row["delivery_status"] == "delivered"
+    # note 里也要能一眼看出这是排练，而不是真弹了窗。
+    assert "recording" in report.note
 
 
 def test_tick_error_does_not_leak_into_interventions(config, cfg_store):

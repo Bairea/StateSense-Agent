@@ -1,15 +1,18 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from statesense.activity.base import ActivitySource
-from statesense.config import load_config
-from statesense.replay.runner import ScriptedReader, run_scenario
+from statesense.replay.runner import (
+    ScriptedFullscreenProbe,
+    ScriptedReader,
+    run_scenario,
+)
 from statesense.replay.scenario import Scenario, Segment
 from statesense.replay.synthesize import snapshot_at
 
-REPO = Path(__file__).resolve().parents[1]
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
 
 SCENARIO = Scenario(
@@ -20,19 +23,31 @@ SCENARIO = Scenario(
     ),
 )
 
+#: 一条**任何规则都不命中**的条目（进程名与标题都不含娱乐/工作/灰色关键词）。
+#: 全屏提权这类「只动未命中条目」的规则，只有用它才测得出来 —— 拿 bilibili
+#: 当素材的话它本来就命中娱乐规则，提权前后一模一样，测试会永远通过。
+UNMATCHED = Scenario(
+    name="unmatched",
+    minutes=60,
+    segments=(Segment(0, 60, "SomeGame.exe", "Some Game"),),
+)
 
-@pytest.fixture()
-def config(tmp_path):
-    src = (REPO / "config" / "config.example.toml").read_text(encoding="utf-8")
-    src = src.replace('path = "statesense.db"', f'path = "{(tmp_path / "s.db").as_posix()}"')
-    target = tmp_path / "config.toml"
-    target.write_text(src, encoding="utf-8")
-    return load_config(target)
+
+def _drive(scenario: Scenario, config, ticks: int = 13):
+    """跑 `ticks` 轮（每轮 5 分钟），返回 (状态集合, 最大 ent)。"""
+    run = run_scenario(scenario, config, start=T0)
+    try:
+        for index in range(ticks):
+            run.tick(0.0 if index == 0 else 5.0)
+        rows = run.evaluations()
+        return {r["state"] for r in rows}, max(r["ent_minutes"] for r in rows)
+    finally:
+        run.close()
 
 
 def test_scripted_reader_satisfies_activity_source():
     """回放器能注入的前提是这道缝隙真的存在。"""
-    assert isinstance(ScriptedReader(SCENARIO, 60, T0), ActivitySource)
+    assert isinstance(ScriptedReader(SCENARIO, T0), ActivitySource)
 
 
 def test_synthesize_clips_segments_to_window():
@@ -106,7 +121,7 @@ def test_degraded_scenario_produces_untrustworthy_snapshot():
 
 
 def test_scripted_reader_records_its_calls():
-    reader = ScriptedReader(SCENARIO, 10, T0)
+    reader = ScriptedReader(SCENARIO, T0)
     reader.read(T0, T0 + timedelta(minutes=10), 10, T0 + timedelta(minutes=10))
     assert reader.calls == [(T0, T0 + timedelta(minutes=10))]
 
@@ -146,3 +161,41 @@ def test_replay_uses_an_isolated_database(config, tmp_path):
         assert not Path(config.store_path).exists()
     finally:
         run.close()
+
+
+# ── 回放的密闭性：绝不读真实环境 ─────────────────────────────
+
+def test_scripted_probe_reports_the_scenario_value():
+    assert ScriptedFullscreenProbe(2).state() == 2
+    # 剧本没有声明时是 None = 无法判定，不是「不是全屏」。
+    assert ScriptedFullscreenProbe(None).state() is None
+
+
+def test_replay_ignores_the_machines_real_fullscreen_state(config, monkeypatch):
+    """回放结果不能取决于「跑回放的这一刻我是不是正开着游戏」。
+
+    这曾经是真的会漂：`run_scenario` 没注入探针，`Scheduler` 就退到
+    `default_probe()` —— 在 Windows 上那是一次真实的系统调用。这里把那个
+    兜底换成「永远说正在全屏游戏」，剧本的结论必须一字不变。
+    """
+
+    class AlwaysGaming:
+        def state(self):
+            return 2
+
+    monkeypatch.setattr("statesense.scheduler.default_probe", lambda: AlwaysGaming())
+    states, worst = _drive(UNMATCHED, config)
+    assert states == {"NORMAL"}
+    assert worst == 0.0
+
+
+def test_replay_carries_the_scripted_fullscreen_signal(config):
+    """对照组另一半：剧本声明「正在全屏游戏」时，未命中规则的条目被提权成娱乐。
+
+    §13 要求全屏信号有一条**带对照组的端到端**测试。单元测试只证明
+    `classify` 会提权；这一条证明它穿过 Scheduler → store → 落行整条链路
+    仍然成立，并与上一条构成对照。
+    """
+    states, worst = _drive(replace(UNMATCHED, fullscreen_state=2), config)
+    assert "HIGH_RISK_PASSIVE_CONSUMPTION" in states
+    assert worst > 0.0

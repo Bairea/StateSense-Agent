@@ -16,12 +16,16 @@ from statesense.config import Config, ConfigError, load_config
 from statesense.notify.base import Notifier, RecordingNotifier
 from statesense.notify.foreground_popup import ForegroundPopupNotifier
 from statesense.perception import default_probe, describe
-from statesense.replay.scenarios import SCENARIOS, check_scenario, structural_findings
+from statesense.replay.scenarios import SCENARIOS, check_scenario
 from statesense.report import queries, render
 from statesense.report.models import ReportData
 from statesense.scheduler import Scheduler
 from statesense.state.taxonomy import Category, classify
 from statesense.store.db import SCHEMA_VERSION, Store
+
+#: 只有 `--report` 认的参数，写在 help 里以免被当成通用参数。
+_REPORT_ONLY = "（仅 --report 有效）"
+_DRIVEN_ONLY = "（仅 --once / --daemon 有效；--replay 恒为不弹窗）"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,13 +45,28 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument(
         "--replay", metavar="剧本", default=None, help="回放剧本：ladder/outcome/gates/degraded/sleep_gap/all"
     )
-    parser.add_argument("--dry-run", action="store_true", help="不真弹窗，只记录")
-    parser.add_argument("--since", default="7d", help="report 回看区间：7d / 24h / ISO 时刻")
-    parser.add_argument("--format", choices=("text", "json"), default="text")
-    parser.add_argument("--views", default="", help="report 视图：1,2,3,4 或 all")
-    parser.add_argument("--trace", default=None, metavar="ISO时刻", help="打印该时刻附近的轨迹")
+    parser.add_argument("--dry-run", action="store_true", help=f"不真弹窗，只记录{_DRIVEN_ONLY}")
     parser.add_argument(
-        "--from-screenpipe", action="store_true", help="漏判明细回查 Screenpipe（需 API key）"
+        "--since", default="7d", help=f"report 回看区间：7d / 24h / ISO 时刻{_REPORT_ONLY}"
+    )
+    parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument(
+        "--views",
+        default="",
+        help=f"report 视图：{'/'.join(render.VIEW_IDS)} 的逗号组合，或 all{_REPORT_ONLY}",
+    )
+    parser.add_argument(
+        "--trace", default=None, metavar="ISO时刻", help=f"打印该时刻附近的轨迹{_REPORT_ONLY}"
+    )
+    parser.add_argument(
+        "--from-screenpipe",
+        action="store_true",
+        help=f"漏判明细回查 Screenpipe（需 API key）{_REPORT_ONLY}",
+    )
+    parser.add_argument(
+        "--keep-db",
+        action="store_true",
+        help="replay 跑完保留库文件（默认写临时库并删除，绝不污染生产库）",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
@@ -104,6 +123,8 @@ def check(config: Config) -> int:
     print(f"ratio_min   {config.gate.ratio_min}")
     print(f"回看窗口    最近 {window} 分钟")
     print(f"data_status {snapshot.data_status}")
+    # §4.5 的全屏信号也在这里露一次：它是唯一一处自动推断，自检时要能看见
+    # 「这台机器上它现在读到什么」，否则配置写对了也可能整条信号静默失效。
     fullscreen = default_probe().state()
     print(f"全屏信号    {fullscreen}  {describe(fullscreen)}")
     print(f"取到 {len(snapshot.entries)} 条窗口记录，总活跃 {snapshot.total_active_minutes} 分钟")
@@ -135,11 +156,24 @@ def _parse_since(text: str, now: datetime) -> datetime:
 
 
 def _requested_views(spec: str) -> tuple[str, ...]:
-    if not spec.strip():
+    """解析 `--views`。**未知编号报错，不静默忽略。**
+
+    这里曾经只认 1–4，而规格 §11 与配置注释都写着 `--views 5`。结果是
+    用户敲下 `--views 5` 得到的是一片空白 —— 看起来像「这个视图没有数据」，
+    而不是「这个编号不存在」。排查方向从一开始就是歪的。
+    """
+    text = spec.strip()
+    if not text:
         return ()
-    if spec.strip() == "all":
-        return ("1", "2", "3", "4")
-    return tuple(part.strip() for part in spec.split(",") if part.strip())
+    if text == "all":
+        return render.VIEW_IDS
+    views = tuple(part.strip() for part in text.split(",") if part.strip())
+    unknown = [view for view in views if view not in render.VIEW_IDS]
+    if unknown:
+        raise ConfigError(
+            f"--views 含未知视图编号 {unknown}；可用：{list(render.VIEW_IDS)} 或 all"
+        )
+    return views
 
 
 def _leak_details(config: Config, anchors) -> tuple[str, ...]:
@@ -150,12 +184,15 @@ def _leak_details(config: Config, anchors) -> tuple[str, ...]:
 
     明细只打印到 stdout，绝不落库。
     """
-    if not anchors:
-        return ()
     try:
         reader = make_reader(config)
     except ConfigError as exc:
+        # 没有锚点也要把这句话说出口：用户正是**因为**看不到明细才加的
+        # `--from-screenpipe`，「没锚点所以什么都不打印」会让他以为参数没生效。
         print(f"漏判明细跳过：{exc}", file=sys.stderr)
+        return ()
+    if not anchors:
+        print("漏判明细：本次区间内没有锚点，无需回查 Screenpipe。", file=sys.stderr)
         return ()
 
     window = config.schedule.window_minutes
@@ -191,20 +228,25 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
 
     store = Store(db_path)
     try:
-        if store.user_version() < SCHEMA_VERSION:
+        version = store.user_version()
+        if version < SCHEMA_VERSION:
             print(
-                f"库 schema 为 v{store.user_version()}，需要 v{SCHEMA_VERSION}；"
+                f"库 schema 为 v{version}，需要 v{SCHEMA_VERSION}；"
                 "请先跑一次 --once 完成迁移（--report 不做任何写入）",
                 file=sys.stderr,
             )
             return 2
 
-        since = _parse_since(args.since, clock.now())
+        now = clock.now()
+        since = _parse_since(args.since, now)
+        # 参数错误先炸，不要等读完库才告诉用户 --views 写错了。
+        views = _requested_views(args.views)
         evaluations = store.list_evaluations(since=since)
         run_events = store.list_run_events(since=since)
         interventions = store.list_interventions(since=since)
         outcomes = store.list_outcomes(since=since)
 
+        gates = queries.build_gate_breakdown(evaluations)
         data = ReportData(
             overview=queries.build_overview(
                 evaluations,
@@ -212,9 +254,17 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
                 evaluate_every_minutes=config.schedule.evaluate_every_minutes,
                 gap_threshold_minutes=config.report.gap_threshold_minutes,
             ),
+            liveness=queries.build_liveness(
+                evaluations,
+                run_events,
+                now,
+                gap_threshold_minutes=config.report.gap_threshold_minutes,
+            ),
             verdicts=queries.build_verdict_breakdown(evaluations),
-            gates=queries.build_gate_breakdown(evaluations),
-            interventions=queries.build_intervention_breakdown(evaluations, interventions),
+            gates=gates,
+            # 闸门统计传进去而不是重算：cooldown / daily_cap 的阻挡次数
+            # 只能有一个来源。
+            interventions=queries.build_intervention_breakdown(interventions, gates),
             outcomes=queries.build_outcome_breakdown(outcomes, interventions),
             leaks=queries.find_leak_anchors(
                 evaluations,
@@ -235,10 +285,18 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
         if args.from_screenpipe:
             data = replace(data, leak_details=_leak_details(config, data.leaks))
 
+        views = _requested_views(args.views)
         if args.format == "json":
+            # JSON 里所有视图的字段都在，`--views` 无从省略任何东西。
+            # 与其静默忽略它，不如说清楚 —— JSON 消费方按字段取用即可。
+            if views:
+                print(
+                    "提示：--format json 输出全部视图字段，--views 对它无效。",
+                    file=sys.stderr,
+                )
             print(render.render_json(data))
         else:
-            print(render.render_text(data, views=_requested_views(args.views)))
+            print(render.render_text(data, views=views))
         return 0
     except ConfigError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
@@ -247,38 +305,30 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
         store.close()
 
 
-def run_replay(name: str, config: Config) -> int:
+def run_replay(name: str, config: Config, *, keep_db: bool) -> int:
     """在独立的库上跑剧本。绝不触碰配置指向的生产库。
 
-    `structural_findings` 打印为 WARN 而不是 FAIL：它描述的是配置本身能让
-    哪段代码成为死路，不是剧本断言失败。
+    默认写临时库并在跑完后删除（spec §11）——「保留」是显式动作，
+    因此给了 `--keep-db`。保留路径是 `<store 所在目录>/replay/<剧本>/`，
+    可以用 `--report --db <那里的库>` 继续读。
     """
-    findings = structural_findings(config)
-
-    if name == "all":
-        failed = False
-        for scenario_name in SCENARIOS:
-            failures = check_scenario(scenario_name, config)
-            print(f"{'FAIL' if failures else 'PASS'}  {scenario_name}")
-            for reason in failures:
-                print(f"      {reason}")
-            failed = failed or bool(failures)
-        for finding in findings:
-            print(f"WARN  {finding}")
-        return 1 if failed else 0
-
-    if name not in SCENARIOS:
+    if name != "all" and name not in SCENARIOS:
         available = ", ".join(sorted(SCENARIOS))
         print(f"未知剧本 {name!r}；可用：{available} 或 all", file=sys.stderr)
         return 2
 
-    failures = check_scenario(name, config)
-    print(f"{'FAIL' if failures else 'PASS'}  {name}")
-    for reason in failures:
-        print(f"      {reason}")
-    for finding in findings:
-        print(f"WARN  {finding}")
-    return 1 if failures else 0
+    names = list(SCENARIOS) if name == "all" else [name]
+    failed = False
+    for scenario_name in names:
+        failures = check_scenario(scenario_name, config, keep_db=keep_db)
+        print(f"{'FAIL' if failures else 'PASS'}  {scenario_name}")
+        for reason in failures:
+            print(f"      {reason}")
+        failed = failed or bool(failures)
+    if keep_db and name == "all":
+        root = Path(config.store_path).parent / "replay"
+        print(f"库文件保留在：{root}")
+    return 1 if failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -302,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.report:
             return run_report(config, args, clock)
         if args.replay is not None:
-            return run_replay(args.replay, config)
+            return run_replay(args.replay, config, keep_db=args.keep_db)
         scheduler = build_scheduler(config, make_notifier(config, args.dry_run, clock), clock)
         if args.once:
             report = scheduler.run_once()

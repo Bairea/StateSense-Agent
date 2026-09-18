@@ -156,6 +156,72 @@ def test_overview_on_empty_database_is_not_an_error(store):
     assert ov.coverage == 0.0
 
 
+def test_overview_coverage_never_exceeds_one(store):
+    """满跑时覆盖率必须是 100%，不是 116%。
+
+    规格 §5.2 写的是 `轮数 × every / 区间分钟数`，它在正常满跑时会算出
+    span=30、every=5、轮数=7 → 1.167。覆盖率超过 100% 只会让人怀疑这个数本身，
+    所以这里改用「按节奏本该有多少轮」当分母。偏差已记入验证日志。
+    """
+    for i in range(7):
+        _eval_row(store, T0 + timedelta(minutes=5 * i))
+    ov = queries.build_overview(
+        store.list_evaluations(), [], evaluate_every_minutes=5, gap_threshold_minutes=15
+    )
+    assert ov.expected_evaluations == 7
+    assert ov.coverage == pytest.approx(1.0)
+
+
+# ── 此刻是否还在跑（spec §7.4）────────────────────────────────
+
+def _liveness(store, now, *, threshold=15.0, run_events=()):
+    return queries.build_liveness(
+        store.list_evaluations(), run_events, now, gap_threshold_minutes=threshold
+    )
+
+
+def test_liveness_is_offline_when_the_last_evaluation_is_too_old(store):
+    """同一个阈值要同时回答「过去断过没有」与「现在断了吗」。
+
+    只实现前一半（缺口列表）时，打开报告的人看不到最关键的那句结论。
+    """
+    _eval_row(store, T0)
+    lv = _liveness(store, T0 + timedelta(minutes=60))
+    assert lv.offline is True
+    assert lv.silent_minutes == pytest.approx(60.0)
+    assert lv.threshold_minutes == 15.0
+    assert lv.events == ()
+
+
+def test_liveness_is_online_within_the_threshold(store):
+    _eval_row(store, T0)
+    lv = _liveness(store, T0 + timedelta(minutes=5))
+    assert lv.offline is False
+    assert lv.silent_minutes == pytest.approx(5.0)
+
+
+def test_liveness_attaches_run_events_after_the_last_evaluation(store):
+    """「有意跳过/出错」与「进程死了」必须在结尾处也能分开。"""
+    _eval_row(store, T0)
+    store.insert_run_event(T0 + timedelta(minutes=30), "tick_error", "RuntimeError: boom")
+    lv = _liveness(store, T0 + timedelta(minutes=60), run_events=store.list_run_events())
+    assert lv.offline is True
+    assert [e.kind for e in lv.events] == ["tick_error"]
+
+
+def test_liveness_ignores_future_timestamps(store):
+    """时钟回拨或库里出现未来行时不能判成掉线 —— 「未来有数据」不是「进程死了」。"""
+    _eval_row(store, T0 + timedelta(minutes=30))
+    assert _liveness(store, T0).offline is False
+
+
+def test_liveness_on_empty_range_says_nothing_is_known(store):
+    lv = _liveness(store, T0)
+    assert lv.last_at is None
+    assert lv.silent_minutes is None
+    assert lv.offline is False
+
+
 def test_verdict_breakdown_counts_skipped_separately(store):
     _eval_row(store, T0, ent=0.0, total=0.0, state="NORMAL", skipped=1,
               data_status="unreachable")
@@ -165,6 +231,23 @@ def test_verdict_breakdown_counts_skipped_separately(store):
     assert bd.skipped == 1
     assert dict(bd.states)["NORMAL"] == 2
     assert dict(bd.data_statuses)["unreachable"] == 1
+
+
+def test_verdict_breakdown_counts_rows_without_entry_detail(store):
+    """报活跃却没有条目明细的轮次必须被数出来。
+
+    漏判视图对它们不成立（两个差额都退化），静默略过就会被读成「没有漏判」。
+    迁移前写入的行（`entries_minutes` 取 DEFAULT 0）也落在这一档，且在数据上
+    无法与「Screenpipe 真的没返回明细」区分 —— 所以只能一起计数、一起说明。
+    """
+    _eval_row(store, T0, ent=0.0, total=59.9, state="NORMAL", entries=0.0)
+    _eval_row(store, T0 + timedelta(minutes=5), ent=45.0, total=60.0, entries=60.0)
+    # 没有活跃的轮次不算 —— 那是「真的没在电脑前」，不是明细缺失。
+    _eval_row(store, T0 + timedelta(minutes=10), ent=0.0, total=0.0, state="NORMAL",
+              entries=0.0)
+
+    bd = queries.build_verdict_breakdown(store.list_evaluations())
+    assert bd.entries_unknown == 1
 
 
 def test_gate_breakdown_names_the_blocking_gate(store):
@@ -185,7 +268,11 @@ def test_gate_breakdown_ignores_rounds_blocked_by_state_min(store):
 
 
 def test_gate_breakdown_survives_corrupt_trace(store):
-    """一行闸门数据坏掉，不该让整份报告失效 —— 坏行跳过，其余照常统计。"""
+    """一行闸门数据坏掉，不该让整份报告失效 —— 坏行跳过，其余照常统计。
+
+    但它必须被**数出来**：坏行同时会从 blocked_by 里消失，不说出口就会被
+    读成「闸门没挡过」。这正是本版本要消灭的那类静默二义。
+    """
     _eval_row(store, T0, gates=[("ratio_min", False, 0.7, 0.75)])
     _eval_row(store, T0 + timedelta(minutes=5), gates=[("ratio_min", False, 0.6, 0.75)])
     first_at = store.list_evaluations()[0]["at"]
@@ -197,6 +284,38 @@ def test_gate_breakdown_survives_corrupt_trace(store):
     gb = queries.build_gate_breakdown(store.list_evaluations())
     assert dict(gb.blocked_by)["ratio_min"] == 1
     assert len(gb.state_min_passed_then_blocked) == 1
+    assert gb.corrupt_rows == 1
+
+
+def test_gate_breakdown_counts_ratio_min_passed_and_blocked(store):
+    """判据 4 要的是**对照**：只看「被挡多少次」推不出该不该调 ratio_min。"""
+    _eval_row(store, T0, gates=[("state_min", True, 1.0, 1.0), ("ratio_min", True, 0.9, 0.75)])
+    _eval_row(store, T0 + timedelta(minutes=5),
+              gates=[("state_min", True, 1.0, 1.0), ("ratio_min", False, 0.4, 0.75)])
+    _eval_row(store, T0 + timedelta(minutes=10),
+              gates=[("state_min", False, 0.0, 1.0), ("ratio_min", False, 0.2, 0.75)])
+
+    gb = queries.build_gate_breakdown(store.list_evaluations())
+    assert gb.ratio_min_passed == 1
+    assert gb.ratio_min_blocked == 2
+
+
+def test_gate_breakdown_counts_every_failed_gate_not_just_the_first(store):
+    """一轮可以同时被 cooldown 与 daily_cap 挡下。
+
+    只看第一个失败闸门的口径会把 daily_cap 的触达次数少算，从而把一个
+    恰好触及上限的日子读成「没到上限」。
+    """
+    _eval_row(store, T0, gates=[
+        ("state_min", True, 1.0, 1.0),
+        ("ratio_min", True, 0.9, 0.75),
+        ("cooldown", False, 5.0, 30.0),
+        ("daily_cap", False, 8.0, 8.0),
+    ])
+    gb = queries.build_gate_breakdown(store.list_evaluations())
+    assert dict(gb.blocked_by) == {"cooldown": 1}          # 主因只有一个
+    assert dict(gb.blocked_any)["cooldown"] == 1           # 触达次数都要算
+    assert dict(gb.blocked_any)["daily_cap"] == 1
 
 
 def test_ratio_histogram_counts_only_rows_with_activity(store):
@@ -257,7 +376,8 @@ def test_leak_anchor_reports_missing_detail_separately(store):
     assert anchors[0].missing_detail_minutes == pytest.approx(15.0)
 
 
-def _insert_intervention(store, evaluation_id, *, at, action_id, response, order=0):
+def _insert_intervention(store, evaluation_id, *, at, action_id, response,
+                         channel="foreground_popup"):
     return store.insert_intervention(
         evaluation_id=evaluation_id,
         at=at,
@@ -266,6 +386,7 @@ def _insert_intervention(store, evaluation_id, *, at, action_id, response, order
         action_id=action_id,
         action_text="t",
         delivery_status="delivered",
+        channel=channel,
         outcome_due_at=at + timedelta(minutes=10),
         user_response=response,
     )
@@ -287,9 +408,33 @@ def test_outcome_breakdown_stratifies_by_user_response(store):
     ob = queries.build_outcome_breakdown(store.list_outcomes(), store.list_interventions())
     by_resp = dict(ob.by_response)
     assert dict(by_resp["accepted"])["disengaged"] == 1
-    assert dict(by_resp["none"])["continued"] == 1
+    # 没点按钮的那一层叫 "null"，与库里的 SQL NULL 对齐 ——
+    # 报告的使用者要能把这一行与自己的 SQL 查询对上，中间多一层翻译就多一次出错机会。
+    assert dict(by_resp["null"])["continued"] == 1
     assert ob.ent_before_mean == pytest.approx(45.0)
     assert ob.ent_after_mean == pytest.approx(26.5)
+    assert ob.ent_before_median == pytest.approx(45.0)
+    assert ob.ent_after_median == pytest.approx(26.5)
+
+
+def test_outcome_breakdown_median_resists_an_outlier(store):
+    """均值被极端值拉动、中位数不动 —— 规格要求两个都出，正是为了看出这件事。"""
+    eid = _eval_row(store, T0)
+    ids = [
+        _insert_intervention(
+            store, eid, at=T0 + timedelta(minutes=i), action_id="walk5", response=None
+        )
+        for i in range(4)
+    ]
+    for i, (iid, after) in enumerate(zip(ids, (0.0, 100.0, 100.0, 100.0))):
+        store.insert_outcome(
+            iid, T0 + timedelta(minutes=10 + i),
+            OutcomeVerdict("continued", 10.0, after, 10.0),
+        )
+
+    ob = queries.build_outcome_breakdown(store.list_outcomes(), store.list_interventions())
+    assert ob.ent_after_mean == pytest.approx(75.0)
+    assert ob.ent_after_median == pytest.approx(100.0)
 
 
 def test_outcome_breakdown_excludes_no_data_from_means(store):
@@ -310,17 +455,49 @@ def test_outcome_breakdown_excludes_no_data_from_means(store):
 
 
 def test_intervention_breakdown_counts_cooldown_and_cap_blocks(store):
+    """阻挡次数取自 GateBreakdown，不在这里重算 —— 同一件事只能有一个来源。"""
     _eval_row(store, T0, gates=[("state_min", True, 1.0, 1.0), ("cooldown", False, 5.0, 30.0)])
     _eval_row(store, T0 + timedelta(minutes=5),
               gates=[("state_min", True, 1.0, 1.0), ("daily_cap", False, 8.0, 8.0)])
-    ib = queries.build_intervention_breakdown(
-        store.list_evaluations(), store.list_interventions()
-    )
+    gates = queries.build_gate_breakdown(store.list_evaluations())
+    ib = queries.build_intervention_breakdown(store.list_interventions(), gates)
     assert ib.cooldown_blocks == 1
     assert ib.daily_cap_blocks == 1
 
 
-def test_build_trace_ends_at_the_row_not_after_the_moment(store):
+def test_intervention_breakdown_counts_a_round_blocked_by_both(store):
+    """cooldown 与 daily_cap 同时挡住时，两个计数都要 +1。"""
+    _eval_row(store, T0, gates=[
+        ("state_min", True, 1.0, 1.0),
+        ("cooldown", False, 5.0, 30.0),
+        ("daily_cap", False, 8.0, 8.0),
+    ])
+    gates = queries.build_gate_breakdown(store.list_evaluations())
+    ib = queries.build_intervention_breakdown(store.list_interventions(), gates)
+    assert ib.cooldown_blocks == 1
+    assert ib.daily_cap_blocks == 1
+
+
+def test_intervention_breakdown_separates_dry_run_from_real_popups(store):
+    """`--dry-run` 与真弹窗返回的都是 delivered —— 只有通道能把它们分开。"""
+    eid = _eval_row(store, T0)
+    _insert_intervention(store, eid, at=T0, action_id="walk5", response=None,
+                         channel="recording")
+    _insert_intervention(store, eid, at=T0 + timedelta(minutes=31), action_id="walk5",
+                         response="accepted", channel="foreground_popup")
+
+    gates = queries.build_gate_breakdown(store.list_evaluations())
+    ib = queries.build_intervention_breakdown(store.list_interventions(), gates)
+    assert dict(ib.channels) == {"recording": 1, "foreground_popup": 1}
+
+
+def test_build_trace_is_centred_on_the_moment(store):
+    """spec §5.2：`--trace <时刻>` 以该时刻为中心。
+
+    居中而不是「以它为末尾」：看某一刻的轨迹要回答「它当时为什么这么判、
+    判完之后又怎样了」，后者在时刻的右边。曾经只取时刻之前的行，
+    「之后怎样了」永远看不到。
+    """
     for i in range(10):
         _eval_row(store, T0 + timedelta(minutes=5 * i),
                   gates=[("state_min", True, 1.0, 1.0)])
@@ -328,8 +505,22 @@ def test_build_trace_ends_at_the_row_not_after_the_moment(store):
         store.list_evaluations(), T0 + timedelta(minutes=25), window_ticks=4
     )
     assert len(trace) == 4
-    assert trace[-1].at == T0 + timedelta(minutes=25)
-    assert trace[0].at == T0 + timedelta(minutes=10)
+    # 在 4 轮的窗口里，at 落在相对下标 2：左边 2 轮、右边 1 轮。
+    # 偶数窗口的取舍一律偏向过去 —— 「为什么这么判」的证据在左边。
+    assert trace[0].at == T0 + timedelta(minutes=15)
+    assert T0 + timedelta(minutes=25) in [row.at for row in trace]
+    assert trace[-1].at == T0 + timedelta(minutes=30)
+
+
+def test_build_trace_before_all_history_still_returns_rows(store):
+    """`at` 早于全部记录时从最早一轮开始给 —— 空输出会被读成「工具坏了」。"""
+    for i in range(10):
+        _eval_row(store, T0 + timedelta(minutes=5 * i))
+    trace = queries.build_trace(
+        store.list_evaluations(), T0 - timedelta(days=1), window_ticks=4
+    )
+    assert len(trace) == 4
+    assert trace[0].at == T0
 
 
 def test_build_trace_clamps_at_the_start_of_history(store):

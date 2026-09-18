@@ -117,7 +117,7 @@ git push --force-with-lease origin feat/activity-reader
 ```
 
 `type`：`feat` / `fix` / `docs` / `refactor` / `test` / `chore` / `perf`。
-`scope` 取架构组件名。当前实际在用的：`config` / `reader` / `state` / `gate` / `store` / `notify` / `outcome` / `scheduler`；V0.5 起新增 `report` / `replay`。新组件引入时请同步更新这一行。
+`scope` 取架构组件名。当前实际在用的：`config` / `reader` / `state` / `gate` / `store` / `notify` / `outcome` / `scheduler` / `perception`；V0.5 起新增 `report` / `replay`。新组件引入时请同步更新这一行。
 
 示例：
 
@@ -154,15 +154,21 @@ git push -u upstream docs/v0.5-spec
 | uv | 0.11.6 |
 | Node | v24.14.1 |
 | bun | 已安装（`D:\DevTools\bun`，`BUN_INSTALL` 已写入用户环境变量） |
-| Screenpipe | 已安装（v0.4.50），数据目录 `D:\Screenpipe`，recorder 监听 `localhost:3030` |
+| Screenpipe | 已安装（v0.4.50），数据目录 `D:\Screenpipe`，recorder 监听 `localhost:3131` |
+
+> **端口不要默认写 3030。** 3030 是 Screenpipe 的默认端口，但它**可能被别的软件占着** ——
+> 本机实测被 Docker Desktop 的 `com.docker.backend` 占过。被占时的现象极具误导性：
+> 端口确实在监听、Screenpipe 进程也确实在，但 `/activity-summary` 返回 404，
+> 于是每轮评估都记成 `data_status=unreachable`，而一切看起来都"在跑"。
+> 排查手段：`Get-NetTCPConnection -LocalPort 3030 -State Listen` 看 `OwningProcess` 是谁。
 
 Screenpipe 的启动命令（V0 实测可用）：
 
 ```bash
-screenpipe record --data-dir "D:\Screenpipe" --disable-audio --retention-days 14
+screenpipe record --data-dir "D:\Screenpipe" --disable-audio --retention-days 14 --port 3131
 ```
 
-> 访问 `localhost:3030` **即使从本机发起也需要** `Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY`，否则返回 403。见第 8 节。
+> 访问它**即使从本机发起也需要** `Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY`，否则返回 403。见第 8 节。
 
 ### 关于 `ghfast.top` 镜像
 

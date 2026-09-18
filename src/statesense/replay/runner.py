@@ -19,9 +19,8 @@ from statesense.store.db import Store
 class ScriptedReader:
     """满足 ActivitySource 的合成数据源。"""
 
-    def __init__(self, scenario: Scenario, window_minutes: int, origin: datetime) -> None:
+    def __init__(self, scenario: Scenario, origin: datetime) -> None:
         self._scenario = scenario
-        self._window = window_minutes
         self._origin = origin
         #: 记录每次调用的窗口，便于断言「回执确实回查了前后两段」。
         self.calls: list[tuple[datetime, datetime]] = []
@@ -37,6 +36,26 @@ class ScriptedReader:
         return snapshot_at(
             self._scenario, start, end, window_minutes, captured_at, self._origin
         )
+
+
+class ScriptedFullscreenProbe:
+    """剧本给定的全屏信号。
+
+    **回放绝不能去读真实的全屏状态。** `Scheduler` 在不注入探针时会退到
+    `default_probe()`，在 Windows 上那是一次真实的系统调用 —— 于是
+    「可重复的验证工具」会随「跑回放的这一刻我是不是正开着游戏」给出不同结果。
+    `--replay all` 曾经因此不是可复现的：它验证的是生产链路，却偷偷带上了一个
+    生产环境才有的输入。
+
+    剧本默认 `fullscreen_state=None` = 无法判定，与生产上「探针取不到值」
+    是同一个语义，因此不会平白提高任何一轮的 ent。
+    """
+
+    def __init__(self, state: int | None) -> None:
+        self._state = state
+
+    def state(self) -> int | None:
+        return self._state
 
 
 @dataclass
@@ -73,17 +92,19 @@ def run_scenario(
 ) -> ReplayRun:
     """用 FrozenClock + 脚本 reader 驱动**真实的 Scheduler**。
 
-    不重跑判定逻辑 —— 被验证的必须是生产链路本身。
+    不重跑判定逻辑 —— 被验证的必须是生产链路本身。但链路里的每一个外部输入
+    （时间、活动数据、全屏信号）都必须由剧本给定，不能漏一个去读真实环境。
     """
     store = Store(db_path or config.store_path)
     store.migrate()
     clock = FrozenClock(start)
-    reader = ScriptedReader(scenario, config.schedule.window_minutes, start)
+    reader = ScriptedReader(scenario, start)
     scheduler = Scheduler(
         config=config,
         clock=clock,
         reader=reader,
         store=store,
         notifier=RecordingNotifier(clock=clock),
+        fullscreen=ScriptedFullscreenProbe(scenario.fullscreen_state),
     )
     return ReplayRun(store=store, scheduler=scheduler, clock=clock)

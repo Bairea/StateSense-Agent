@@ -39,17 +39,14 @@ def classify(entry: Entry, taxonomy: TaxonomyConfig) -> Category:
 
 
 def bucket_minutes(entries: Iterable[Entry], taxonomy: TaxonomyConfig) -> dict[Category, float]:
+    """按类别汇总分钟数。**这是全仓唯一的归类入口。**
+
+    「被动消费分钟数」不在这里算：它还要叠上全屏提权，口径在
+    `state.engine.effective_entertainment_minutes`。本模块只管把条目分到四类，
+    不再另外提供一份只取 ENTERTAINMENT 的快捷函数 —— 那会让「同一件事两处各算一份」
+    重新长回来，而这正是上一轮审查修掉的缺陷。
+    """
     buckets = {c: 0.0 for c in Category}
     for entry in entries:
         buckets[classify(entry, taxonomy)] += entry.minutes
     return buckets
-
-
-def entertainment_minutes(entries: Iterable[Entry], taxonomy: TaxonomyConfig) -> float:
-    """被动消费分钟数。
-
-    状态判定与行为回执必须共用这一个口径 —— 审查发现两处各写了一份
-    `round(bucket_minutes(...)[ENTERTAINMENT], 2)`，一旦漂移，
-    「干预前 vs 干预后」就不是同一个量了，回执会失真。
-    """
-    return round(bucket_minutes(entries, taxonomy)[Category.ENTERTAINMENT], 2)

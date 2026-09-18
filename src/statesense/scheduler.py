@@ -6,6 +6,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import partial
 
 from statesense.activity.base import ActivitySource
 from statesense.activity.models import ActivitySnapshot
@@ -17,13 +18,25 @@ from statesense.intervention.gates import GateContext
 from statesense.intervention.wording import TemplateWording, Wording
 from statesense.notify.base import Notifier
 from statesense.outcome.tracker import evaluate as evaluate_outcome
-from statesense.perception import FullscreenProbe, default_probe
+from statesense.perception import FullscreenProbe, default_probe, is_gaming
 from statesense.state.engine import classify, effective_entertainment_minutes
+from statesense.state.taxonomy import bucket_minutes
 from statesense.store.db import Store
 
 log = logging.getLogger(__name__)
 
 ACTION_CURSOR_KEY = "action_cursor"
+
+
+def _error_detail(exc: BaseException) -> str:
+    """异常类名 + 消息**首行**，截断至 200 字符（spec §7.2）。
+
+    取首行而不是整条消息：包装过的异常，消息里往往重复堆叠同一条信息，
+    换行还会把 report 缺口视图里「一行一条运行事件」的版式冲掉。
+    """
+    message = str(exc).strip()
+    first_line = message.splitlines()[0] if message else ""
+    return f"{type(exc).__name__}: {first_line}"[:200]
 
 
 @dataclass(frozen=True)
@@ -57,20 +70,28 @@ class Scheduler:
 
     # ── 对外 ────────────────────────────────────────────────
 
-    def ent_minutes(self, snapshot: ActivitySnapshot) -> float:
+    def ent_minutes(self, snapshot: ActivitySnapshot, fullscreen_state: int | None) -> float:
         """被动消费分钟数。与状态判定共用同一口径 —— **包括全屏提权**。
 
         若这里退回原始 taxonomy 口径，全屏识别出的游戏会在回执里 ent_before=0，
         回执直接落成 no_data —— 刚加的信号会自己把反馈回路切断。
+
+        `fullscreen_state` 刻意不给默认值：它必须由调用方在一轮 tick 内**取一次**
+        再复用。探针是一次系统调用，每调一次都可能给出不同答案；若判定与回执
+        各自去探，两者用的就不是同一个事实了。
         """
         return effective_entertainment_minutes(
-            snapshot, self._config.taxonomy, fullscreen_state=self._fullscreen.state()
+            bucket_minutes(snapshot.entries, self._config.taxonomy),
+            trustworthy=snapshot.is_trustworthy,
+            gaming=is_gaming(fullscreen_state),
         )
 
     def run_once(self) -> TickReport:
         now = self._clock.now()
-        closed = self._close_due_outcomes(now)
-        return self._evaluate_tick(now, closed)
+        # 一轮只探一次，并把同一个值贯穿本轮所有用途（回执 + 状态判定）。
+        fullscreen = self._fullscreen.state()
+        closed = self._close_due_outcomes(now, fullscreen)
+        return self._evaluate_tick(now, closed, fullscreen)
 
     def run_forever(self) -> None:  # pragma: no cover - 常驻路径靠手动验证
         interval = timedelta(minutes=self._config.schedule.evaluate_every_minutes)
@@ -96,30 +117,33 @@ class Scheduler:
         except Exception as exc:  # noqa: BLE001 - 常驻进程不能因为单轮失败就退出
             log.exception("本轮评估失败，跳过")
             try:
-                self._store.insert_run_event(
-                    now, "tick_error", f"{type(exc).__name__}: {exc}"[:200]
-                )
+                self._store.insert_run_event(now, "tick_error", _error_detail(exc))
             except Exception:  # noqa: BLE001
                 log.exception("写入 tick_error 运行事件失败")
             return None
 
     # ── 内部 ────────────────────────────────────────────────
 
-    def _close_due_outcomes(self, now: datetime) -> int:
+    def _close_due_outcomes(self, now: datetime, fullscreen: int | None) -> int:
         delay = self._config.outcome.delay_minutes
         window = int(delay)
         closed = 0
+        # before / after 两次回查绑定同一个全屏取值：它们是同一次干预的两侧，
+        # 用两个时刻的两次探测去算，差出来的就不是「效果」而是「探测时机」。
+        ent_minutes = partial(self.ent_minutes, fullscreen_state=fullscreen)
         for due in self._store.due_interventions(now):
             before = self._reader.read(due.at - timedelta(minutes=delay), due.at, window, now)
             after = self._reader.read(
                 due.at, due.at + timedelta(minutes=delay), window, now
             )
-            verdict = evaluate_outcome(before, after, self.ent_minutes, self._config.outcome)
+            verdict = evaluate_outcome(before, after, ent_minutes, self._config.outcome)
             self._store.insert_outcome(due.id, now, verdict)
             closed += 1
         return closed
 
-    def _evaluate_tick(self, now: datetime, closed: int) -> TickReport:
+    def _evaluate_tick(
+        self, now: datetime, closed: int, fullscreen: int | None
+    ) -> TickReport:
         window = self._config.schedule.window_minutes
 
         # 休眠/唤醒检测：醒来后第一轮拿到的窗口会横跨一段根本没采集的时间，
@@ -144,7 +168,7 @@ class Scheduler:
             snapshot,
             self._config.taxonomy,
             self._config.thresholds,
-            fullscreen_state=self._fullscreen.state(),
+            fullscreen_state=fullscreen,
         )
 
         day_start = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -179,12 +203,14 @@ class Scheduler:
             action_id=action.id,
             action_text=body,
             delivery_status=result.stored_status,
+            channel=result.channel,
             outcome_due_at=now + timedelta(minutes=self._config.outcome.delay_minutes),
             user_response=result.user_response,
         )
         self._store.set_kv(ACTION_CURSOR_KEY, action.id)
 
-        note = result.stored_status
+        # 通道写进 note：`--dry-run` 的排练与真实弹窗在库里必须一眼可辨。
+        note = f"{result.stored_status}@{result.channel}"
         if result.user_response:
             note = f"{note} response={result.user_response}"
         return TickReport(evaluation_id, str(verdict.state), True, closed, note)

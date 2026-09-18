@@ -20,7 +20,11 @@ window_minutes = 60
 [thresholds]
 watch_minutes = 20
 passive_minutes = 40
-high_risk_minutes = 65
+# 必须 <= schedule.window_minutes。ent 是窗口内条目分钟数之和，上界就是窗口长度
+# （60），所以 65 这条线永远够不到 —— HIGH_RISK_PASSIVE_CONSUMPTION 会成为死状态，
+# 它专属的动作（reading）永远不会被选中，而配置看起来一切正常。
+# 现在这种组合会在启动时被直接拒绝，不再靠运行时 WARN 提示。
+high_risk_minutes = 55
 late_night_start_hour = 1
 late_night_end_hour = 6
 late_night_min_active_minutes = 10

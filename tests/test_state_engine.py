@@ -5,8 +5,10 @@ import pytest
 
 from statesense.activity.models import ActivitySnapshot, Entry
 from statesense.config import TaxonomyConfig, ThresholdConfig
+from statesense.perception import is_gaming
 from statesense.state.engine import classify, effective_entertainment_minutes, is_late_night
 from statesense.state.models import State
+from statesense.state.taxonomy import bucket_minutes
 
 T0 = datetime(2026, 9, 16, 6, 0, tzinfo=timezone.utc)
 TAX = TaxonomyConfig(
@@ -264,9 +266,32 @@ def test_classify_defaults_to_unknown_fullscreen():
 
 def test_effective_entertainment_minutes_matches_classify():
     """状态判定与行为回执必须共用同一口径 —— 一旦漂移，「干预前 vs 干预后」
-    就不是同一个量，回执会失真。V0 审查发现过两处各算一份。"""
+    就不是同一个量，回执会失真。V0 审查发现过两处各算一份。
+
+    现在两者共用同一个函数，这条测试锁的是「共用」这件事本身：只要有一边改了
+    而另一边没改，这里就会红。
+    """
     for fullscreen in (GAMING, BUSY, None):
         snap = _snap([_ent(10.0), _other(35.0), _work(5.0)], 50.0)
         assert effective_entertainment_minutes(
-            snap, TAX, fullscreen_state=fullscreen
+            bucket_minutes(snap.entries, TAX),
+            trustworthy=snap.is_trustworthy,
+            gaming=is_gaming(fullscreen),
         ) == classify(snap, TAX, TH, fullscreen_state=fullscreen).ent_minutes
+
+
+def test_effective_entertainment_minutes_only_promotes_other():
+    """提权只动 OTHER，不碰 WORK / GRAY —— 边打游戏边开终端时终端时间不算娱乐。"""
+    buckets = bucket_minutes(
+        [_ent(10.0), _other(35.0), _work(20.0)], TAX
+    )
+    assert effective_entertainment_minutes(
+        buckets, trustworthy=True, gaming=True
+    ) == pytest.approx(45.0)
+    assert effective_entertainment_minutes(
+        buckets, trustworthy=True, gaming=False
+    ) == pytest.approx(10.0)
+    # 数据不可信时连提权都不做 —— 这是「取不到数据就不得下结论」的延伸。
+    assert effective_entertainment_minutes(
+        buckets, trustworthy=False, gaming=True
+    ) == pytest.approx(10.0)

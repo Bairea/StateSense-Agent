@@ -6,13 +6,11 @@ import pytest
 
 from statesense.activity.reader import ActivityReader
 from statesense.clock import FrozenClock
-from statesense.config import load_config
 from statesense.notify.base import RESPONSE_ACCEPTED, RecordingNotifier
 from statesense.scheduler import Scheduler
 from statesense.store.db import Store
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
-REPO = Path(__file__).resolve().parents[1]
 
 
 def _body(ent_minutes: float, total: float = 60.0, status: str = "ok") -> bytes:
@@ -35,17 +33,6 @@ def _body(ent_minutes: float, total: float = 60.0, status: str = "ok") -> bytes:
         ],
     }
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-
-@pytest.fixture()
-def config(tmp_path):
-    src = (REPO / "config" / "config.example.toml").read_text(encoding="utf-8")
-    # TOML 基本字符串里反斜杠是转义符，Windows 路径必须用正斜杠。
-    db_path = (tmp_path / "s.db").as_posix()
-    src = src.replace('path = "statesense.db"', f'path = "{db_path}"')
-    target = tmp_path / "config.toml"
-    target.write_text(src, encoding="utf-8")
-    return load_config(target)
 
 
 @pytest.fixture()

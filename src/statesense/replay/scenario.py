@@ -25,3 +25,8 @@ class Scenario:
     #: 属于快照整体。挂在段上会产生语义不明 —— 同一快照里两段各自声称不同的
     #: data_status，而快照只有一个。
     data_status: str = "ok"
+    #: 整段剧本期间 `SHQueryUserNotificationState` 的取值。
+    #: 它必须由剧本给定，否则回放会去读真实的全屏状态，结果随「跑回放的这一刻
+    #: 我是不是正开着游戏」变化 —— 一个不可重复的验证工具比没有更糟。
+    #: 默认 `None` = 无法判定，不触发任何提权。
+    fullscreen_state: int | None = None

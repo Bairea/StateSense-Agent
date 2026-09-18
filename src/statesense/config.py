@@ -7,6 +7,9 @@ import re
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any, TypeVar
+
+T = TypeVar("T")
 
 
 class ConfigError(Exception):
@@ -40,7 +43,8 @@ class ScheduleConfig:
 class ThresholdConfig:
     watch_minutes: float = 20
     passive_minutes: float = 40
-    high_risk_minutes: float = 65
+    #: 必须 <= schedule.window_minutes，否则该状态永远不可达（load_config 会拒绝）。
+    high_risk_minutes: float = 55
     late_night_start_hour: int = 1
     late_night_end_hour: int = 6
     late_night_min_active_minutes: float = 10
@@ -126,6 +130,21 @@ class Config:
     actions: tuple[Action, ...] = field(default_factory=tuple)
 
 
+def _section(cls: type[T], raw: dict[str, Any], name: str) -> T:
+    """按节构造配置 dataclass，把「键名拼错」翻译成启动期报错。
+
+    不做这一步的话，`[screenpipe] base_uri = "..."` 会在构造 dataclass 时抛
+    `TypeError` —— 它不是 `ConfigError`，`main` 接不住，用户看到的是 traceback
+    加退出码 1，与「配置非法」应有的干净报错（退出码 2）完全不同。
+
+    这与 BOM 那次是同一类缺陷：错误本身没错，错在它没有被翻译成用户能看懂的形式。
+    """
+    try:
+        return cls(**raw.get(name, {}))
+    except TypeError as exc:
+        raise ConfigError(f"[{name}] 节的键有问题：{exc}") from exc
+
+
 def _compile(patterns: list[str], where: str) -> tuple[re.Pattern[str], ...]:
     compiled = []
     for raw in patterns:
@@ -153,25 +172,36 @@ def load_config(path: Path) -> Config:
         # 必须包成 ConfigError：main 只接这一种，否则用户看到的是 traceback 加退出码 1。
         raise ConfigError(f"配置文件解析失败：{path}（{exc}）") from exc
 
-    screenpipe = ScreenpipeConfig(**raw.get("screenpipe", {}))
+    screenpipe = _section(ScreenpipeConfig, raw, "screenpipe")
     # spec §12/§15.1：base_url 可由 SCREENPIPE_LOCAL_API_URL 覆盖。
     # 上游明确存在 fallback port 与开发态实例，写死 3030 会打到另一个实例。
     env_base_url = os.environ.get("SCREENPIPE_LOCAL_API_URL", "").strip()
     if env_base_url:
         screenpipe = replace(screenpipe, base_url=env_base_url)
 
-    schedule = ScheduleConfig(**raw.get("schedule", {}))
+    schedule = _section(ScheduleConfig, raw, "schedule")
     if schedule.window_minutes <= 0 or schedule.evaluate_every_minutes <= 0:
         raise ConfigError("schedule.window_minutes 与 evaluate_every_minutes 必须为正数")
 
-    thresholds = ThresholdConfig(**raw.get("thresholds", {}))
+    thresholds = _section(ThresholdConfig, raw, "thresholds")
     if not (thresholds.watch_minutes <= thresholds.passive_minutes <= thresholds.high_risk_minutes):
         raise ConfigError("thresholds 必须满足 watch <= passive <= high_risk")
+    # ent 是**窗口内**条目分钟数之和，其上界就是 window_minutes。阈值超过窗口
+    # 意味着这个状态永远不可达 —— 它专属的动作永远不会被选中，而配置看起来
+    # 一切正常，剧本也只能悄悄少断言一档。这类"能写但永远不生效"的值必须
+    # 在启动时就被拒绝（与 gate.enabled 里拼错闸门名同一原则）。
+    if thresholds.high_risk_minutes > schedule.window_minutes:
+        raise ConfigError(
+            f"thresholds.high_risk_minutes={thresholds.high_risk_minutes:g} 超过 "
+            f"schedule.window_minutes={schedule.window_minutes:g}：ent 是窗口内条目"
+            "分钟数之和，不可能超过窗口长度，该状态因此永远不可达。"
+            "要么把 high_risk_minutes 降到窗口以内，要么加长 window_minutes。"
+        )
 
     gate_raw = dict(raw.get("gate", {}))
     if "enabled" in gate_raw:
         gate_raw["enabled"] = tuple(gate_raw["enabled"])
-    gate = GateConfig(**gate_raw)
+    gate = _section(GateConfig, {"gate": gate_raw}, "gate")
     # 闸门名必须逐一可识别 —— 静默丢弃未知名字会让安全属性无声失效。
     if not gate.enabled:
         raise ConfigError("gate.enabled 不能为空；至少要启用 state_min")
@@ -193,13 +223,13 @@ def load_config(path: Path) -> Config:
         if not (0.0 < gate.ratio_min <= 1.0):
             raise ConfigError(f"gate.ratio_min 必须在 (0, 1] 区间内，当前为 {gate.ratio_min}")
 
-    outcome = OutcomeConfig(**raw.get("outcome", {}))
-    notify = NotifyConfig(**raw.get("notify", {}))
+    outcome = _section(OutcomeConfig, raw, "outcome")
+    notify = _section(NotifyConfig, raw, "notify")
 
     store_raw = raw.get("store", {})
     store_path = (path.parent / store_raw.get("path", "statesense.db")).resolve()
 
-    report = ReportConfig(**raw.get("report", {}))
+    report = _section(ReportConfig, raw, "report")
     if report.gap_threshold_minutes <= 0:
         raise ConfigError("report.gap_threshold_minutes 必须为正数")
     if report.leak_min_active_minutes < 0:

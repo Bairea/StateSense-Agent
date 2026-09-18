@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,16 +9,27 @@ from pathlib import Path
 
 from statesense._time import iso as _iso
 from statesense._time import parse_iso as _parse
-from statesense.intervention.models import Decision
+from statesense.intervention.models import Decision, dump_gate_trace
 from statesense.outcome.models import OutcomeVerdict
 from statesense.state.models import StateVerdict
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 #: 运行事件的封闭枚举。写入未知类型必须报错 —— 与 gate.enabled 的处理同一原则：
 #: 不认识的取值意味着写入方与 schema 已漂移，静默接受会让观测结论失真。
 RUN_EVENT_KINDS: tuple[str, ...] = ("sleep_gap", "tick_error")
+
+#: report 的只读查询能读的表 → 该表的时间列。写成封闭字面量表而不是让调用方
+#: 传表名：表名不来自外部输入，拼进 SQL 才是安全的。
+#: 时间过滤走 SQL 字符串比较 —— `_iso()` 统一转本地时区后序列化，所有落库
+#: 字符串的偏移量一致，字典序即时间序。`since` 必须先经 `_iso()` 转换。
+_LISTABLE: dict[str, str] = {
+    "evaluations": "at",
+    "interventions": "at",
+    "outcomes": "checked_at",
+    "run_events": "at",
+}
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -68,6 +78,13 @@ class Store:
         # 旧行留 NULL = 「无法判定」—— 不伪造「当时不是全屏」。
         if "fullscreen_state" not in _column_names(self._conn, "evaluations"):
             self._conn.execute("ALTER TABLE evaluations ADD COLUMN fullscreen_state INTEGER")
+        # v5 → v6：interventions 增加 channel（投递通道）。
+        # 旧行留 NULL = 「通道未知」。加这一列是因为 `--dry-run` 走 RecordingNotifier，
+        # 它同样返回 status='delivered'，于是排练出来的干预与真实干预在库里一模一样 ——
+        # 「今晚到底有没有真的弹过窗」这个最基本的问题将永远答不上来。
+        # 通道本来就在 DeliveryResult 上，只是过去没有被落库。
+        if "channel" not in _column_names(self._conn, "interventions"):
+            self._conn.execute("ALTER TABLE interventions ADD COLUMN channel TEXT")
 
     def user_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -84,13 +101,7 @@ class Store:
         return row["state"] if row else None
 
     def insert_evaluation(self, at: datetime, verdict: StateVerdict, decision: Decision) -> int:
-        trace = json.dumps(
-            [
-                {"name": g.name, "passed": g.passed, "value": g.value, "threshold": g.threshold}
-                for g in decision.gate_trace
-            ],
-            ensure_ascii=False,
-        )
+        trace = dump_gate_trace(decision.gate_trace)
         with self._conn:
             cur = self._conn.execute(
                 """
@@ -131,15 +142,24 @@ class Store:
         action_text: str,
         delivery_status: str,
         outcome_due_at: datetime,
+        *,
+        channel: str,
         user_response: str | None = None,
     ) -> int:
+        """`channel` 与 `user_response` 一样是**记录下来的事实**，因此不给默认值，
+        并且强制写成关键字 —— 位置参数里夹一个会悄悄取默认值的通道，
+        正是让「排练」与「真弹窗」混在一起的那种写法。
+
+        少了 channel，`--dry-run` 排练出的干预与真实干预在库里无法区分，
+        视图 3 / 视图 4 的结论会同时被两种数据污染。
+        """
         with self._conn:
             cur = self._conn.execute(
                 """
                 INSERT INTO interventions (
                   evaluation_id, at, state, late_night, action_id, action_text,
-                  delivery_status, outcome_due_at, user_response
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  delivery_status, channel, outcome_due_at, user_response
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     evaluation_id,
@@ -149,6 +169,7 @@ class Store:
                     action_id,
                     action_text,
                     delivery_status,
+                    channel,
                     _iso(outcome_due_at),
                     user_response,
                 ),
@@ -245,33 +266,25 @@ class Store:
 
     # ── 只读查询（report 用） ────────────────────────────────
     # 一律以 list_ 开头，便于评审时一眼确认 report 路径不写库。
-    # 时间过滤走 SQL 字符串比较：_iso() 统一转本地时区后序列化，所有落库
-    # 字符串的偏移量一致，字典序即时间序。since 必须先经 _iso() 转换。
+
+    def _list(self, table: str, since: datetime | None) -> list[sqlite3.Row]:
+        column = _LISTABLE[table]
+        if since is None:
+            return self._conn.execute(
+                f"SELECT * FROM {table} ORDER BY {column}"
+            ).fetchall()
+        return self._conn.execute(
+            f"SELECT * FROM {table} WHERE {column} >= ? ORDER BY {column}", (_iso(since),)
+        ).fetchall()
 
     def list_evaluations(self, since: datetime | None = None) -> list[sqlite3.Row]:
-        if since is None:
-            return self._conn.execute("SELECT * FROM evaluations ORDER BY at").fetchall()
-        return self._conn.execute(
-            "SELECT * FROM evaluations WHERE at >= ? ORDER BY at", (_iso(since),)
-        ).fetchall()
+        return self._list("evaluations", since)
 
     def list_interventions(self, since: datetime | None = None) -> list[sqlite3.Row]:
-        if since is None:
-            return self._conn.execute("SELECT * FROM interventions ORDER BY at").fetchall()
-        return self._conn.execute(
-            "SELECT * FROM interventions WHERE at >= ? ORDER BY at", (_iso(since),)
-        ).fetchall()
+        return self._list("interventions", since)
 
     def list_outcomes(self, since: datetime | None = None) -> list[sqlite3.Row]:
-        if since is None:
-            return self._conn.execute("SELECT * FROM outcomes ORDER BY checked_at").fetchall()
-        return self._conn.execute(
-            "SELECT * FROM outcomes WHERE checked_at >= ? ORDER BY checked_at", (_iso(since),)
-        ).fetchall()
+        return self._list("outcomes", since)
 
     def list_run_events(self, since: datetime | None = None) -> list[sqlite3.Row]:
-        if since is None:
-            return self._conn.execute("SELECT * FROM run_events ORDER BY at").fetchall()
-        return self._conn.execute(
-            "SELECT * FROM run_events WHERE at >= ? ORDER BY at", (_iso(since),)
-        ).fetchall()
+        return self._list("run_events", since)

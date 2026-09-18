@@ -60,18 +60,26 @@ Notification          ← 轻推一下
 | [`ref1.md`](./ref1.md) | 技术方案讨论：为什么用 Screenpipe、v1 架构、迭代路线、坑位 |
 | [`docs/project-understanding.md`](./docs/project-understanding.md) | 项目理解整理 + 对上游 Screenpipe 文档的核对结果与偏差修正 |
 | [`docs/specs/2026-09-16-v0-state-intervention-design.md`](./docs/specs/2026-09-16-v0-state-intervention-design.md) | **V0 技术规格**：架构、状态模型、介入闸门、投递与回执、数据模型、测试与部署 |
+| [`docs/specs/2026-09-16-v0.5-observability-and-replay-design.md`](./docs/specs/2026-09-16-v0.5-observability-and-replay-design.md) | **V0.5 技术规格**：观测层视图、回放剧本、常驻健康信号、全屏信号 |
 | [`docs/plans/2026-09-16-v0-implementation.md`](./docs/plans/2026-09-16-v0-implementation.md) | V0 实现计划（11 任务 / 56 步 / TDD） |
 | [`docs/plans/2026-09-16-v0-verification-log.md`](./docs/plans/2026-09-16-v0-verification-log.md) | **V0 验证日志**：端到端实测结果、投递通道实测矩阵、实施中发现的缺陷 |
+| [`docs/plans/2026-09-17-v0.5-verification-log.md`](./docs/plans/2026-09-17-v0.5-verification-log.md) | **V0.5 验证日志**：逐条判据的证据、真实联调结果、缺陷与偏差记录 |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | 协作仓库布局、分支策略与 PR 流程 |
 
 ## 迭代路线
 
 | 版本 | 内容 | 要验证的问题 |
 | --- | --- | --- |
-| **V0** | Screenpipe + 一个 `pipe.md`，每 10 min 检查最近 1 小时，超阈值就通知 | 这种提醒到底有没有价值？ |
-| **V0.5** | Python + Screenpipe API + Rule Engine | 什么时候提醒最好？ |
-| **V1** | + feedback + state transitions + SQLite | 什么干预最有效？ |
+| **V0** | Python + Screenpipe API + Rule Engine + 投递 + 双轨回执 + SQLite | 这种提醒到底有没有价值？ |
+| **V0.5** | 回放器 + `report` 观测层 + 常驻健康信号 + 全屏信号 | V0 到底在不在跑，跑出来的数据能不能用？ |
+| **V1** | 用真实数据校准阈值与分类；「什么干预最有效」分析 | 什么时候提醒最好、什么干预最有效？ |
 | **V2** | + LLM | 模糊状态与个性化策略 |
+
+> **编号已重新基线化（2026-09-16）。** 本表原先定义的 V0 是「Screenpipe + 一个
+> `pipe.md`」，V0.5 是「Python + Screenpipe API + Rule Engine」，V1 才是
+> 「+ feedback + state transitions + SQLite」。实际交付的 V0 直接实现了原先的 V0.5
+> 并顺带实现了原 V1 的反馈与状态转移，因此版本号按事实重排。权威表述见
+> [`docs/project-understanding.md`](./docs/project-understanding.md) §4。
 
 > V0 的目标是**先真的让自己用起来**。如果连续几天后发现「它真的有几次在我要继续刷的时候把我拽出来了」，再投入做完整的 State Agent。
 
