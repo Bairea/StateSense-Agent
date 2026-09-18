@@ -27,7 +27,10 @@ MANDATORY_GATES: tuple[str, ...] = ("state_min",)
 
 @dataclass(frozen=True)
 class ScreenpipeConfig:
-    base_url: str = "http://localhost:3030"
+    #: 默认端口取本机 recorder 实际监听的 3131，而不是 Screenpipe 上游默认的 3030 ——
+    #: 3030 可能被别的软件占住（CONTRIBUTING §7，本机被 Docker 占过），届时每一轮
+    #: 都记成 data_status=unreachable，而一切看起来「在跑」。
+    base_url: str = "http://localhost:3131"
     api_key_env: str = "SCREENPIPE_LOCAL_API_KEY"
     request_timeout_sec: float = 10.0
 

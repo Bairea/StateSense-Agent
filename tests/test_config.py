@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from statesense.config import ConfigError, load_config
+from statesense.config import ConfigError, ScreenpipeConfig, load_config
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -31,11 +31,20 @@ def _write(tmp_path: Path, body: str) -> Path:
 
 def test_loads_example_config_shipped_with_repo():
     cfg = load_config(REPO / "config" / "config.example.toml")
-    assert cfg.screenpipe.base_url == "http://localhost:3030"
+    assert cfg.screenpipe.base_url == "http://localhost:3131"
     assert cfg.gate.ratio_min == 0.75
     assert cfg.schedule.window_minutes == 60
     assert cfg.taxonomy.entertainment
     assert cfg.actions
+
+
+def test_example_port_follows_contributing_section_7():
+    """CONTRIBUTING §7：端口不要默认写 3030（它可能被别的软件占住，
+    症状是每轮 data_status=unreachable 却看起来一切正常）。
+    代码默认值也必须与示例一致，否则「不写 [screenpipe] 节」的库配置会漂回 3030。"""
+    example = (REPO / "config" / "config.example.toml").read_text(encoding="utf-8")
+    assert "http://localhost:3030" not in example
+    assert ScreenpipeConfig().base_url == "http://localhost:3131"
 
 
 def test_utf8_bom_is_tolerated(tmp_path):

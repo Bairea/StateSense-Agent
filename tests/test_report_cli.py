@@ -325,7 +325,7 @@ def test_unknown_config_key_exits_2_without_a_traceback(make_config, capsys):
     """
     cfg = make_config()
     text = cfg.read_text(encoding="utf-8").replace(
-        'base_url = "http://localhost:3030"', 'base_uri = "http://localhost:3030"'
+        'base_url = "http://localhost:3131"', 'base_uri = "http://localhost:3131"'
     )
     cfg.write_text(text, encoding="utf-8")
     assert main(["--report", "--config", str(cfg)]) == 2

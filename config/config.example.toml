@@ -2,13 +2,13 @@
 # 复制为 config/config.toml 后按需修改。密钥不放这里，走环境变量。
 
 [screenpipe]
-# 端口必须与 recorder 实际的 --port 一致。
-# 3030 是 Screenpipe 的默认端口，但它**可能被别的软件占着** —— 本机实测被
+# 端口必须与 recorder 实际的 --port 一致。本机 recorder 监听 3131（见 CONTRIBUTING §7）。
+# 不要用回 Screenpipe 上游默认的 3030：它**可能被别的软件占着** —— 本机实测被
 # Docker Desktop 的 com.docker.backend 占过。被占时的现象极具误导性：
 # Screenpipe 绑不上却仍有进程，端口确实在监听，但 /activity-summary 返回 404，
 # 于是每轮评估都记成 data_status=unreachable，而一切看起来都"在跑"。
-# 排查手段：Get-NetTCPConnection -LocalPort 3030 -State Listen 看 OwningProcess 是谁。
-base_url = "http://localhost:3030"
+# 排查手段：Get-NetTCPConnection -LocalPort <端口> -State Listen 看 OwningProcess 是谁。
+base_url = "http://localhost:3131"
 api_key_env = "SCREENPIPE_LOCAL_API_KEY"
 request_timeout_sec = 10
 
