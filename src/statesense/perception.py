@@ -65,21 +65,33 @@ class FullscreenProbe(Protocol):
         ...
 
 
+def _query_state() -> tuple[int, int] | None:
+    """调 SHQueryUserNotificationState，返回 (调用结果, 取到的值)。
+
+    抬成模块级缝隙只为一个理由：`state()` 的契约（§13 封闭枚举 —— 调用失败、
+    非 Windows、枚举外取值一律「无法判定」）此前只能靠本机真实 API 间接验证，
+    而「result != 0」「返回 99」这两种分支在真机上永远跑不到。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        value = ctypes.c_int(0)
+        result = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(value))
+    except (OSError, AttributeError):
+        # 没有 shell32、或该调用不存在（老系统）—— 按「无法判定」处理。
+        return None
+    return result, value.value
+
+
 class Win32FullscreenProbe:
     """真实探针。非 Windows、调用失败、返回枚举外的值 —— 一律 `None`。"""
 
     def state(self) -> int | None:
-        if sys.platform != "win32":
+        queried = _query_state()
+        if queried is None or queried[0] != 0:
             return None
-        try:
-            value = ctypes.c_int(0)
-            result = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(value))
-        except (OSError, AttributeError):
-            # 没有 shell32、或该调用不存在（老系统）—— 按「无法判定」处理。
-            return None
-        if result != 0:
-            return None
-        return value.value if value.value in KNOWN_STATES else None
+        value = queried[1]
+        return value if value in KNOWN_STATES else None
 
 
 class NullFullscreenProbe:

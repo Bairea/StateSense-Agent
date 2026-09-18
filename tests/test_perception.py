@@ -2,6 +2,7 @@ import sys
 
 import pytest
 
+from statesense import perception
 from statesense.perception import (
     GAMING_STATES,
     KNOWN_STATES,
@@ -45,6 +46,25 @@ def test_null_probe_is_always_unknown():
 
 def test_win32_probe_satisfies_protocol():
     assert isinstance(Win32FullscreenProbe(), FullscreenProbe)
+
+
+#: §13 封闭枚举契约的可达分支：真机永远跑不到「调用失败」和「枚举外取值」，
+#: 只能从 _query_state 缝隙喂进去 —— 否则这两条最要紧的分支无测试可言。
+@pytest.mark.parametrize(
+    ("queried", "expected"),
+    [
+        (None, None),  # 非 Windows / 没有 shell32
+        ((1, QUNS_BUSY), None),  # HRESULT 非 0：调用失败，值再正常也不许采用
+        ((0, 99), None),  # 枚举外取值
+        ((0, 0), None),  # 边界：0 不在 1–7 之内
+        ((0, QUNS_BUSY), QUNS_BUSY),
+        ((0, QUNS_ACCEPTS_NOTIFICATIONS), QUNS_ACCEPTS_NOTIFICATIONS),
+    ],
+    ids=["no-shell32", "call-failed", "out-of-enum", "zero", "busy", "normal"],
+)
+def test_win32_probe_state_contract(monkeypatch, queried, expected):
+    monkeypatch.setattr(perception, "_query_state", lambda: queried)
+    assert Win32FullscreenProbe().state() is expected
 
 
 def test_default_probe_matches_platform():
