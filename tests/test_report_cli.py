@@ -1,9 +1,16 @@
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from statesense.__main__ import _parse_since, _requested_views, build_parser, main
+from statesense.__main__ import (
+    _REPORT_ONLY,
+    _parse_since,
+    _requested_views,
+    build_parser,
+    main,
+)
 from statesense.config import ConfigError
 from statesense.report.render import LEAK_VIEW, VIEW_IDS
 
@@ -97,6 +104,59 @@ def test_unknown_view_id_exits_2_at_the_cli(make_config, tmp_path, capsys):
     _empty_migrated_db(tmp_path)
     assert main(["--report", "--config", str(make_config()), "--views", "9"]) == 2
     assert "未知视图编号" in capsys.readouterr().err
+
+
+# ── §11 help 标注与输出编码 ─────────────────────────────────
+
+@pytest.mark.parametrize("flag", ["--since", "--format", "--views", "--trace", "--from-screenpipe"])
+def test_report_only_flags_are_marked_in_help(flag):
+    """五个「仅 --report 有效」的旗标必须在 --help 里就自报身份，
+    否则用户会在 --once 上敲 --views 并期待生效。"""
+    actions = {a.option_strings[0]: a for a in build_parser()._actions if a.option_strings}
+    assert _REPORT_ONLY in actions[flag].help
+
+
+def test_report_survives_a_gbk_only_stdout(make_config, tmp_path):
+    """中文 Windows 控制台上 stdout 只能写 GBK，而视图 2 的告警行带 ⚠。
+
+    曾经这不是乱码而是**崩溃**：UnicodeEncodeError 死在半路，一份只读命令
+    连自己的输出编码都保不住，谈不上可观测。
+    """
+    from statesense.intervention.models import Decision, GateResult
+    from statesense.state.models import State, StateVerdict
+    from statesense.store.db import Store
+
+    db = tmp_path / "statesense.db"
+    store = Store(db)
+    store.migrate()
+
+    verdict = StateVerdict(
+        state=State.PASSIVE_CONSUMPTION, late_night=False,
+        total_active_minutes=60.0, ent_minutes=45.0, gray_minutes=0.0,
+        work_minutes=0.0, ent_ratio=0.75, entries_minutes=60.0,
+        fullscreen_state=None, window_minutes=60, data_status="ok",
+        skipped=False, skip_reason=None,
+    )
+    decision = Decision(
+        intervene=False, action_id=None, reason="t",
+        gate_trace=(GateResult("ratio_min", False, 0.7, 0.75),),
+    )
+    store.insert_evaluation(T0, verdict, decision)
+    with store._conn:
+        store._conn.execute(
+            "UPDATE evaluations SET gate_trace = 'not json' WHERE at = ?",
+            (store.list_evaluations()[0]["at"],),
+        )
+    store.close()
+
+    out = tmp_path / "gbk_stdout.txt"
+    with open(out, "w", encoding="gbk") as fake_stdout, \
+            redirect_stdout(fake_stdout):
+        assert main([
+            "--report", "--config", str(make_config()), "--views", "2"
+        ]) == 0
+    text = out.read_text(encoding="utf-8")
+    assert "闸门数据损坏 1 轮" in text
 
 
 # ── 端到端 ──────────────────────────────────────────────────

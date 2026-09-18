@@ -53,7 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--since", default="7d", help=f"report 回看区间：7d / 24h / ISO 时刻{_REPORT_ONLY}"
     )
-    parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help=f"输出格式 text / json{_REPORT_ONLY}",
+    )
     parser.add_argument(
         "--views",
         default="",
@@ -398,7 +403,19 @@ def run_replay(name: str, config: Config, *, keep_db: bool) -> int:
     return 1 if failed else 0
 
 
+def _pin_utf8_output() -> None:
+    """把 stdout/stderr 钉成 UTF-8。渲染层有 GBK 编码不了的字符（⚠），
+    中文 Windows 控制台上 `--report` 会死在中途 —— 无论 launcher 有没有设
+    PYTHONIOENCODING。日志设置不该反过来杀死进程，所以失败一律咽下。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _pin_utf8_output()
     args = build_parser().parse_args(argv)
     # 常驻模式的日志走 **stdout**，其余模式走 stderr。两条理由：
     #   · daemon 的日志就是它的输出，落在 daemon.out.log 里名正言顺；落在
