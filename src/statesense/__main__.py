@@ -335,6 +335,9 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
                 min_active_minutes=config.report.leak_min_active_minutes,
                 min_unclassified_ratio=config.report.leak_min_unclassified_ratio,
             ),
+            # 「没索取」与「忘了传」必须是两件写得出来的事 —— 见 models 的 docstring。
+            trace=(),
+            leak_details=(),
         )
 
         if args.trace:

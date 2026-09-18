@@ -199,7 +199,7 @@ class ReportData:
     gates: GateBreakdown
     interventions: InterventionBreakdown
     outcomes: OutcomeBreakdown
-    leaks: tuple[LeakAnchor, ...] = ()
-    trace: tuple[TraceRow, ...] = ()
+    leaks: tuple[LeakAnchor, ...]
+    trace: tuple[TraceRow, ...]
     #: 二级漏判视图的回查结果（窗口标题只在这里出现，绝不落库）。可能为空。
-    leak_details: tuple[LeakWindowDetail, ...] = ()
+    leak_details: tuple[LeakWindowDetail, ...]

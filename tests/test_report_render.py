@@ -41,6 +41,8 @@ def _data(**over) -> ReportData:
         interventions=InterventionBreakdown(0, (), (), (), (), (), (), 0, 0),
         outcomes=OutcomeBreakdown((), (), 0, None, None, None, None),
         leaks=(),
+        trace=(),
+        leak_details=(),
     )
     return replace(base, **over)
 
