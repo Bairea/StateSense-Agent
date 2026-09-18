@@ -13,7 +13,13 @@ from datetime import datetime
 from typing import Any
 
 from statesense._time import parse_iso as _parse
-from statesense.config import TaxonomyConfig
+from statesense.config import (
+    GATE_COOLDOWN,
+    GATE_DAILY_CAP,
+    GATE_RATIO_MIN,
+    GATE_STATE_MIN,
+    TaxonomyConfig,
+)
 from statesense.intervention.models import first_failed, parse_gate_trace
 from statesense.report.models import (
     ContinuityGap,
@@ -51,6 +57,15 @@ def _count(items: Sequence[tuple[str, int]], key: str) -> int:
     return next((count for name, count in items if name == key), 0)
 
 
+def _moments(evaluations: Sequence[Any]) -> list[datetime]:
+    """评估行的时刻序列。store 已按时间序返回，这里只负责解析这一件事。"""
+    return [_parse(r["at"]) for r in evaluations]
+
+
+def _run_events(rows: Iterable[Any]) -> tuple[RunEvent, ...]:
+    return tuple(RunEvent(_parse(r["at"]), r["kind"], r["detail"]) for r in rows)
+
+
 def _ratio_bucket(ratio: float, buckets: int) -> str:
     index = max(0, min(int(ratio * buckets), buckets - 1))
     return f"{index / buckets:.1f}-{(index + 1) / buckets:.1f}"
@@ -63,8 +78,8 @@ def build_overview(
     evaluate_every_minutes: int,
     gap_threshold_minutes: float,
 ) -> Overview:
-    moments = [_parse(r["at"]) for r in evaluations]
-    events = tuple(RunEvent(_parse(r["at"]), r["kind"], r["detail"]) for r in run_events)
+    moments = _moments(evaluations)
+    events = _run_events(run_events)
     if not moments:
         return Overview(None, None, 0, 0, 0.0, ())
 
@@ -102,7 +117,7 @@ def build_liveness(
     `now` 必须由调用方传入（`clock.now()`），本函数不读时钟 —— 保持纯函数，
     报告才可能在测试里被固定在某一刻复现。
     """
-    moments = [_parse(r["at"]) for r in evaluations]
+    moments = _moments(evaluations)
     if not moments:
         return Liveness(
             now,
@@ -115,11 +130,7 @@ def build_liveness(
 
     last = moments[-1]
     silent = (now - last).total_seconds() / 60
-    events = tuple(
-        RunEvent(_parse(r["at"]), r["kind"], r["detail"])
-        for r in run_events
-        if _parse(r["at"]) >= last
-    )
+    events = tuple(e for e in _run_events(run_events) if e.at >= last)
     # 时钟回拨或库里出现未来行时 silent 会为负，一律不算掉线 ——
     # 「未来有数据」不是「进程死了」。
     offline = silent > gap_threshold_minutes
@@ -194,7 +205,7 @@ def build_gate_breakdown(
         for gate in trace:
             if not gate.passed:
                 blocked_any[gate.name] += 1
-            if gate.name == "ratio_min":
+            if gate.name == GATE_RATIO_MIN:
                 if gate.passed:
                     ratio_min_passed += 1
                 else:
@@ -204,7 +215,7 @@ def build_gate_breakdown(
         if failing is not None:
             blocked_first[failing.name] += 1
             # state_min 挡下的轮次不算「该提醒但没提醒」—— 那本来就不该提醒。
-            if failing.name != "state_min":
+            if failing.name != GATE_STATE_MIN:
                 candidates.append(
                     GateBlock(
                         at=_parse(row["at"]),
@@ -256,8 +267,8 @@ def build_intervention_breakdown(
         delivery_statuses=_ranked(deliveries),
         channels=_ranked(channels),
         user_responses=_ranked(responses),
-        cooldown_blocks=_count(gates.blocked_any, "cooldown"),
-        daily_cap_blocks=_count(gates.blocked_any, "daily_cap"),
+        cooldown_blocks=_count(gates.blocked_any, GATE_COOLDOWN),
+        daily_cap_blocks=_count(gates.blocked_any, GATE_DAILY_CAP),
     )
 
 
@@ -395,7 +406,7 @@ def build_trace(
     `at` 早于全部记录时不返回空：改为从最早一轮开始给。空输出会被读成
     「工具坏了」，而实际情况是「那时候还没有数据」—— 那是两件不同的事。
     """
-    moments = [_parse(r["at"]) for r in evaluations]
+    moments = _moments(evaluations)
     pivot = -1
     for index, moment in enumerate(moments):
         if moment <= at:

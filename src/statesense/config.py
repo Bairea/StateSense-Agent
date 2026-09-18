@@ -16,13 +16,20 @@ class ConfigError(Exception):
     """配置非法。"""
 
 
+#: 闸门名。注册表、配置校验与报告统计都引用这些常量 —— 同一件事只能有一个拼法，
+#: 字面量各写各的正是「配置能写、运行时静默不跑」那类缺陷的土壤。
+GATE_STATE_MIN = "state_min"
+GATE_RATIO_MIN = "ratio_min"
+GATE_COOLDOWN = "cooldown"
+GATE_DAILY_CAP = "daily_cap"
+
 #: 闸门注册表里允许出现的名字。
 #: 配置中出现未知名字必须**启动失败**：拼错一个名字会静默少跑一条闸门，
 #: 若少掉的是 state_min，系统就会对并不处于被动消费状态的人弹窗。
-KNOWN_GATES: tuple[str, ...] = ("state_min", "ratio_min", "cooldown", "daily_cap")
+KNOWN_GATES: tuple[str, ...] = (GATE_STATE_MIN, GATE_RATIO_MIN, GATE_COOLDOWN, GATE_DAILY_CAP)
 
 #: 必须始终启用的闸门。state_min 是「只在真的被困住时才打扰」这条安全属性的唯一守卫。
-MANDATORY_GATES: tuple[str, ...] = ("state_min",)
+MANDATORY_GATES: tuple[str, ...] = (GATE_STATE_MIN,)
 
 
 @dataclass(frozen=True)
@@ -55,7 +62,7 @@ class ThresholdConfig:
 
 @dataclass(frozen=True)
 class GateConfig:
-    enabled: tuple[str, ...] = ("state_min", "ratio_min", "cooldown", "daily_cap")
+    enabled: tuple[str, ...] = KNOWN_GATES
     ratio_min: float | None = None
     cooldown_minutes: float = 30
     daily_cap: int = 8
@@ -220,7 +227,7 @@ def load_config(path: Path) -> Config:
             "非被动消费状态下打扰用户的闸门，不允许关闭。"
         )
     # ratio_min 是必填项。缺失时绝不静默降级为 0 —— 静默失效的闸门比报错危险得多。
-    if "ratio_min" in gate.enabled:
+    if GATE_RATIO_MIN in gate.enabled:
         if gate.ratio_min is None:
             raise ConfigError("gate.ratio_min 未设置；该项为必填，不接受默认值")
         if not (0.0 < gate.ratio_min <= 1.0):

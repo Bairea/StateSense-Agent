@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from statesense._time import parse_iso
-from statesense.config import Config
+from statesense.config import GATE_COOLDOWN, GATE_DAILY_CAP, Config
 from statesense.intervention.models import GateResult, first_failed, parse_gate_trace
 from statesense.replay.runner import ReplayRun, run_scenario
 from statesense.replay.scenario import Scenario, Segment
@@ -172,13 +172,13 @@ def _drive_gates(config: Config, workdir: Path) -> list[str]:
             failures.append(
                 f"触发 {len(interventions)} 次，daily_cap={cap}，应当恰好相等"
             )
-        if not any(_first_failed_name(r) == "daily_cap" for r in rows):
+        if not any(_first_failed_name(r) == GATE_DAILY_CAP for r in rows):
             failures.append(
                 f"跑满 300 分钟后仍未触到 daily_cap={cap}，该闸门没有被这条剧本覆盖"
             )
 
         # ② cooldown 的边界必须踩实：最大值（被挡）恰好是 cooldown-1。
-        elapsed = [gate for gate in (_gate(r, "cooldown") for r in rows) if gate is not None]
+        elapsed = [gate for gate in (_gate(r, GATE_COOLDOWN) for r in rows) if gate is not None]
         blocked = [
             g for g in elapsed
             if not g.passed and g.value is not None and g.value < cooldown
@@ -206,7 +206,7 @@ def _drive_gates(config: Config, workdir: Path) -> list[str]:
 
         # ④ 「第 cap 次通过」与「第 cap+1 次被挡」两侧都要看到。
         #    只看被挡的那一侧，无法区分「上限生效」与「根本没跑到上限」。
-        daily = [gate for gate in (_gate(r, "daily_cap") for r in rows) if gate is not None]
+        daily = [gate for gate in (_gate(r, GATE_DAILY_CAP) for r in rows) if gate is not None]
         if not any(g.passed and g.value == cap - 1 for g in daily):
             failures.append(
                 f"没有一轮在「今天已触发 {cap - 1} 次」时通过 daily_cap（即第 {cap} 次）"

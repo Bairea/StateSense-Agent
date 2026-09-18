@@ -10,7 +10,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from statesense.config import KNOWN_GATES, GateConfig
+from statesense.config import (
+    GATE_COOLDOWN,
+    GATE_DAILY_CAP,
+    GATE_RATIO_MIN,
+    GATE_STATE_MIN,
+    KNOWN_GATES,
+    GateConfig,
+)
 from statesense.intervention.models import GateResult
 from statesense.state.models import State, StateVerdict
 
@@ -28,13 +35,13 @@ class GateContext:
 
 def evaluate_state_min(ctx: GateContext) -> GateResult:
     passed = ctx.verdict.state in INTERVENABLE
-    return GateResult(name="state_min", passed=passed, value=1.0 if passed else 0.0, threshold=1.0)
+    return GateResult(name=GATE_STATE_MIN, passed=passed, value=1.0 if passed else 0.0, threshold=1.0)
 
 
 def evaluate_ratio_min(ctx: GateContext) -> GateResult:
     threshold = ctx.config.required_ratio_min()
     return GateResult(
-        name="ratio_min",
+        name=GATE_RATIO_MIN,
         passed=ctx.verdict.ent_ratio >= threshold,
         value=ctx.verdict.ent_ratio,
         threshold=threshold,
@@ -45,16 +52,16 @@ def evaluate_cooldown(ctx: GateContext) -> GateResult:
     limit = ctx.config.cooldown_minutes
     if ctx.last_intervention_at is None:
         # 从未干预过：没有「距上次多少分钟」这个量，只能显式为 None，不要用 inf 假装它是个数。
-        return GateResult(name="cooldown", passed=True, value=None, threshold=limit)
+        return GateResult(name=GATE_COOLDOWN, passed=True, value=None, threshold=limit)
     elapsed = (ctx.now - ctx.last_intervention_at).total_seconds() / 60.0
     return GateResult(
-        name="cooldown", passed=elapsed >= limit, value=round(elapsed, 1), threshold=limit
+        name=GATE_COOLDOWN, passed=elapsed >= limit, value=round(elapsed, 1), threshold=limit
     )
 
 
 def evaluate_daily_cap(ctx: GateContext) -> GateResult:
     return GateResult(
-        name="daily_cap",
+        name=GATE_DAILY_CAP,
         passed=ctx.interventions_today < ctx.config.daily_cap,
         value=float(ctx.interventions_today),
         threshold=float(ctx.config.daily_cap),
@@ -62,10 +69,10 @@ def evaluate_daily_cap(ctx: GateContext) -> GateResult:
 
 
 GATE_REGISTRY: dict[str, Callable[[GateContext], GateResult]] = {
-    "state_min": evaluate_state_min,
-    "ratio_min": evaluate_ratio_min,
-    "cooldown": evaluate_cooldown,
-    "daily_cap": evaluate_daily_cap,
+    GATE_STATE_MIN: evaluate_state_min,
+    GATE_RATIO_MIN: evaluate_ratio_min,
+    GATE_COOLDOWN: evaluate_cooldown,
+    GATE_DAILY_CAP: evaluate_daily_cap,
 }
 
 # 注册表必须覆盖配置层认可的全部闸门名。缺一个就意味着配置能写、运行时却静默不跑。

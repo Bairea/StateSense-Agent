@@ -20,6 +20,7 @@ from statesense.report.models import (
     LeakDetailStatus,
     Liveness,
     ReportData,
+    RunEvent,
     VerdictBreakdown,
 )
 
@@ -31,11 +32,16 @@ LEAK_VIEW = "5"
 SKIPPED_ALERT_RATIO = 0.2
 
 
+def _events_phrase(events: Collection[RunEvent]) -> str:
+    """把一组运行事件写成「kind(detail)、…」。缺口与掉线描述的是同一类东西，
+    措辞必须出自一处，否则两处会在某次只改一边的改动后漂移。"""
+    return "、".join(f"{e.kind}({e.detail})" for e in events)
+
+
 def _gap_reason(gap: ContinuityGap) -> str:
     """缺口旁边写清它是什么 —— 这正是本版本要消灭的二义。"""
     if gap.events:
-        kinds = "、".join(f"{e.kind}({e.detail})" for e in gap.events)
-        return f"有运行事件记录：{kinds}"
+        return f"有运行事件记录：{_events_phrase(gap.events)}"
     return "无运行事件记录 → 进程当时不在运行"
 
 
@@ -65,8 +71,7 @@ def _liveness_lines(lv: Liveness) -> list[str]:
         f"已超过阈值 {lv.threshold_minutes:g} 分钟"
     ]
     if lv.events:
-        kinds = "、".join(f"{e.kind}({e.detail})" for e in lv.events)
-        lines.append(f"              之后有运行事件：{kinds}")
+        lines.append(f"              之后有运行事件：{_events_phrase(lv.events)}")
     else:
         lines.append("              之后没有运行事件记录 → 进程大概率已不在运行")
     return lines

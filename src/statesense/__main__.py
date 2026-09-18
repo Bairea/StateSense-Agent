@@ -352,7 +352,6 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
         if args.from_screenpipe:
             data = replace(data, leak_details=_leak_details(config, data.leaks))
 
-        views = _requested_views(args.views)
         if args.format == "json":
             # JSON 里所有视图的字段都在，`--views` 无从省略任何东西。
             # 与其静默忽略它，不如说清楚 —— JSON 消费方按字段取用即可。
