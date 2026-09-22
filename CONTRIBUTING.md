@@ -158,7 +158,7 @@ git push -u origin feat/activity-reader
 | uv | 0.11.16 |
 | Node | v24.14.1 |
 | bun | 已安装（`D:\DevTools\bun`，`BUN_INSTALL` 已写入用户环境变量） |
-| Screenpipe | 桌面版装过：数据目录是**默认的** `C:\Users\<用户>\.screenpipe`（2026-09-22 实测 211 MB，最后活动 2026-09-15）。`D:\Screenpipe` **不存在**，`screenpipe` CLI 不在 PATH 上 |
+| Screenpipe | CLI `screenpipe@0.4.50`（`bun install -g screenpipe` → `%USERPROFILE%\.bun\bin\screenpipe.exe`）；桌面版数据目录是默认的 `C:\Users\<用户>\.screenpipe`。`D:\Screenpipe` **不存在** |
 
 > **⚠️ 2026-09-22 实测修正。** 上面这一行原写作「已安装 v0.4.50，数据目录 `D:\Screenpipe`，
 > recorder 监听 `localhost:3131`」——那是另一台机器/另一套部署的状态，在本机不成立。
@@ -166,6 +166,13 @@ git push -u origin feat/activity-reader
 > 而且现象很像「一直在跑、只是没数据」。
 > **先确认数据目录**（看已存在的 `.screenpipe` 在哪，或 `screenpipe --help` 的默认值），
 > 再决定 `--data-dir`；不确定就**不要**加这个参数，用默认值。
+>
+> 三条装完才知道的约束：
+> `npm` 在这台机器上不可用（输出乱码并调起 WSL，被沙箱拦），用 `bun` 装；
+> `%USERPROFILE%\.bun\bin` **不在 PATH** 上（把启动器复制到别的 PATH 目录也没用，
+> 实测报 `MODULE_NOT_FOUND`）；脚本与计划任务请写绝对路径；
+> `screenpipe service` 在 Windows 上**不支持**，常驻只能靠任务计划程序。
+> 详细步骤与冒烟结果见 `docs/plans/2026-09-22-stage-0-baseline-checklist.md`。
 
 > **端口不要默认写 3030。** 3030 是 Screenpipe 的默认端口，但它**可能被别的软件占着** ——
 > 本机实测被 Docker Desktop 的 `com.docker.backend` 占过。被占时的现象极具误导性：

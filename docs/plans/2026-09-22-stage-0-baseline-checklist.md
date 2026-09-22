@@ -118,13 +118,22 @@ bun install -g screenpipe        # → screenpipe@0.4.50，二进制在 %USERPRO
 screenpipe doctor                # screen recording / microphone / accessibility 全 ok，ffmpeg ok
 ```
 
-`npm` 在这台机器上会绕到 WSL（被沙箱拦），改用 bun；官方文档也把 `bun x screenpipe@latest`
-列为第二条路径。**注意 `%USERPROFILE%\.bun\bin` 不在 PATH 上**，裸敲 `screenpipe` 会找不到：
+`npm` 在这台机器上会绕到 WSL（被沙箱拦，输出也是乱码），改用 bun；官方文档也把
+`bun x screenpipe@latest` 列为第二条路径。
 
-- 要用裸命令：把 `%USERPROFILE%\.bun\bin` 加进用户 PATH（本项目里凡是脚本/计划任务，
-  一律写**绝对路径**更稳）。
-- `screenpipe service install` 在 Windows 上**不支持**（`service status` 直接报
-  「supported on Linux and macOS only」）—— 常驻得靠任务计划程序。
+**裸敲 `screenpipe` 暂时不行 —— `%USERPROFILE%\.bun\bin` 不在 PATH 上。** 试过两条替代路，都不通：
+
+| 试法 | 结果 |
+| --- | --- |
+| 把 `screenpipe.exe` + `screenpipe.bunx` 复制进 `%APPDATA%\npm`（那目录在 PATH 上） | **不行**：启动器依赖 `bun` 在 PATH 上、并按其所在目录解析模块，复制后报 `bun is not installed in %PATH%` / `MODULE_NOT_FOUND`。已把这两个文件删掉，没留在系统里 |
+| `npm i -g screenpipe` | **不行**：本机 `npm` 输出乱码并调起 WSL，被拦（`wsl.exe` 在黑名单里） |
+
+所以二选一：把 `%USERPROFILE%\.bun\bin` 加进**用户 PATH**（新开终端生效），
+或者一律用绝对路径 `%USERPROFILE%\.bun\bin\screenpipe.exe` —— 本项目的脚本与计划任务
+建议用后者，路径显式、不依赖 shell 环境。
+
+另：`screenpipe service install` 在 Windows 上**不支持**（`service status` 直接报
+「supported on Linux and macOS only」）—— 常驻只能靠任务计划程序。
 
 Token 已写入用户环境变量（值不落任何文件）：
 
