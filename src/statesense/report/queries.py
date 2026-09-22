@@ -77,6 +77,17 @@ def _moments(evaluations: Sequence[Any]) -> list[datetime]:
     return [_parse(r["at"]) for r in evaluations]
 
 
+def _local_day(moment: str | datetime) -> str:
+    """一个时刻落在**本地时区**的哪一天，形如 `2026-09-22`。
+
+    日界只有这一个实现。此前 `per_day`、两处「覆盖了几天」、以及视图 8 的
+    `total_days` 各自写了一遍 `astimezone().date().isoformat()` —— 四处都算同一天，
+    却谁也不保证与别人一致：将来只改其中一处，出现的就是「某天干预了 12 次」
+    与「区间覆盖 3 天」用两个日界，而报表里两个数字并排出现，看起来能互相校验。
+    """
+    return _parse(moment).astimezone().date().isoformat()
+
+
 def _run_events(rows: Iterable[Any]) -> tuple[RunEvent, ...]:
     return tuple(RunEvent(_parse(r["at"]), r["kind"], r["detail"]) for r in rows)
 
@@ -298,7 +309,7 @@ def build_intervention_breakdown(
     responses: Counter[str] = Counter()
 
     for row in interventions:
-        per_day[_parse(row["at"]).astimezone().date().isoformat()] += 1
+        per_day[_local_day(row["at"])] += 1
         actions[row["action_id"]] += 1
         states[row["state"]] += 1
         deliveries[row["delivery_status"]] += 1
@@ -442,7 +453,7 @@ def build_cohort_breakdown(rows: Sequence[Any]) -> CohortBreakdown:
             outcomes[layer][row["outcome"]] += 1
         if layer != COHORT_MAIN:
             continue
-        days.add(_parse(row["at"]).astimezone().date().isoformat())
+        days.add(_local_day(row["at"]))
         versions[row["eval_rule_version"] or UNKNOWN_VERSION] += 1
         before.append(row["ent_before"])
         after.append(row["ent_after"])
@@ -663,7 +674,7 @@ def build_action_timing_breakdown(
         event_hits: set[int] = set()
         missing = 0
         for row in group:
-            days.add(_parse(row["at"]).astimezone().date().isoformat())
+            days.add(_local_day(row["at"]))
             for index, event in enumerate(events):
                 if event.start <= _parse(row["at"]) <= event.end + timedelta(
                     minutes=gap_threshold_minutes
@@ -707,7 +718,7 @@ def build_action_timing_breakdown(
         total_deliveries=len(delivered),
         total_events=len(events),
         total_days=len(
-            {_parse(r["at"]).astimezone().date().isoformat() for r in delivered}
+            {_local_day(r["at"]) for r in delivered}
         ),
         layers=tuple(layers),
         raw_ticks=len(delivered),
