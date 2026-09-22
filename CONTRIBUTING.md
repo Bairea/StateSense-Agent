@@ -2,21 +2,26 @@
 
 本仓库已进入实现阶段：`main` 上已有协作脚手架与 V0 技术规格（PR #1 已合并），V0 实现见 PR #2。这份文档说明远程协作的仓库布局、分支策略与提交/评审流程。
 
+> **2026-09-22 按事实修订。** 本节的旧版写着「origin 是 `SilhouetteQA` 的 fork，
+> `upstream` 只读」，与当前 clone 不符：本机 `origin` 就是
+> `Bairea/StateSense-Agent`（canonical），登录账号是 `Bairea`。V0/V0.5 那批提交
+> 确实是由协作账号经 fork 提 PR 完成的，那是历史；现在的流程见下面各节。
+
 ---
 
 ## 1. 仓库与权限
 
 | 项 | 值 |
 | --- | --- |
-| 上游（canonical） | https://github.com/Bairea/StateSense-Agent |
+| 仓库（canonical） | https://github.com/Bairea/StateSense-Agent |
 | 默认分支 | `main` |
 | 可见性 | Public |
-| 当前协作账号 | `SilhouetteQA`（**collaborator，Write 权限**） |
-| 本仓库 fork | https://github.com/SilhouetteQA/StateSense-Agent |
+| 当前账号 | `Bairea`（**owner**） |
+| remote | 只有 `origin`，指向上面这个 canonical 仓库 |
 
-> `SilhouetteQA` 已被加为 collaborator，可直接向 `Bairea/StateSense-Agent` 推送分支。`origin`（fork）保留作备份，两条路径都可用，见第 6 节。
-
-本仓库采用标准的 **Fork + Pull Request** 协作模型。所有改动仍经由 PR 评审进入 `main`。
+本机没有 fork、也不需要：分支直接推到 `origin`，用 PR 合入 `main`。
+**`main` 仍不接受直接提交** —— 走 feature 分支加 PR 的理由不是权限，是可追溯：
+每个改动的验证结果与决定都留在 PR 里，回看时能对上。
 
 ---
 
@@ -24,30 +29,29 @@
 
 ```bash
 git remote -v
-# origin    https://github.com/SilhouetteQA/StateSense-Agent.git  ← 你自己的 fork，用来推分支
-# upstream  https://github.com/Bairea/StateSense-Agent.git        ← 权威仓库，只读
+# origin  https://github.com/Bairea/StateSense-Agent.git (fetch)
+# origin  https://github.com/Bairea/StateSense-Agent.git (push)
 ```
 
 | remote | 用途 |
 | --- | --- |
-| `origin` | 推送 feature 分支、开 PR |
-| `upstream` | 拉取权威最新代码 |
+| `origin` | 拉取最新 `main`、推送 feature 分支、开 PR |
 
-`main` 分支跟踪 `upstream/main`，所以：
+`main` 跟踪 `origin/main`，所以：
 
 ```bash
 git checkout main
-git pull            # = 从 Bairea 拉取最新 main
+git pull            # 拉取最新 main
 ```
 
-这样 `git status` 会直接告诉你「落后上游几个提交」。
+这样 `git status` 会直接告诉你「落后远端几个提交」。
 
 ---
 
 ## 3. 分支策略
 
-- `main` **永不直接提交**，只用于同步上游。
-- 所有工作都在 feature 分支上进行，**默认**从最新的 `upstream/main` 切出。
+- `main` **永不直接提交**，只用于同步远端。
+- 所有工作都在 feature 分支上进行，从最新的 `origin/main` 切出。
 - 当一个功能依赖尚未合并的前序功能分支时（V0.5 依赖 V0 即属此例），允许基于该功能分支切出。但**开 PR 前必须摘干净**，否则 PR 会带上不属于它的提交：
 
   ```bash
@@ -71,32 +75,32 @@ git pull            # = 从 Bairea 拉取最新 main
 ## 4. 标准工作流
 
 ```bash
-# 1) 同步上游
+# 1) 同步远端
 git checkout main && git pull
 
 # 2) 切出分支
 git checkout -b feat/activity-reader
 
-# 3) 开发 & 提交
-git add -A
+# 3) 开发 & 提交（用显式路径，别用 git add -A —— .gitignore 里那条血的教训）
+git add src/statesense/activity tests/test_activity_reader.py
 git commit -m "feat(reader): 基于 activity-summary 实现 30min 活动快照"
 
-# 4) 推到自己的 fork
+# 4) 推分支（同仓，不经过 fork）
 git push -u origin feat/activity-reader
 
-# 5) 向上游开 PR
+# 5) 开 PR，base main
 gh pr create --repo Bairea/StateSense-Agent \
   --base main \
-  --head SilhouetteQA:feat/activity-reader \
+  --head feat/activity-reader \
   --title "feat(reader): 基于 activity-summary 实现 30min 活动快照" \
   --body "…"
 ```
 
-分支落后上游时，优先 **rebase** 而不是 merge，保持线性历史：
+分支落后 `main` 时，优先 **rebase** 而不是 merge，保持线性历史：
 
 ```bash
-git fetch upstream
-git rebase upstream/main
+git fetch origin
+git rebase origin/main
 git push --force-with-lease origin feat/activity-reader
 ```
 
@@ -117,7 +121,7 @@ git push --force-with-lease origin feat/activity-reader
 ```
 
 `type`：`feat` / `fix` / `docs` / `refactor` / `test` / `chore` / `perf`。
-`scope` 取架构组件名。当前实际在用的：`config` / `reader` / `state` / `intervention` / `store` / `notify` / `outcome` / `scheduler` / `perception` / `cli`（入口层 `__main__.py`）；V0.5 起新增 `report` / `replay`。`docs` / `chore` 类提交往往不对应单一组件，用宽泛 scope（如 `spec` / `plan` / `gitignore`）或省略不写均可。新组件引入时请同步更新这一行。
+`scope` 取架构组件名。当前实际在用的：`config` / `reader` / `state` / `intervention` / `store` / `notify` / `outcome` / `scheduler` / `perception` / `cli`（入口层 `__main__.py`）；V0.5 起新增 `report` / `replay`；阶段 1.1 起新增 `rulebook`（判定规则版本）。`docs` / `chore` 类提交往往不对应单一组件，用宽泛 scope（如 `spec` / `plan` / `gitignore`）或省略不写均可。新组件引入时请同步更新这一行。
 
 示例：
 
@@ -131,16 +135,16 @@ docs(ref): 修正 ref1 中 /search 的 browser_url 描述
 
 ---
 
-## 6. 推分支到上游（已具备权限）
+## 6. 推送分支
 
-`SilhouetteQA` 已是 collaborator，可以直接把分支推到上游：
+同仓直推，没有 fork 与 upstream 两套 remote 要区分：
 
 ```bash
-git remote set-url --push upstream https://github.com/Bairea/StateSense-Agent.git
-git push -u upstream docs/v0.5-spec
+git push -u origin feat/activity-reader
 ```
 
-`origin`（fork）继续作为备份，推 `origin` 开 PR 同样可行 —— 两条路径产生的 PR 等价。选哪条由提交者决定。
+首次推送后 `gh pr create` 会自动用这个分支作 head；之后的提交再推一次即可
+自动更新 PR。**不要推 `main`，也不要对 `main` 用 `--force`。**
 
 ---
 
@@ -148,10 +152,10 @@ git push -u upstream docs/v0.5-spec
 
 | 组件 | 状态 |
 | --- | --- |
-| git | 2.53.0.windows.2 |
-| gh | 2.92.0（已登录 `SilhouetteQA`，scopes: `repo`, `workflow`, `read:org`） |
-| Python | 3.12.10 |
-| uv | 0.11.6 |
+| git | 2.36.1.windows.1 |
+| gh | 2.92.0（已登录 `Bairea`，scopes: `repo`, `workflow`, `read:org`, `gist`） |
+| Python | `uv run` 下的解释器是 3.13.12（`pyproject.toml` 要求 >=3.12） |
+| uv | 0.11.16 |
 | Node | v24.14.1 |
 | bun | 已安装（`D:\DevTools\bun`，`BUN_INSTALL` 已写入用户环境变量） |
 | Screenpipe | 已安装（v0.4.50），数据目录 `D:\Screenpipe`，recorder 监听 `localhost:3131` |
