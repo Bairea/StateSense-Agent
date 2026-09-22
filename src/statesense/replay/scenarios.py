@@ -16,6 +16,7 @@ from pathlib import Path
 from statesense._time import parse_iso
 from statesense.config import GATE_COOLDOWN, GATE_DAILY_CAP, Config
 from statesense.intervention.models import GateResult, first_failed, parse_gate_trace
+from statesense.perception import QUNS_BUSY
 from statesense.replay.runner import ReplayRun, run_scenario
 from statesense.replay.scenario import Scenario, Segment
 
@@ -51,6 +52,29 @@ SCENARIOS: dict[str, Scenario] = {
 
 #: 行为停止的对照剧本：娱乐恰好在触发点结束。
 _OUTCOME_STOPPED = Scenario("outcome-stopped", 40, (_fun(40),))
+
+#: 「游戏退出」的对照剧本（阶段 2.2 的验证要求）：
+#: 前 45 分钟在打一个**清单里没有的游戏**（`brotato.exe`，只能靠全屏信号提权），
+#: 之后换成文档页。剧本里的「退出游戏」就表达为这一次**活动段切换**。
+#:
+#: 这一节能证的是**两个窗口各读各的活动**：触发前 10 分钟全是游戏、触发后 10 分钟
+#: 只剩头 5 分钟 —— 两侧算出来的娱乐分钟一旦相同，就说明取窗口取错了。
+#:
+#: 它**证不了**「前侧用触发那一刻落库的全屏取值」这件事：剧本的全屏信号是
+#: 剧本级常量（理由见 `scenario.py`），触发时与结算时探针返回的是同一个值，
+#: 剧本结构上无法让两侧不一致。那件事由 `tests/test_scheduler.py` 的
+#: 「触发侧用落库的全屏状态」与 `tests/test_outcome.py` 的
+#: 「两侧各用自己的证据」在单元层面覆盖 —— 不是漏测，是这个层面测不到。
+_GAME_EXIT = Scenario(
+    "game-exit",
+    120,
+    (
+        Segment(0, 45, "brotato.exe", "Brotato"),
+        # 文档页命中 work 清单：工作分钟不参与全屏提权，所以它不会被算成娱乐。
+        Segment(45, 75, "chrome.exe", "docs.python.org", "https://docs.python.org/3/"),
+    ),
+    fullscreen_state=QUNS_BUSY,
+)
 
 
 def _advance(run: ReplayRun, ticks: int, step: float = 5.0) -> None:
@@ -144,6 +168,42 @@ def _drive_outcome(config: Config, workdir: Path) -> list[str]:
 
     _one(_OUTCOME_STOPPED, "stopped", "disengaged")
     _one(SCENARIOS["outcome"], "kept", "continued")
+
+    # 「游戏退出」：阶段 2.2 验证要求的第二个场景。
+    run = run_scenario(_GAME_EXIT, config, start=START,
+                       db_path=workdir / "replay-outcome-game-exit.db")
+    try:
+        # 第 40 分钟触发（窗口内 40 分钟游戏，恰好够 passive 线），第 50 分钟结算。
+        _advance(run, 11)
+        rows = run.store.list_outcomes()
+        if not rows:
+            failures.append("[game-exit] 干预后没有落任何 outcomes 行")
+        else:
+            row = rows[0]
+            if row["outcome"] == "no_data":
+                failures.append(
+                    "[game-exit] 前侧娱乐被算成 0，回执落成 no_data —— "
+                    "触发之前那 10 分钟的游戏没被算进去"
+                )
+            actual = (row["ent_before"], row["ent_after"])
+            if actual != (10.0, 5.0):
+                failures.append(
+                    f"[game-exit] 两侧窗口各读各的活动：期望 前 10.0 / 后 5.0，"
+                    f"实际 前 {row['ent_before']} / 后 {row['ent_after']}"
+                )
+            interventions = run.store.list_interventions()
+            trigger = (
+                run.store.fetch_evaluation(interventions[0]["evaluation_id"])
+                if interventions else None
+            )
+            if trigger is None or trigger["fullscreen_state"] != QUNS_BUSY:
+                failures.append(
+                    "[game-exit] 触发那一轮没有留下全屏取值 2（全屏应用运行中）—— "
+                    "这条回执就不会落进视图 7 的 gaming_at_trigger 档，"
+                    "未知全屏取值的那一类也不该被当成它"
+                )
+    finally:
+        run.close()
     return failures
 
 
