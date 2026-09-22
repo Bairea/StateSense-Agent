@@ -158,7 +158,14 @@ git push -u origin feat/activity-reader
 | uv | 0.11.16 |
 | Node | v24.14.1 |
 | bun | 已安装（`D:\DevTools\bun`，`BUN_INSTALL` 已写入用户环境变量） |
-| Screenpipe | 已安装（v0.4.50），数据目录 `D:\Screenpipe`，recorder 监听 `localhost:3131` |
+| Screenpipe | 桌面版装过：数据目录是**默认的** `C:\Users\<用户>\.screenpipe`（2026-09-22 实测 211 MB，最后活动 2026-09-15）。`D:\Screenpipe` **不存在**，`screenpipe` CLI 不在 PATH 上 |
+
+> **⚠️ 2026-09-22 实测修正。** 上面这一行原写作「已安装 v0.4.50，数据目录 `D:\Screenpipe`，
+> recorder 监听 `localhost:3131`」——那是另一台机器/另一套部署的状态，在本机不成立。
+> 照旧文执行下面的启动命令会**新建一个空的 `D:\Screenpipe`**、把历史记录留在原地，
+> 而且现象很像「一直在跑、只是没数据」。
+> **先确认数据目录**（看已存在的 `.screenpipe` 在哪，或 `screenpipe --help` 的默认值），
+> 再决定 `--data-dir`；不确定就**不要**加这个参数，用默认值。
 
 > **端口不要默认写 3030。** 3030 是 Screenpipe 的默认端口，但它**可能被别的软件占着** ——
 > 本机实测被 Docker Desktop 的 `com.docker.backend` 占过。被占时的现象极具误导性：
@@ -166,10 +173,16 @@ git push -u origin feat/activity-reader
 > 于是每轮评估都记成 `data_status=unreachable`，而一切看起来都"在跑"。
 > 排查手段：`Get-NetTCPConnection -LocalPort 3030 -State Listen` 看 `OwningProcess` 是谁。
 
-Screenpipe 的启动命令（V0 实测可用）：
+Screenpipe 的启动命令（V0 实测可用，**`--data-dir` 必须换成实际在用的那个目录**）：
 
 ```bash
-screenpipe record --data-dir "D:\Screenpipe" --disable-audio --retention-days 14 --port 3131
+screenpipe record --data-dir "<实际数据目录>" --disable-audio --retention-days 14 --port 3131
+```
+
+recorder 起来后先用一条命令确认「端口在听、且归属是 Screenpipe」：
+
+```bash
+Get-NetTCPConnection -LocalPort 3131 -State Listen | Select-Object OwningProcess
 ```
 
 > 访问它**即使从本机发起也需要** `Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY`，否则返回 403。见第 8 节。
