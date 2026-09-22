@@ -275,7 +275,8 @@ class ActionTimingBreakdown:
     total_events: int
     total_days: int
     layers: tuple[ActionTimingLayer, ...]
-    #: 事件被合并前的轮次数与事件数 —— 「按事件看」与「按轮次看」的差别写在这里。
+    #: 合并前的可干预轮次数（`count_intervenable_rounds`）。它 ÷ `total_events`
+    #: 就是窗口重叠把样本量放大的倍数 —— 「按轮次看」与「按事件看」的差别写在这里。
     raw_ticks: int
 
 

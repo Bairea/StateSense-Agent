@@ -417,6 +417,29 @@ def test_timing_section_lists_layers_and_flags_single_event_layers():
     assert "动作 × 时机" in out
     assert "walk5" in out and "reading" in out
     assert "不是独立观察" in out
+    assert "合并前轮次  4 轮" in out
+    assert "放大 2.0 倍" in out, "4 轮合成 2 个事件：这个倍数必须写在报表里"
+
+
+def test_timing_section_stays_quiet_when_no_rounds_were_merged():
+    """每个事件只占一轮时不给倍数 —— 硬凑一个「1.0 倍」会让人以为算过什么。"""
+    data = _data(
+        timing=ActionTimingBreakdown(
+            total_deliveries=2,
+            total_events=2,
+            total_days=1,
+            raw_ticks=2,
+            layers=(
+                ActionTimingLayer(
+                    "walk5", "PASSIVE_CONSUMPTION", False, "40-50", "12-17",
+                    1, 1, 0, 0, 1, 1, (("continued", 1),), 45.0, 12.0,
+                ),
+            ),
+        )
+    )
+    out = render.render_text(data, views=("8",))
+    assert "合并前轮次  2 轮" in out
+    assert "放大" not in out
 
 
 # ── 视图 2 · 闸门面 ─────────────────────────────────────────

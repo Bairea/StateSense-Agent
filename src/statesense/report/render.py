@@ -309,6 +309,20 @@ def _audit_lines(data: ReportData) -> list[str]:
     return lines
 
 
+def _overlap_note(raw_ticks: int, events: int) -> str | None:
+    """窗口重叠把样本量放大了几倍。没有可比的倍数时不给话。
+
+    事件数为 0、或轮次数并不多于事件数（每个事件只占一轮）时，这个比值没有
+    解释力 —— 硬凑一个「1.0 倍」只会让人以为算过什么。
+    """
+    if events <= 0 or raw_ticks <= events:
+        return None
+    return (
+        f"← 按轮次当样本会把样本量放大 {raw_ticks / events:.1f} 倍，"
+        "所以下面的层只能在事件层面解释"
+    )
+
+
 def _timing_lines(data: ReportData) -> list[str]:
     """视图 8：动作 × 时机。
 
@@ -320,8 +334,12 @@ def _timing_lines(data: ReportData) -> list[str]:
         "动作 × 时机（分母为真实投递；低样本层只列数据，不作排名）",
         f"  真实投递    {t.total_deliveries} 次",
         f"  消费事件    {t.total_events} 个（同一事件内可能触发多次）",
+        f"  合并前轮次  {t.raw_ticks} 轮",
         f"  跨越自然日  {t.total_days} 天",
     ]
+    note = _overlap_note(t.raw_ticks, t.total_events)
+    if note:
+        lines.append(f"              {note}")
     if not t.layers:
         lines.append("  （无）")
         return lines

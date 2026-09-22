@@ -346,6 +346,12 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
             timing=queries.build_action_timing_breakdown(
                 cohort_rows,
                 events,
+                # 合并前的轮次数与事件数必须出自同一次切分：两者之比是
+                # 「样本量被窗口重叠放大了几倍」，分别算就可能互相矛盾。
+                raw_ticks=queries.count_intervenable_rounds(
+                    evaluations,
+                    gap_threshold_minutes=config.report.gap_threshold_minutes,
+                ),
                 gap_threshold_minutes=config.report.gap_threshold_minutes,
             ),
             leaks=queries.find_leak_anchors(
