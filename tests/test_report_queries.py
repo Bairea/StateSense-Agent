@@ -526,7 +526,7 @@ def test_leak_anchor_reports_missing_detail_separately(store):
 
 
 def _insert_intervention(store, evaluation_id, *, at, action_id, response,
-                         channel="foreground_popup"):
+                         channel="foreground_popup", delivery_status="delivered"):
     return store.insert_intervention(
         evaluation_id=evaluation_id,
         at=at,
@@ -534,11 +534,132 @@ def _insert_intervention(store, evaluation_id, *, at, action_id, response,
         late_night=False,
         action_id=action_id,
         action_text="t",
-        delivery_status="delivered",
+        delivery_status=delivery_status,
         channel=channel,
         outcome_due_at=at + timedelta(minutes=10),
         user_response=response,
     )
+
+
+def _null_channel(store, intervention_id: int) -> None:
+    """把通道改回 NULL —— 迁移前写入的行在库里就长这样（写入接口要求显式通道）。"""
+    with store._conn:
+        store._conn.execute(
+            "UPDATE interventions SET channel = NULL WHERE id = ?", (intervention_id,)
+        )
+
+
+def _cohort_rows(store, since=None):
+    return store.list_intervention_cohort(since=since)
+
+
+def test_cohort_layers_are_mutually_exclusive_and_sum_to_total(store):
+    """各层互斥、相加等于干预总数 —— 主分析的分母不能凭空变小。
+
+    少算一层的表现是「分母看起来更干净」，而报告上完全看不出来。
+    """
+    eid = _eval_row(store, T0)
+    minute = lambda n: T0 + timedelta(minutes=n)  # noqa: E731 - 测试内的小工具
+
+    main = _insert_intervention(store, eid, at=minute(0), action_id="walk5", response="accepted")
+    store.insert_outcome(main, minute(10), OutcomeVerdict("disengaged", 45.0, 5.0, 10.0))
+
+    _insert_intervention(store, eid, at=minute(1), action_id="walk5", response=None,
+                         channel="recording")
+    _insert_intervention(store, eid, at=minute(2), action_id="walk5", response=None,
+                         delivery_status="failed")
+    _insert_intervention(store, eid, at=minute(3), action_id="walk5", response=None)
+    no_data = _insert_intervention(store, eid, at=minute(4), action_id="walk5", response=None)
+    store.insert_outcome(no_data, minute(14), OutcomeVerdict("no_data", 0.0, 0.0, 0.0))
+    legacy = _insert_intervention(store, eid, at=minute(5), action_id="walk5", response=None)
+    _null_channel(store, legacy)
+
+    cb = queries.build_cohort_breakdown(_cohort_rows(store))
+    assert {layer.name: layer.interventions for layer in cb.layers} == {
+        "main": 1,
+        "recording": 1,
+        "channel_unknown": 1,
+        "undelivered": 1,
+        "missing_outcome": 1,
+        "no_data": 1,
+    }
+    assert cb.total == 6
+    assert sum(layer.interventions for layer in cb.layers) == cb.total
+    assert cb.main_interventions == 1
+
+
+def test_cohort_main_layer_excludes_rehearsal_and_no_data_from_the_means(store):
+    """排练与 no_data 不得进效果均值 —— 这就是本版要修的口径问题。
+
+    排练同样返回 delivered，只按用户回应分层时它与真实弹窗完全同形；
+    把两者一起平均，「有效」会随排练次数变化而变化。
+    """
+    eid = _eval_row(store, T0)
+    real = _insert_intervention(store, eid, at=T0, action_id="walk5", response=None)
+    store.insert_outcome(real, T0 + timedelta(minutes=10), OutcomeVerdict("disengaged", 40.0, 10.0, 10.0))
+    rehearsal = _insert_intervention(store, eid, at=T0 + timedelta(minutes=1),
+                                     action_id="walk5", response=None, channel="recording")
+    store.insert_outcome(rehearsal, T0 + timedelta(minutes=11), OutcomeVerdict("continued", 0.0, 99.0, 10.0))
+    empty = _insert_intervention(store, eid, at=T0 + timedelta(minutes=2), action_id="walk5", response=None)
+    store.insert_outcome(empty, T0 + timedelta(minutes=12), OutcomeVerdict("no_data", 0.0, 0.0, 0.0))
+
+    cb = queries.build_cohort_breakdown(_cohort_rows(store))
+    assert cb.main_interventions == 1
+    assert cb.main_ent_before_mean == pytest.approx(40.0)
+    assert cb.main_ent_after_mean == pytest.approx(10.0)
+
+    # 对照：旧口径把三者算在一起，均值被排练与 no_data 拉动。
+    ob = queries.build_outcome_breakdown(store.list_outcomes(), store.list_interventions())
+    assert ob.ent_after_mean != cb.main_ent_after_mean
+
+
+def test_cohort_filters_by_intervention_time_only(store):
+    """区间起点前投递、区间内检查的回执不再被误记为孤儿（阶段 2.1 的验收线）。
+
+    旧写法用两个时间轴拼分母：干预按 `interventions.at`、回执按 `outcomes.checked_at`。
+    于是这条回执进得来、对应的干预进不来，报告凭空多出一层 orphan ——
+    那不是数据脏，是取数口径错。这里把两种取法的差别钉住。
+    """
+    eid = _eval_row(store, T0 - timedelta(hours=2))
+    early = _insert_intervention(store, eid, at=T0 - timedelta(hours=1),
+                                 action_id="walk5", response=None)
+    store.insert_outcome(early, T0 + timedelta(minutes=5),
+                         OutcomeVerdict("continued", 40.0, 40.0, 10.0))
+
+    # 旧口径：两轴各取一次，回执在区间内、干预在区间外。
+    window_outcomes = store.list_outcomes(since=T0)
+    window_interventions = store.list_interventions(since=T0)
+    assert len(window_outcomes) == 1
+    assert window_interventions == []
+    orphaned = queries.build_outcome_breakdown(window_outcomes, window_interventions)
+    # by_response 是 (层名, 该层回执分布) 的序列，所以先按层名取出来再读分布。
+    by_response = dict(orphaned.by_response)
+    assert dict(by_response[queries.ORPHAN_INTERVENTION])["continued"] == 1
+
+    # 新口径：一条干预一行，过滤轴只有干预发生时刻 → 同进同出。
+    assert _cohort_rows(store, since=T0) == []
+    assert len(_cohort_rows(store, since=T0 - timedelta(hours=2))) == 1
+
+
+def test_cohort_counts_days_and_rule_versions_separately(store):
+    """主分析层要给出跨天数和触发时的规则版本 —— 次数不等于证据量。
+
+    五分钟重叠窗口里同一次消费可以弹出多次，只看次数会把「一天里被提醒了
+    很多次」读成「很多天的证据」；版本混在一起则无法归因。
+    """
+    day1 = T0
+    day2 = T0 + timedelta(days=1)
+    eid1 = _eval_row(store, day1, version="v-a")
+    eid2 = _eval_row(store, day2, version="v-b")
+    for at, eid in ((day1, eid1), (day1 + timedelta(minutes=5), eid1), (day2, eid2)):
+        iid = _insert_intervention(store, eid, at=at, action_id="walk5", response=None)
+        store.insert_outcome(iid, at + timedelta(minutes=10),
+                             OutcomeVerdict("continued", 40.0, 40.0, 10.0))
+
+    cb = queries.build_cohort_breakdown(_cohort_rows(store))
+    assert cb.main_interventions == 3
+    assert len(cb.main_days) == 2
+    assert dict(cb.main_rule_versions) == {"v-a": 2, "v-b": 1}
 
 
 def test_outcome_breakdown_stratifies_by_user_response(store):

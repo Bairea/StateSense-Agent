@@ -26,8 +26,10 @@ from statesense.report.models import (
 
 #: 视图编号的封闭枚举。`--views` 只接受这些值，未知编号在解析层就报错，
 #: 而不是被静默丢掉 —— 静默丢掉会让 `--views 5` 看起来「没输出」而不是「参数错了」。
-VIEW_IDS: tuple[str, ...] = ("0", "1", "2", "3", "4", "5")
+#: 6 起是阶段 2 新增：6=效果分母（分层与排除原因），7=动作×时机，8=回执口径审计。
+VIEW_IDS: tuple[str, ...] = ("0", "1", "2", "3", "4", "5", "6")
 LEAK_VIEW = "5"
+COHORT_VIEW = "6"
 #: `skipped` 占比到这个数就高亮：它高说明「看起来正常」是假的。
 SKIPPED_ALERT_RATIO = 0.2
 
@@ -229,6 +231,48 @@ def _outcome_lines(data: ReportData) -> list[str]:
     return lines
 
 
+def _cohort_lines(data: ReportData) -> list[str]:
+    """视图 6：效果分析的分母。
+
+    这一节的用处是让人**明确知道哪些记录没被算进效果**及为什么。缺了它，
+    读者会默认视图 4 的均值来自全部干预 —— 而其中可能混着排练。
+    """
+    c = data.cohort
+    lines = [
+        "效果分母（同一批干预，只按干预发生时刻取数）",
+        f"  干预总数    {c.total}",
+        f"  主分析口径  {c.main_interventions} 次"
+        "（foreground_popup + delivered + 有可用回执）",
+        f"  覆盖自然日  {len(c.main_days)} 天  {'、'.join(c.main_days) or '（无）'}",
+        f"  触发规则版本 {_pairs(c.main_rule_versions)}",
+        "  各层计数（互斥，相加等于干预总数）：",
+    ]
+    for layer in c.layers:
+        lines.append(f"    {layer.name:<16} {layer.interventions:>3}  {layer.reason}")
+        if layer.interventions:
+            lines.append(
+                f"      {'':<14} 按钮 {_pairs(layer.user_responses)}"
+                f"    回执 {_pairs(layer.outcomes)}"
+            )
+    lines.append(
+        f"  主分析层前后娱乐  均值 {c.main_ent_before_mean} → {c.main_ent_after_mean}"
+        f"    中位数 {c.main_ent_before_median} → {c.main_ent_after_median}"
+    )
+    if "unknown" in dict(c.main_rule_versions):
+        lines.append(
+            "              ⚠ 主分析层含版本未知的行（迁移前写入），"
+            "它的判定用的是当时的规则，不能当作当前版本"
+        )
+    if len(c.main_rule_versions) > 1:
+        lines.append("              ⚠ 主分析层跨规则版本，前后对比须再按版本分组")
+    if c.orphan_outcomes:
+        lines.append(
+            f"              ⚠ {c.orphan_outcomes} 条主分析行缺少回执检查时刻 —— "
+            "取数又用上了第二个时间轴"
+        )
+    return lines
+
+
 def _leak_lines(data: ReportData) -> list[str]:
     lines = ["疑似漏判（这一轮有活动，但规则一条都没命中）"]
     for anchor in data.leaks:
@@ -295,6 +339,7 @@ def render_text(data: ReportData, *, views: Collection[str] = ()) -> str:
         "3": _intervention_lines,
         "4": _outcome_lines,
         "5": _leak_lines,
+        "6": _cohort_lines,
     }
     for key in VIEW_IDS:
         if key != "0" and key in views:

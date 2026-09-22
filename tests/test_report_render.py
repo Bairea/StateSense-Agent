@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 from statesense.report import render
 from statesense.report.models import (
+    CohortBreakdown,
+    CohortLayer,
     ContinuityGap,
     GateBreakdown,
     InterventionBreakdown,
@@ -32,6 +34,32 @@ def _live(**over) -> Liveness:
     return Liveness(**base)
 
 
+def _cohort(**over) -> CohortBreakdown:
+    """一份「没有干预」的默认分母 —— 各层都在，计数为 0。"""
+    names = (
+        ("main", "计入效果分析"),
+        ("recording", "--dry-run 的排练"),
+        ("channel_unknown", "通道未知"),
+        ("undelivered", "投递未成功"),
+        ("missing_outcome", "回执未结算"),
+        ("no_data", "回执取不到数"),
+    )
+    base = dict(
+        total=0,
+        layers=tuple(CohortLayer(n, r, 0, (), ()) for n, r in names),
+        main_interventions=0,
+        main_days=(),
+        main_rule_versions=(),
+        main_ent_before_mean=None,
+        main_ent_after_mean=None,
+        main_ent_before_median=None,
+        main_ent_after_median=None,
+        orphan_outcomes=0,
+    )
+    base.update(over)
+    return CohortBreakdown(**base)
+
+
 def _data(**over) -> ReportData:
     base = ReportData(
         overview=Overview(T0, T0, 2, 2, 1.0, ()),
@@ -40,6 +68,7 @@ def _data(**over) -> ReportData:
         gates=GateBreakdown((), (), (), 0, 0, (), 0),
         interventions=InterventionBreakdown(0, (), (), (), (), (), (), 0, 0),
         outcomes=OutcomeBreakdown((), (), 0, None, None, None, None),
+        cohort=_cohort(),
         leaks=(),
         trace=(),
         leak_details=(),
@@ -264,14 +293,68 @@ def test_views_flag_is_selective():
 
 
 def test_view_ids_cover_the_specs_documented_set():
-    """spec §11 写的是 `all|0,1,2,3,4,5`。0 号是默认输出，不必再打印一遍。"""
-    assert render.VIEW_IDS == ("0", "1", "2", "3", "4", "5")
+    """spec §11 写的是 `all|0,1,2,3,4,5`，阶段 2 起追加 6（效果分母）。
+
+    0 号是默认输出，不必再打印一遍。编号是封闭集合：解析层对未知编号报错，
+    所以这里列的每一个都必须在 `_cohort_lines` 一类渲染函数里真的有着落。
+    """
+    assert render.VIEW_IDS == ("0", "1", "2", "3", "4", "5", "6")
     out = render.render_text(_data(), views=("0",))
     assert out.count("概览") == 1
 
 
-# ── 视图 2 · 闸门面 ─────────────────────────────────────────
+# ── 视图 6 · 效果分母（阶段 2.1）─────────────────────────────
 
+def test_cohort_section_shows_the_denominator_and_every_exclusion():
+    """分母这一节的作用是让人**看出哪些记录没被算进效果**及为什么。"""
+    data = _data(
+        cohort=_cohort(
+            total=5,
+            layers=(
+                CohortLayer(
+                    "main", "真实弹出 + 已投递 + 有可用回执，计入效果分析", 2,
+                    (("accepted", 1), ("null", 1)), (("disengaged", 1), ("continued", 1)),
+                ),
+                CohortLayer("recording", "--dry-run 的排练，不是真实投递", 3,
+                            (("null", 3),), (("continued", 3),)),
+            ),
+            main_interventions=2,
+            main_days=("2026-09-16",),
+            main_rule_versions=(("v1", 2),),
+            main_ent_before_mean=45.0,
+            main_ent_after_mean=12.0,
+            main_ent_before_median=45.0,
+            main_ent_after_median=12.0,
+        )
+    )
+    out = render.render_text(data, views=("6",))
+    assert "效果分母" in out
+    assert "排练" in out
+    assert "45.0 → 12.0" in out
+    assert "2026-09-16" in out
+    assert "v1=2" in out
+
+
+def test_cohort_section_warns_when_the_main_layer_mixes_versions():
+    """主分析层跨规则版本时前后对比要再分组 —— 否则差异无法归因。"""
+    data = _data(
+        cohort=_cohort(
+            total=2,
+            main_interventions=2,
+            main_days=("2026-09-16", "2026-09-17"),
+            main_rule_versions=(("v1", 1), ("v2", 1)),
+        )
+    )
+    out = render.render_text(data, views=("6",))
+    assert "主分析层跨规则版本" in out
+
+
+def test_cohort_default_output_does_not_dump_the_layer_table():
+    out = render.render_text(_data())
+    assert "效果分母" not in out
+
+
+# ── 视图 2 · 闸门面 ─────────────────────────────────────────
 def test_gate_section_names_the_blocking_gate_and_shows_ratio():
     data = _data(
         gates=GateBreakdown(
