@@ -684,6 +684,43 @@ def test_cohort_counts_days_and_rule_versions_separately(store):
     assert cb.main_interventions == 3
     assert len(cb.main_days) == 2
     assert dict(cb.main_rule_versions) == {"v-a": 2, "v-b": 1}
+    # 跨版本 → 合并均值必须空着，改由分片给出（阶段 1.1 验收：不混算）。
+    assert cb.main_ent_before_mean is None
+    assert cb.main_ent_after_mean is None
+    assert cb.main_ent_before_median is None
+    assert [(s.version, s.interventions) for s in cb.versions] == [("v-a", 2), ("v-b", 1)]
+    assert sum(s.interventions for s in cb.versions) == cb.main_interventions
+    assert [s.ent_before_mean for s in cb.versions] == [40.0, 40.0], "分片各算各的均值"
+
+
+def test_cohort_single_version_keeps_the_merged_mean(store):
+    """只有一个版本时不拆：分片与合并值必然相同，重复一遍像是有两套口径。"""
+    eid = _eval_row(store, T0, version="v-only")
+    iid = _insert_intervention(store, eid, at=T0, action_id="walk5", response=None)
+    store.insert_outcome(
+        iid, T0 + timedelta(minutes=10), OutcomeVerdict("continued", 40.0, 10.0, 10.0)
+    )
+
+    cb = queries.build_cohort_breakdown(_cohort_rows(store))
+    assert cb.versions == ()
+    assert cb.main_ent_before_mean == 40.0
+    assert cb.main_ent_after_mean == 10.0
+
+
+def test_cohort_unknown_version_is_its_own_slice_and_goes_last(store):
+    """「版本未知」必须单独一档，且不并进已知版本 —— 迁移前的行用的是当时的规则。"""
+    known = _eval_row(store, T0, version="v-known")
+    legacy = _eval_row(store, T0 + timedelta(minutes=30), version="v-legacy")
+    _strip_version(store, legacy)
+    for eid, at in ((known, T0), (legacy, T0 + timedelta(minutes=30))):
+        iid = _insert_intervention(store, eid, at=at, action_id="walk5", response=None)
+        store.insert_outcome(
+            iid, at + timedelta(minutes=10), OutcomeVerdict("continued", 40.0, 40.0, 10.0)
+        )
+
+    cb = queries.build_cohort_breakdown(_cohort_rows(store))
+    assert [s.version for s in cb.versions] == ["v-known", "unknown"], "unknown 殿后"
+    assert cb.main_ent_before_mean is None, "含未知版本时同样不许合并"
 
 
 # ── 阶段 2.2：回执口径审计与阶段 2.3：动作 × 时机 ────────────

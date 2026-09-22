@@ -42,6 +42,7 @@ from statesense.report.models import (
     Overview,
     ReceiptAudit,
     ReceiptAuditStratum,
+    RuleVersionSlice,
     RunEvent,
     TraceRow,
     VerdictBreakdown,
@@ -175,6 +176,17 @@ def build_liveness(
 UNKNOWN_VERSION = "unknown"
 
 
+def _version_order(names: Sequence[str]) -> list[str]:
+    """规则版本名的输出顺序：已知版本按键升序，`unknown` 始终殿后。
+
+    **顺序规则只有这一处。** 分组顺序会随字典遍历顺序漂移的话，同一份数据
+    两次运行会给出不同的报表，测试也无从断言 —— 这与「按次数降序、同次数按键
+    升序」的 `_ranked` 是同一类要求。
+    """
+    known = sorted(name for name in names if name != UNKNOWN_VERSION)
+    return [*known, *([UNKNOWN_VERSION] if UNKNOWN_VERSION in names else [])]
+
+
 def group_by_rule_version(
     evaluations: Sequence[Any],
 ) -> tuple[tuple[str, tuple[Any, ...]], ...]:
@@ -185,17 +197,12 @@ def group_by_rule_version(
     两个版本的行混在一起算「同一批样本」，得出的差异既可能是阈值造成的，
     也可能是规则本身换了，而数据里分辨不出来。
 
-    排序刻意稳定（已知版本按键升序、unknown 殿后），否则分组结果的顺序会随
-    字典遍历顺序漂移，测试与报告的对比都无从谈起。
+    排序见 `_version_order`。
     """
     groups: dict[str, list[Any]] = defaultdict(list)
     for row in evaluations:
         groups[row["rule_version"] or UNKNOWN_VERSION].append(row)
-    known = sorted((name, rows) for name, rows in groups.items() if name != UNKNOWN_VERSION)
-    tail = (
-        [(UNKNOWN_VERSION, groups[UNKNOWN_VERSION])] if UNKNOWN_VERSION in groups else []
-    )
-    return tuple((name, tuple(rows)) for name, rows in [*known, *tail])
+    return tuple((name, tuple(groups[name])) for name in _version_order(list(groups)))
 
 
 def build_verdict_breakdown(evaluations: Sequence[Any]) -> VerdictBreakdown:
@@ -423,6 +430,15 @@ def cohort_layer(row: Any) -> str:
     return COHORT_MAIN
 
 
+def _mean(values: Sequence[float]) -> float | None:
+    """空集合不给 0 —— 「没有样本」与「均值恰好是 0」是两件事。"""
+    return round(statistics.fmean(values), 2) if values else None
+
+
+def _median(values: Sequence[float]) -> float | None:
+    return round(statistics.median(values), 2) if values else None
+
+
 def build_cohort_breakdown(rows: Sequence[Any]) -> CohortBreakdown:
     """把同一批干预切成互斥的层，并给出主分析层的分母与前后娱乐。
 
@@ -435,6 +451,12 @@ def build_cohort_breakdown(rows: Sequence[Any]) -> CohortBreakdown:
     各层计数相加必须等于干预总数。这不是巧合而是不变式：`cohort_layer` 是
     一个全定义函数，每条干预恰好落一层；哪里少算了，下面这行断言会当场炸，
     而不是让分母悄悄变小。
+
+    **主分析层的均值不跨规则版本合并**（阶段 1.1 验收：「旧行『版本未知』与
+    新版本不混算」）。区间里出现多个版本时，`main_ent_*` 一律给 `None`，
+    改由 `versions` 逐版本给出各自的次数与均值 —— 分类清单或阈值换过之后，
+    两个版本的行混在一起算「同一批样本」，得出的差异既可能来自阈值也可能来自
+    规则本身，而数据里分不出来。只给警告不够：警告拦不住有人把那个数抄走。
     """
     counts: dict[str, int] = {name: 0 for name in COHORT_LAYER_NAMES}
     outcomes: dict[str, Counter[str]] = {name: Counter() for name in COHORT_LAYER_NAMES}
@@ -444,6 +466,9 @@ def build_cohort_breakdown(rows: Sequence[Any]) -> CohortBreakdown:
     before: list[float] = []
     after: list[float] = []
     orphan = 0
+    #: 主分析层按规则版本各留一份原始行。跨版本时均值只能在各版本内部算 ——
+    #: 见下面 `mixed` 那一段。
+    by_version: dict[str, list[Any]] = defaultdict(list)
 
     for row in rows:
         layer = cohort_layer(row)
@@ -454,7 +479,9 @@ def build_cohort_breakdown(rows: Sequence[Any]) -> CohortBreakdown:
         if layer != COHORT_MAIN:
             continue
         days.add(_local_day(row["at"]))
-        versions[row["eval_rule_version"] or UNKNOWN_VERSION] += 1
+        version = row["eval_rule_version"] or UNKNOWN_VERSION
+        versions[version] += 1
+        by_version[version].append(row)
         before.append(row["ent_before"])
         after.append(row["ent_after"])
         # 主分析层的行必然有回执；拿到行却没有检查时刻，说明取数又漏了关联。
@@ -474,16 +501,31 @@ def build_cohort_breakdown(rows: Sequence[Any]) -> CohortBreakdown:
     total = sum(layer.interventions for layer in layers)
     assert total == len(rows), f"分层计数 {total} 与干预总数 {len(rows)} 不一致"
 
+    slices = tuple(
+        RuleVersionSlice(
+            version=name,
+            interventions=len(group),
+            days=len({_local_day(row["at"]) for row in group}),
+            ent_before_mean=_mean([row["ent_before"] for row in group]),
+            ent_after_mean=_mean([row["ent_after"] for row in group]),
+        )
+        for name in _version_order(list(by_version))
+        for group in (by_version[name],)
+    )
+    # 只有一个版本时不必重复给一遍：被拆出来的那份与合并值必然相同。
+    mixed = len(slices) > 1
+
     return CohortBreakdown(
         total=len(rows),
         layers=layers,
         main_interventions=len(before),
         main_days=tuple(sorted(days)),
         main_rule_versions=_ranked(versions),
-        main_ent_before_mean=round(statistics.fmean(before), 2) if before else None,
-        main_ent_after_mean=round(statistics.fmean(after), 2) if after else None,
-        main_ent_before_median=round(statistics.median(before), 2) if before else None,
-        main_ent_after_median=round(statistics.median(after), 2) if after else None,
+        main_ent_before_mean=None if mixed else _mean(before),
+        main_ent_after_mean=None if mixed else _mean(after),
+        main_ent_before_median=None if mixed else _median(before),
+        main_ent_after_median=None if mixed else _median(after),
+        versions=slices if mixed else (),
         orphan_outcomes=orphan,
     )
 

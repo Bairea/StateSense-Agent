@@ -18,6 +18,7 @@ from statesense.report.models import (
     ReceiptAudit,
     ReceiptAuditStratum,
     ReportData,
+    RuleVersionSlice,
     RunEvent,
     VerdictBreakdown,
 )
@@ -58,6 +59,7 @@ def _cohort(**over) -> CohortBreakdown:
         main_ent_after_mean=None,
         main_ent_before_median=None,
         main_ent_after_median=None,
+        versions=(),
         orphan_outcomes=0,
     )
     base.update(over)
@@ -342,18 +344,49 @@ def test_cohort_section_shows_the_denominator_and_every_exclusion():
     assert "v1=2" in out
 
 
-def test_cohort_section_warns_when_the_main_layer_mixes_versions():
-    """主分析层跨规则版本时前后对比要再分组 —— 否则差异无法归因。"""
+def test_cohort_section_splits_the_mean_when_the_main_layer_mixes_versions():
+    """跨规则版本时不许合并均值 —— 差异无法归因到阈值还是规则本身。
+
+    只给一句警告是不够的：警告拦不住有人把那一个数抄走，所以合并值干脆不出，
+    改成逐版本给。阶段 1.1 验收原句是「旧行『版本未知』与新版本不混算」。
+    """
     data = _data(
         cohort=_cohort(
             total=2,
             main_interventions=2,
             main_days=("2026-09-16", "2026-09-17"),
             main_rule_versions=(("v1", 1), ("v2", 1)),
+            versions=(
+                RuleVersionSlice("v1", 1, 1, 40.0, 10.0),
+                RuleVersionSlice("v2", 1, 1, 50.0, 5.0),
+            ),
         )
     )
     out = render.render_text(data, views=("6",))
-    assert "主分析层跨规则版本" in out
+    assert "不合并 —— 区间内有 2 个规则版本" in out
+    assert "按规则版本分组" in out
+    assert "v1" in out and "40.0 → 10.0" in out
+    assert "v2" in out and "50.0 → 5.0" in out
+    assert "均值 None" not in out, "空值要写清原因，不能打一行 None → None"
+
+
+def test_cohort_section_prints_one_merged_mean_when_a_single_version(monkeypatch):
+    """单版本时不必逐版本重复一遍：分片与合并值必然相同，重复会像有两套口径。"""
+    data = _data(
+        cohort=_cohort(
+            total=1,
+            main_interventions=1,
+            main_days=("2026-09-16",),
+            main_rule_versions=(("v1", 1),),
+            main_ent_before_mean=40.0,
+            main_ent_after_mean=10.0,
+            main_ent_before_median=40.0,
+            main_ent_after_median=10.0,
+        )
+    )
+    out = render.render_text(data, views=("6",))
+    assert "均值 40.0 → 10.0" in out
+    assert "按规则版本分组" not in out
 
 
 def test_cohort_default_output_does_not_dump_the_layer_table():
