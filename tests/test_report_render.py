@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 from statesense.report import render
 from statesense.report.models import (
+    ActionTimingBreakdown,
+    ActionTimingLayer,
     CohortBreakdown,
     CohortLayer,
     ContinuityGap,
@@ -13,6 +15,8 @@ from statesense.report.models import (
     Liveness,
     OutcomeBreakdown,
     Overview,
+    ReceiptAudit,
+    ReceiptAuditStratum,
     ReportData,
     RunEvent,
     VerdictBreakdown,
@@ -69,6 +73,8 @@ def _data(**over) -> ReportData:
         interventions=InterventionBreakdown(0, (), (), (), (), (), (), 0, 0),
         outcomes=OutcomeBreakdown((), (), 0, None, None, None, None),
         cohort=_cohort(),
+        receipt_audit=ReceiptAudit(0, (), 0, 0),
+        timing=ActionTimingBreakdown(0, 0, 0, (), 0),
         leaks=(),
         trace=(),
         leak_details=(),
@@ -293,12 +299,13 @@ def test_views_flag_is_selective():
 
 
 def test_view_ids_cover_the_specs_documented_set():
-    """spec §11 写的是 `all|0,1,2,3,4,5`，阶段 2 起追加 6（效果分母）。
+    """spec §11 的 0–5 一个都不能少，阶段 2 追加 6/7/8（效果分母、口径审计、动作×时机）。
 
     0 号是默认输出，不必再打印一遍。编号是封闭集合：解析层对未知编号报错，
-    所以这里列的每一个都必须在 `_cohort_lines` 一类渲染函数里真的有着落。
+    所以这里列的每一个都必须在渲染层真的有着落 —— 逐个点名检查。
     """
-    assert render.VIEW_IDS == ("0", "1", "2", "3", "4", "5", "6")
+    assert render.VIEW_IDS[:6] == ("0", "1", "2", "3", "4", "5")
+    assert (render.COHORT_VIEW, render.AUDIT_VIEW, render.TIMING_VIEW) == ("6", "7", "8")
     out = render.render_text(_data(), views=("0",))
     assert out.count("概览") == 1
 
@@ -352,6 +359,64 @@ def test_cohort_section_warns_when_the_main_layer_mixes_versions():
 def test_cohort_default_output_does_not_dump_the_layer_table():
     out = render.render_text(_data())
     assert "效果分母" not in out
+
+
+# ── 视图 7 · 回执口径审计 / 视图 8 · 动作 × 时机（阶段 2.2/2.3）──
+
+def test_audit_section_shows_strata_and_names_the_affected_class():
+    """审计节要把「触发时正在全屏游戏」这一类单独说出口 —— 那正是失真的来源。"""
+    data = _data(
+        receipt_audit=ReceiptAudit(
+            total_receipts=4,
+            strata=(
+                ReceiptAuditStratum(
+                    "gaming_at_trigger", "触发时正在全屏游戏", 2, 1,
+                    (("continued", 1), ("no_data", 1)), 1, 45.0, 12.0,
+                ),
+                ReceiptAuditStratum(
+                    "not_gaming_at_trigger", "触发时没有全屏游戏", 1, 0,
+                    (("disengaged", 1),), 1, 40.0, 5.0,
+                ),
+                ReceiptAuditStratum(
+                    "fullscreen_unknown", "触发时无法判定全屏状态", 1, 0, (), 0, None, None,
+                ),
+            ),
+            affected_receipts=2,
+            affected_no_data=1,
+        )
+    )
+    out = render.render_text(data, views=("7",))
+    assert "回执口径审计" in out
+    assert "gaming_at_trigger" in out
+    assert "全屏游戏" in out
+    assert "no_data 1" in out
+
+
+def test_timing_section_lists_layers_and_flags_single_event_layers():
+    """低样本层要给数据、也要给「它不是独立观察」的提示。"""
+    data = _data(
+        timing=ActionTimingBreakdown(
+            total_deliveries=4,
+            total_events=2,
+            total_days=2,
+            raw_ticks=4,
+            layers=(
+                ActionTimingLayer(
+                    "reading", "HIGH_RISK_PASSIVE_CONSUMPTION", False, "50-60", "18-23",
+                    1, 1, 0, 0, 1, 1, (("continued", 1),), 55.0, 55.0,
+                ),
+                ActionTimingLayer(
+                    "walk5", "PASSIVE_CONSUMPTION", False, "40-50", "12-17",
+                    3, 2, 1, 0, 2, 2, (("disengaged", 1), ("continued", 1), ("no_data", 1)),
+                    45.0, 12.0,
+                ),
+            ),
+        )
+    )
+    out = render.render_text(data, views=("8",))
+    assert "动作 × 时机" in out
+    assert "walk5" in out and "reading" in out
+    assert "不是独立观察" in out
 
 
 # ── 视图 2 · 闸门面 ─────────────────────────────────────────

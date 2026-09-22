@@ -9,7 +9,7 @@ from __future__ import annotations
 import statistics
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from statesense._time import parse_iso as _parse
@@ -20,10 +20,15 @@ from statesense.config import (
     GATE_STATE_MIN,
     TaxonomyConfig,
 )
+from statesense.intervention.gates import INTERVENABLE
 from statesense.intervention.models import first_failed, parse_gate_trace
+from statesense.perception import GAMING_STATES
 from statesense.report.models import (
+    ActionTimingBreakdown,
+    ActionTimingLayer,
     CohortBreakdown,
     CohortLayer,
+    ConsumptionEvent,
     ContinuityGap,
     GateBlock,
     GateBreakdown,
@@ -35,11 +40,19 @@ from statesense.report.models import (
     Liveness,
     OutcomeBreakdown,
     Overview,
+    ReceiptAudit,
+    ReceiptAuditStratum,
     RunEvent,
     TraceRow,
     VerdictBreakdown,
 )
+from statesense.state.models import State
 from statesense.state.taxonomy import Category, classify
+
+#: 可干预状态的字面量集合与阶梯次序。从 `State` 派生而不是另写一遍字符串 ——
+#: 状态枚举改名时这里跟着走，不会留下一个永远不命中的字面量。
+_INTERVENABLE_STATES = frozenset(str(state) for state in INTERVENABLE)
+_STATE_RANK = {state.value: rank for rank, state in enumerate(State)}
 
 #: 干预行存在，但用户压根没理会弹窗（`user_response IS NULL`）。
 #: 名字直接写 "null"，与库里的 SQL NULL 对齐 —— 报告的使用者要能把这一行
@@ -461,6 +474,243 @@ def build_cohort_breakdown(rows: Sequence[Any]) -> CohortBreakdown:
         main_ent_before_median=round(statistics.median(before), 2) if before else None,
         main_ent_after_median=round(statistics.median(after), 2) if after else None,
         orphan_outcomes=orphan,
+    )
+
+
+#: 回执审计的分层名。按**触发那一刻**的全屏取值分类 —— 前侧证据受它影响。
+RECEIPT_GAMING = "gaming_at_trigger"
+RECEIPT_NOT_GAMING = "not_gaming_at_trigger"
+RECEIPT_UNKNOWN = "fullscreen_unknown"
+
+_RECEIPT_DESCRIPTIONS: dict[str, str] = {
+    RECEIPT_GAMING: "触发时正在全屏游戏 —— 前侧娱乐分钟最容易被历史取值误算的一类",
+    RECEIPT_NOT_GAMING: "触发时没有全屏游戏",
+    RECEIPT_UNKNOWN: "触发时无法判定全屏状态（保守不提权）",
+}
+
+
+def build_receipt_audit(rows: Sequence[Any]) -> ReceiptAudit:
+    """按触发那一刻的全屏取值审计回执（阶段 2.2 的「先审计」）。
+
+    想回答的问题是：**「游戏退出被读成干预有效」这类失真到底占多少**。
+    它的成因写在 `state.engine.effective_entertainment_minutes` 的注释里 ——
+    提权只作用于未归类条目，而历史全屏状态过去没有留存，回执前侧曾被按当下的
+    取值重算。修完之后前侧改用触发那一轮落库的取值，但**历史行不会因此改变**，
+    所以审计必须能按这一维度把旧行与「前侧本来就取不到全屏状态」的行分开。
+
+    只统计有回执的行：没有回执就无从谈前后两值。
+    """
+    counts: Counter[str] = Counter()
+    no_data: Counter[str] = Counter()
+    outcomes: dict[str, Counter[str]] = {name: Counter() for name in _RECEIPT_DESCRIPTIONS}
+    not_worse: Counter[str] = Counter()
+    before: dict[str, list[float]] = {name: [] for name in _RECEIPT_DESCRIPTIONS}
+    after: dict[str, list[float]] = {name: [] for name in _RECEIPT_DESCRIPTIONS}
+
+    for row in rows:
+        if row["outcome"] is None:
+            continue
+        state = row["eval_fullscreen_state"]
+        if state is None:
+            stratum = RECEIPT_UNKNOWN
+        elif state in GAMING_STATES:
+            stratum = RECEIPT_GAMING
+        else:
+            stratum = RECEIPT_NOT_GAMING
+
+        counts[stratum] += 1
+        outcomes[stratum][row["outcome"]] += 1
+        if row["outcome"] == "no_data":
+            no_data[stratum] += 1
+            continue
+        before[stratum].append(row["ent_before"])
+        after[stratum].append(row["ent_after"])
+        if row["ent_after"] <= row["ent_before"]:
+            not_worse[stratum] += 1
+
+    strata = tuple(
+        ReceiptAuditStratum(
+            name=name,
+            description=_RECEIPT_DESCRIPTIONS[name],
+            receipts=counts[name],
+            no_data=no_data[name],
+            outcomes=_ranked(outcomes[name]),
+            after_not_worse=not_worse[name],
+            ent_before_mean=(
+                round(statistics.fmean(before[name]), 2) if before[name] else None
+            ),
+            ent_after_mean=round(statistics.fmean(after[name]), 2) if after[name] else None,
+        )
+        for name in (RECEIPT_GAMING, RECEIPT_NOT_GAMING, RECEIPT_UNKNOWN)
+    )
+    total = sum(stratum.receipts for stratum in strata)
+    assert total == len([r for r in rows if r["outcome"] is not None])
+
+    return ReceiptAudit(
+        total_receipts=total,
+        strata=strata,
+        affected_receipts=counts[RECEIPT_GAMING],
+        affected_no_data=no_data[RECEIPT_GAMING],
+    )
+
+
+def build_consumption_events(
+    evaluations: Sequence[Any], *, gap_threshold_minutes: float
+) -> tuple[ConsumptionEvent, ...]:
+    """把连续可干预的评估轮次合并成消费事件。
+
+    **为什么必须在 report 里做这件事**：判定按五分钟一轮、窗口回看 60 分钟，
+    所以同一次被动消费会被反复评估十几次。把每个轮次当一个样本，会把
+    「今晚刷了 1 次」读成「有 19 个样本」—— 样本量被窗口重叠凭空放大，
+    而所有比例与均值都建立在这个分母上。
+
+    合并条件是两件事同时成立：状态可干预，且与上一轮的间隔不超过
+    `gap_threshold_minutes`（与缺口视图同一个阈值：跨过关机的一段不能被算成
+    同一次消费）。状态与间隔缺一不可 —— 只看状态的相同会把两段时间上不连续的
+    行为合并，算出来的「事件时长」就没有意义。
+    """
+    runs: list[list[Any]] = []
+    for row in evaluations:
+        if row["state"] not in _INTERVENABLE_STATES:
+            continue
+        moment = _parse(row["at"])
+        if runs and (moment - _parse(runs[-1][-1]["at"])).total_seconds() / 60 <= (
+            gap_threshold_minutes
+        ):
+            runs[-1].append(row)
+        else:
+            runs.append([row])
+
+    events: list[ConsumptionEvent] = []
+    for run in runs:
+        peak = max((r["state"] for r in run), key=_STATE_RANK.__getitem__)
+        events.append(
+            ConsumptionEvent(
+                start=_parse(run[0]["at"]),
+                end=_parse(run[-1]["at"]),
+                ticks=len(run),
+                peak_state=peak,
+            )
+        )
+    return tuple(events)
+
+
+def is_real_delivery(row: Any) -> bool:
+    """真的弹了窗。**与「回执可用」是两件事。**
+
+    前者是干预面的事实（提醒了多少次），后者是效果面的准入条件（均值不能被
+    no_data 污染）。视图 6 的主分析层要的是后者，视图 8 的分母要的是前者 ——
+    把两者当成一件事，两边必有一边说谎。
+    """
+    return row["channel"] == "foreground_popup" and row["delivery_status"] == "delivered"
+
+
+def _hour_bucket(moment: datetime) -> str:
+    hour = moment.astimezone().hour
+    if hour < 6:
+        return "00-05"
+    if hour < 12:
+        return "06-11"
+    if hour < 18:
+        return "12-17"
+    return "18-23"
+
+
+def _ent_bucket(minutes: float) -> str:
+    """10 分钟一档。用整数档而不是连续值作分组键：连续值会让每层只有一行。"""
+    low = int(minutes // 10) * 10
+    return f"{low}-{low + 10}"
+
+
+def build_action_timing_breakdown(
+    rows: Sequence[Any],
+    events: Sequence[ConsumptionEvent],
+    *,
+    gap_threshold_minutes: float,
+) -> ActionTimingBreakdown:
+    """动作 × 时机的联合分层（阶段 2.3）。
+
+    分母是**真实投递**（foreground_popup + delivered），不是视图 6 的主分析口径：
+    后者还要求回执可用，用来算均值；而「这个动作被弹了多少次」必须把 no_data
+    与尚未结算的都算进去。两者刻意分开，每层同时给有效回执数与缺失数。
+
+    每层另给三个旁证：**跨越天数、落在几个消费事件里、回执是否可用**。
+    计划 2.3 明确要求「低样本层只列数据，不给最佳动作排名」—— 之所以要这么克制，
+    是因为同一消费事件内的多次提醒不是独立观察，排序得到的「最佳」可能只反映
+    「谁恰好被分给了那一次长长的消费」。
+    """
+    grouped: dict[tuple[str, str, bool, str, str], list[Any]] = {}
+    for row in rows:
+        if not is_real_delivery(row):
+            continue
+        at = _parse(row["at"])
+        key = (
+            row["action_id"],
+            row["eval_state"] or row["state"],
+            bool(row["eval_late_night"] if row["eval_late_night"] is not None
+                 else row["late_night"]),
+            _ent_bucket(row["eval_ent_minutes"] or 0.0),
+            _hour_bucket(at),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    layers: list[ActionTimingLayer] = []
+    for key, group in grouped.items():
+        action_id, state, late_night, ent_bucket, hour_bucket = key
+        outcomes: Counter[str] = Counter()
+        usable: list[Any] = []
+        days: set[str] = set()
+        event_hits: set[int] = set()
+        missing = 0
+        for row in group:
+            days.add(_parse(row["at"]).astimezone().date().isoformat())
+            for index, event in enumerate(events):
+                if event.start <= _parse(row["at"]) <= event.end + timedelta(
+                    minutes=gap_threshold_minutes
+                ):
+                    event_hits.add(index)
+                    break
+            outcome = row["outcome"]
+            if outcome is None:
+                missing += 1
+                continue
+            outcomes[outcome] += 1
+            if outcome != "no_data":
+                usable.append(row)
+        before = [r["ent_before"] for r in usable]
+        after = [r["ent_after"] for r in usable]
+        layers.append(
+            ActionTimingLayer(
+                action_id=action_id,
+                state=state,
+                late_night=late_night,
+                ent_bucket=ent_bucket,
+                hour_bucket=hour_bucket,
+                deliveries=len(group),
+                valid_receipts=len(usable),
+                no_data=outcomes["no_data"],
+                missing_receipts=missing,
+                days=len(days),
+                events=len(event_hits),
+                outcomes=_ranked(outcomes),
+                ent_before_mean=round(statistics.fmean(before), 2) if before else None,
+                ent_after_mean=round(statistics.fmean(after), 2) if after else None,
+            )
+        )
+
+    # 排序稳定：动作、状态、深夜、档位、时段。输出顺序会漂移的分组表没法对比。
+    layers.sort(
+        key=lambda x: (x.action_id, x.state, x.late_night, x.ent_bucket, x.hour_bucket)
+    )
+    delivered = [r for r in rows if is_real_delivery(r)]
+    return ActionTimingBreakdown(
+        total_deliveries=len(delivered),
+        total_events=len(events),
+        total_days=len(
+            {_parse(r["at"]).astimezone().date().isoformat() for r in delivered}
+        ),
+        layers=tuple(layers),
+        raw_ticks=len(delivered),
     )
 
 

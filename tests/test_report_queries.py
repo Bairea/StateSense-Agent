@@ -7,6 +7,7 @@ from statesense.intervention.models import Decision, GateResult, parse_gate_trac
 from statesense.outcome.models import OutcomeVerdict
 from statesense.report import queries
 from statesense.state.models import State, StateVerdict
+from statesense.perception import QUNS_ACCEPTS_NOTIFICATIONS, QUNS_BUSY
 from statesense.store.db import Store
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
@@ -526,12 +527,13 @@ def test_leak_anchor_reports_missing_detail_separately(store):
 
 
 def _insert_intervention(store, evaluation_id, *, at, action_id, response,
-                         channel="foreground_popup", delivery_status="delivered"):
+                         channel="foreground_popup", delivery_status="delivered",
+                         state="PASSIVE_CONSUMPTION", late_night=False):
     return store.insert_intervention(
         evaluation_id=evaluation_id,
         at=at,
-        state="PASSIVE_CONSUMPTION",
-        late_night=False,
+        state=state,
+        late_night=late_night,
         action_id=action_id,
         action_text="t",
         delivery_status=delivery_status,
@@ -660,6 +662,163 @@ def test_cohort_counts_days_and_rule_versions_separately(store):
     assert cb.main_interventions == 3
     assert len(cb.main_days) == 2
     assert dict(cb.main_rule_versions) == {"v-a": 2, "v-b": 1}
+
+
+# ── 阶段 2.2：回执口径审计与阶段 2.3：动作 × 时机 ────────────
+
+
+def _receipt(store, *, at, trigger_fullscreen, outcome="continued", before=40.0,
+             after=40.0, action_id="walk5", evaluation_id=None, channel="foreground_popup"):
+    eid = evaluation_id
+    if eid is None:
+        eid = _eval_row(store, at, fullscreen_state=trigger_fullscreen)
+    iid = _insert_intervention(store, eid, at=at, action_id=action_id, response=None,
+                               channel=channel)
+    store.insert_outcome(iid, at + timedelta(minutes=10),
+                         OutcomeVerdict(outcome, before, after, 10.0))
+    return iid
+
+
+def test_receipt_audit_stratifies_by_the_trigger_time_fullscreen_state(store):
+    """审计按**触发那一刻**的全屏取值分层 —— 前侧证据受它影响，与通道无关。
+
+    「游戏退出被读成干预有效」这类失真只会出现在游戏触发的那一类里，
+    所以比例必须按这一维分开算，而不是给一个总体 no_data 率。
+    """
+    _receipt(store, at=T0, trigger_fullscreen=QUNS_BUSY)  # 触发时全屏（游戏）
+    _receipt(store, at=T0 + timedelta(minutes=1), trigger_fullscreen=QUNS_BUSY,
+             outcome="no_data", before=0.0, after=0.0)
+    _receipt(store, at=T0 + timedelta(minutes=2), trigger_fullscreen=QUNS_ACCEPTS_NOTIFICATIONS)
+    _receipt(store, at=T0 + timedelta(minutes=3), trigger_fullscreen=None)
+
+    audit = queries.build_receipt_audit(_cohort_rows(store))
+    strata = {s.name: s for s in audit.strata}
+    assert audit.total_receipts == 4
+    assert audit.affected_receipts == 2, "触发时在全屏游戏里的回执数"
+    assert audit.affected_no_data == 1
+    assert strata[queries.RECEIPT_GAMING].receipts == 2
+    assert strata[queries.RECEIPT_GAMING].no_data == 1
+    assert strata[queries.RECEIPT_NOT_GAMING].receipts == 1
+    assert strata[queries.RECEIPT_UNKNOWN].receipts == 1
+
+
+def test_receipt_audit_ignores_interventions_without_a_receipt(store):
+    """没有回执就无从谈前后两值 —— 未结算的行只出现在视图 6 的 missing 层。"""
+    eid = _eval_row(store, T0)
+    _insert_intervention(store, eid, at=T0, action_id="walk5", response=None)
+    _receipt(store, at=T0 + timedelta(minutes=1), trigger_fullscreen=QUNS_BUSY,
+             evaluation_id=eid)
+
+    audit = queries.build_receipt_audit(_cohort_rows(store))
+    assert audit.total_receipts == 1
+
+
+def test_consumption_events_merge_overlapping_ticks_into_one_event(store):
+    """窗口重叠产生的连续可干预轮次是同一次消费 —— 按轮次当样本会放大十几倍。
+
+    19 轮 PASSIVE 是同一个消费事件，不是 19 个样本。
+    """
+    for i in range(19):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), state="PASSIVE_CONSUMPTION")
+
+    events = queries.build_consumption_events(
+        store.list_evaluations(), gap_threshold_minutes=15
+    )
+    assert len(events) == 1
+    assert events[0].ticks == 19
+    assert events[0].minutes == 90.0
+
+
+def test_consumption_events_split_on_a_continuity_gap_and_skip_non_intervenable(store):
+    """跨过关机的一段不能算同一次消费；NORMAL / WATCH 不算消费。"""
+    for i in range(4):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), state="PASSIVE_CONSUMPTION")
+    _eval_row(store, T0 + timedelta(minutes=25), state="NORMAL", ent=5.0)
+    # 65 分钟之后才继续：间隔超过连续性阈值 → 断成两个事件。
+    for i in range(2):
+        _eval_row(store, T0 + timedelta(minutes=90 + 5 * i),
+                  state="HIGH_RISK_PASSIVE_CONSUMPTION")
+
+    events = queries.build_consumption_events(
+        store.list_evaluations(), gap_threshold_minutes=15
+    )
+    assert [(e.ticks, e.peak_state) for e in events] == [
+        (4, "PASSIVE_CONSUMPTION"),
+        (2, "HIGH_RISK_PASSIVE_CONSUMPTION"),
+    ]
+
+
+def test_action_timing_layers_use_only_the_main_cohort(store):
+    """排练没有真实投递，进不了动作时机的分组 —— 与视图 6 同一分母。"""
+    eid = _eval_row(store, T0, state="PASSIVE_CONSUMPTION")
+    _receipt(store, at=T0, trigger_fullscreen=QUNS_ACCEPTS_NOTIFICATIONS,
+             action_id="walk5", evaluation_id=eid)
+    _receipt(store, at=T0 + timedelta(minutes=1), trigger_fullscreen=QUNS_ACCEPTS_NOTIFICATIONS,
+             action_id="stretch", evaluation_id=eid, channel="recording")
+
+    events = queries.build_consumption_events(
+        store.list_evaluations(), gap_threshold_minutes=15
+    )
+    timing = queries.build_action_timing_breakdown(
+        _cohort_rows(store), events, gap_threshold_minutes=15
+    )
+    assert [layer.action_id for layer in timing.layers] == ["walk5"]
+    assert timing.total_deliveries == 1
+    assert timing.layers[0].valid_receipts == 1
+
+
+def test_action_timing_layers_carry_days_events_and_missing_receipts(store):
+    """每层必须给「跨越天数 / 落在几个事件里 / 回执是否可用」三个旁证。
+
+    次数相同、旁证不同的两层证据强度完全不同 —— 计划 2.3 要求低样本层只列数据，
+    可读的前提正是这三个数就在同一行上。
+    """
+    day1 = T0
+    day2 = T0 + timedelta(days=1)
+    eid1 = _eval_row(store, day1, state="PASSIVE_CONSUMPTION")
+    eid2 = _eval_row(store, day2, state="PASSIVE_CONSUMPTION")
+    # 同一天、同一个事件里两次投递：不能算成两条独立证据。
+    _receipt(store, at=day1, trigger_fullscreen=QUNS_ACCEPTS_NOTIFICATIONS, action_id="walk5",
+             evaluation_id=eid1, after=10.0)
+    _receipt(store, at=day1 + timedelta(minutes=5), trigger_fullscreen=QUNS_ACCEPTS_NOTIFICATIONS,
+             action_id="walk5", evaluation_id=eid1, outcome="no_data", before=0.0, after=0.0)
+    # 另一天的一次投递，回执还没结算。
+    _insert_intervention(store, eid2, at=day2, action_id="walk5", response=None)
+
+    events = queries.build_consumption_events(
+        store.list_evaluations(), gap_threshold_minutes=15
+    )
+    timing = queries.build_action_timing_breakdown(
+        _cohort_rows(store), events, gap_threshold_minutes=15
+    )
+    layer = timing.layers[0]
+    assert timing.total_deliveries == 3, "分母是真实投递，含 no_data 与未结算"
+    assert timing.total_events == 2
+    assert timing.total_days == 2
+    assert layer.deliveries == 3
+    assert layer.valid_receipts == 1
+    assert layer.no_data == 1
+    assert layer.missing_receipts == 1
+    assert layer.days == 2
+    assert layer.events == 2
+    assert layer.ent_before_mean == pytest.approx(40.0)
+    assert layer.ent_after_mean == pytest.approx(10.0)
+
+
+def test_action_timing_layers_are_sorted_stably(store):
+    """分组表必须稳定排序 —— 顺序会漂移的表没法比较两天的结果。"""
+    eid = _eval_row(store, T0, state="PASSIVE_CONSUMPTION")
+    for action_id in ("stretch", "walk5", "calligraphy"):
+        _receipt(store, at=T0 + timedelta(minutes=len(action_id)), trigger_fullscreen=5,
+                 action_id=action_id, evaluation_id=eid)
+
+    events = ()
+    timing = queries.build_action_timing_breakdown(
+        _cohort_rows(store), events, gap_threshold_minutes=15
+    )
+    assert [layer.action_id for layer in timing.layers] == [
+        "calligraphy", "stretch", "walk5"
+    ]
 
 
 def test_outcome_breakdown_stratifies_by_user_response(store):
