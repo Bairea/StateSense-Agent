@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS evaluations (
   -- 记原始值而不是布尔：这条「自动推断」需要事后审计准确率，
   -- 只存 true/false 就再也答不上「它当时到底看到了什么」。
   fullscreen_state INTEGER,
+  -- 判定这套规则（分类清单 + 状态阈值 + 全屏提权语义）的标识，见 rulebook.py。
+  -- 结果行里没有规则本身，跨版本比较阈值时必须靠它把样本分组；
+  -- NULL = 迁移前写入的行，**版本未知**，不得与已知版本混算。
+  rule_version TEXT,
   prev_state TEXT,
   decision TEXT NOT NULL,
   gate_trace TEXT NOT NULL

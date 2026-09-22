@@ -20,6 +20,7 @@ from statesense.intervention.wording import TemplateWording, Wording
 from statesense.notify.base import Notifier
 from statesense.outcome.tracker import evaluate as evaluate_outcome
 from statesense.perception import FullscreenProbe, default_probe, is_gaming
+from statesense.rulebook import version_of
 from statesense.state.engine import classify, effective_entertainment_minutes
 from statesense.state.taxonomy import bucket_minutes
 from statesense.store.db import Store
@@ -68,6 +69,14 @@ class Scheduler:
         self._wording = wording or TemplateWording()
         self._fullscreen = fullscreen or default_probe()
         self._last_evaluation_at: datetime | None = None
+        # 判定规则在一次进程生命周期内不会变（配置是 frozen 的），所以算一次就够。
+        # 它是**判定**的标识，因此写在 evaluations 行上：跨版本比较阈值时靠它分组。
+        self._rule_version = version_of(config)
+
+    @property
+    def rule_version(self) -> str:
+        """本轮判定所用的规则版本。启动日志与写库共用同一个值。"""
+        return self._rule_version
 
     # ── 对外 ────────────────────────────────────────────────
 
@@ -158,15 +167,37 @@ class Scheduler:
         delay = self._config.outcome.delay_minutes
         window = int(delay)
         closed = 0
-        # before / after 两次回查绑定同一个全屏取值：它们是同一次干预的两侧，
-        # 用两个时刻的两次探测去算，差出来的就不是「效果」而是「探测时机」。
-        ent_minutes = partial(self.ent_minutes, fullscreen_state=fullscreen)
         for due in self._store.due_interventions(now):
+            # 两侧各用**可归属其时段**的证据，这是阶段 2.2 校正的核心：
+            #   · 干预前：触发那一轮落库的 fullscreen_state —— 那是当时的事实；
+            #   · 干预后：当下这一次探测 —— 它覆盖的正是最近这段时间。
+            # 过去两侧共用当下的取值，于是「打游戏时触发、随后退出游戏」时，
+            # 前侧被按「没在玩游戏」重算、ent_before 被低估甚至落成 no_data，
+            # 而「退出游戏」看起来就像「干预有效」。
+            # 历史全屏状态并不存在于别处，恰好就在触发那一轮的行里。
+            trigger = self._store.fetch_evaluation(due.evaluation_id)
+            if trigger is None:
+                # 取不到就**保留未知**（未知 = 不提权，保守），绝不拿当下取值冒充历史。
+                # 后果通常是前侧 ent 偏低直至 no_data —— 那是如实记录，不是失败。
+                log.warning(
+                    "干预 %d 找不到触发评估行 %d：回执前侧按「全屏状态未知」处理，"
+                    "不用当下取值替代",
+                    due.id,
+                    due.evaluation_id,
+                )
+            before_fullscreen = trigger["fullscreen_state"] if trigger is not None else None
+
             before = self._reader.read(due.at - timedelta(minutes=delay), due.at, window, now)
             after = self._reader.read(
                 due.at, due.at + timedelta(minutes=delay), window, now
             )
-            verdict = evaluate_outcome(before, after, ent_minutes, self._config.outcome)
+            verdict = evaluate_outcome(
+                before,
+                after,
+                ent_before_minutes=partial(self.ent_minutes, fullscreen_state=before_fullscreen),
+                ent_after_minutes=partial(self.ent_minutes, fullscreen_state=fullscreen),
+                config=self._config.outcome,
+            )
             self._store.insert_outcome(due.id, now, verdict)
             closed += 1
         return closed
@@ -213,7 +244,9 @@ class Scheduler:
         pool = candidates(self._config.actions, verdict.state)
         decision = decide(ctx, pool, last_action)
 
-        evaluation_id = self._store.insert_evaluation(now, verdict, decision)
+        evaluation_id = self._store.insert_evaluation(
+            now, verdict, decision, rule_version=self._rule_version
+        )
 
         if not decision.intervene or decision.action_id is None:
             return TickReport(evaluation_id, str(verdict.state), False, closed, decision.reason)

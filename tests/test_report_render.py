@@ -36,7 +36,7 @@ def _data(**over) -> ReportData:
     base = ReportData(
         overview=Overview(T0, T0, 2, 2, 1.0, ()),
         liveness=_live(),
-        verdicts=VerdictBreakdown(2, (("NORMAL", 2),), (("ok", 2),), 0, 0, (), 0),
+        verdicts=VerdictBreakdown(2, (("NORMAL", 2),), (("ok", 2),), 0, 0, (), (("v1", 2),), 0),
         gates=GateBreakdown((), (), (), 0, 0, (), 0),
         interventions=InterventionBreakdown(0, (), (), (), (), (), (), 0, 0),
         outcomes=OutcomeBreakdown((), (), 0, None, None, None, None),
@@ -91,7 +91,7 @@ def test_empty_database_says_so_and_says_why_it_matters():
     data = _data(
         overview=Overview(None, None, 0, 0, 0.0, ()),
         liveness=_live(last_at=None, silent_minutes=None),
-        verdicts=VerdictBreakdown(0, (), (), 0, 0, (), 0),
+        verdicts=VerdictBreakdown(0, (), (), 0, 0, (), (), 0),
     )
     out = render.render_text(data)
     assert "无任何评估记录" in out
@@ -161,7 +161,7 @@ def test_liveness_offline_separates_tick_error_from_process_death():
 def test_skipped_rows_are_highlighted():
     data = _data(
         verdicts=VerdictBreakdown(
-            2, (("NORMAL", 2),), (("ok", 1), ("unreachable", 1)), 1, 0, (), 0
+            2, (("NORMAL", 2),), (("ok", 1), ("unreachable", 1)), 1, 0, (), (("v1", 2),), 0
         )
     )
     out = render.render_text(data)
@@ -173,7 +173,7 @@ def test_verdict_section_shows_proportions_not_just_counts():
     """spec §5.2：四状态分布要「计数 + 占比」。只给计数看不出严重程度。"""
     data = _data(
         verdicts=VerdictBreakdown(
-            4, (("NORMAL", 3), ("WATCH", 1)), (("ok", 4),), 0, 0, (), 0
+            4, (("NORMAL", 3), ("WATCH", 1)), (("ok", 4),), 0, 0, (), (("v1", 4),), 0
         )
     )
     out = render.render_text(data, views=("1",))
@@ -184,7 +184,7 @@ def test_verdict_section_shows_proportions_not_just_counts():
 def test_verdict_section_shouts_when_skipped_share_is_high():
     data = _data(
         verdicts=VerdictBreakdown(
-            10, (("NORMAL", 10),), (("ok", 7), ("unreachable", 3)), 3, 0, (), 0
+            10, (("NORMAL", 10),), (("ok", 7), ("unreachable", 3)), 3, 0, (), (("v1", 10),), 0
         )
     )
     out = render.render_text(data, views=("1",))
@@ -196,7 +196,7 @@ def test_verdict_section_shows_fullscreen_distribution():
     以及「无法判定」占了多大比例。"""
     data = _data(
         verdicts=VerdictBreakdown(
-            3, (("NORMAL", 3),), (("ok", 3),), 0, 0, (("2", 2), ("unknown", 1)), 0
+            3, (("NORMAL", 3),), (("ok", 3),), 0, 0, (("2", 2), ("unknown", 1)), (("v1", 3),), 0
         )
     )
     out = render.render_text(data, views=("1",))
@@ -208,11 +208,42 @@ def test_verdict_section_shows_fullscreen_distribution():
 def test_verdict_section_discloses_the_leak_blind_spot():
     """有轮次取不到明细时，必须在判定面上说清「漏判结论覆盖了多少轮」。"""
     data = _data(
-        verdicts=VerdictBreakdown(2, (("NORMAL", 2),), (("ok", 2),), 0, 0, (), 1)
+        verdicts=VerdictBreakdown(2, (("NORMAL", 2),), (("ok", 2),), 0, 0, (), (("v1", 2),), 1)
     )
     out = render.render_text(data, views=("1",))
     assert "明细缺失" in out
     assert "漏判判据对它们不成立" in out
+
+
+def test_verdict_section_shows_rule_versions_and_warns_about_mixing():
+    """规则版本必须出现在报告里，跨版本时必须提示不能混算。
+
+    这一档的意义不是「多一行信息」，而是让「阈值调优的效果」与「规则换了」
+    能被分开 —— 两者混读时得出的差异无法归因，而报告是唯一的出口。
+    """
+    mixed = _data(
+        verdicts=VerdictBreakdown(
+            3, (("NORMAL", 3),), (("ok", 3),), 0, 0, (),
+            (("aaaaaaaaaaaa", 2), ("unknown", 1)), 0,
+        )
+    )
+    out = render.render_text(mixed, views=("1",))
+    assert "规则版本" in out
+    assert "aaaaaaaaaaaa=2" in out
+    assert "unknown=1" in out
+    assert "规则版本未知" in out
+    assert "跨规则版本" in out
+
+
+def test_single_known_rule_version_does_not_warn():
+    """只有一个已知版本时不该啰嗦 —— 警告用滥了就没人看警告。"""
+    single = _data(
+        verdicts=VerdictBreakdown(
+            2, (("NORMAL", 2),), (("ok", 2),), 0, 0, (), (("aaaaaaaaaaaa", 2),), 0
+        )
+    )
+    out = render.render_text(single, views=("1",))
+    assert "跨规则版本" not in out
 
 
 # ── 视图选择 ────────────────────────────────────────────────
@@ -344,7 +375,7 @@ def test_leak_anchors_show_every_bucket():
 
 def test_leak_section_states_its_blind_spot():
     """读者会在这一节下「没有漏判」的结论 —— 那句话对明细缺失的轮次并不成立。"""
-    data = _data(verdicts=VerdictBreakdown(2, (("NORMAL", 2),), (("ok", 2),), 0, 0, (), 3))
+    data = _data(verdicts=VerdictBreakdown(2, (("NORMAL", 2),), (("ok", 2),), 0, 0, (), (("v1", 2),), 3))
     out = render.render_text(data, views=("5",))
     assert "另有 3 轮报活跃却没有条目明细" in out
     assert "（无）" in out

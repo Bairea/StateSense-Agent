@@ -248,6 +248,8 @@ def test_db_option_is_accepted():
 # ── 全屏信号端到端（带对照组）────────────────────────────────
 
 QUNS_RUNNING_D3D_FULL_SCREEN = 3
+#: 「正常，无全屏应用」——游戏退出后探针给出的取值。
+QUNS_ACCEPTS_NOTIFICATIONS = 5
 
 
 class _StubProbe:
@@ -310,7 +312,7 @@ def test_fullscreen_signal_rescues_an_unnamed_game(config, store):
 
 
 def test_fullscreen_is_sampled_once_even_when_an_outcome_is_due(config, store):
-    """回执到期那一轮，两次取数（判定 + 回执前后两侧）必须共用同一个探测结果。"""
+    """回执到期那一轮，判定与回执后侧必须共用同一个探测结果。"""
     probe = _StubProbe(QUNS_RUNNING_D3D_FULL_SCREEN)
     sch = _probe_scheduler(config, store, _unnamed_game(45.0), probe)
     first = sch.run_once()
@@ -321,7 +323,71 @@ def test_fullscreen_is_sampled_once_even_when_an_outcome_is_due(config, store):
     sch._clock.advance(minutes=15)  # noqa: SLF001 - 测试需要推进冻结时钟
     sch.run_once()
 
-    assert probe.calls == 1, "判定与回执必须共用同一次探测"
+    assert probe.calls == 1, "一轮只应探测一次；回执前侧改用触发那一轮落库的取值"
+
+
+def _intervention_id(store) -> int:
+    return store._conn.execute("SELECT id FROM interventions").fetchone()["id"]  # noqa: SLF001
+
+
+def test_outcome_before_side_uses_the_fullscreen_state_recorded_at_trigger(config, store):
+    """游戏退出后结算回执：前侧仍按触发那一刻的取值算，后侧用当下的取值。
+
+    阶段 2.2 要修的正是这条：打游戏时触发，10 分钟后结算时游戏已经退出。
+    旧写法两侧绑同一个取值 → 前侧被按「没在玩游戏」重算 → ent_before 掉到 0
+    → 回执落成 no_data；而「退出游戏」看起来就像「干预成功」。
+    """
+    probe = _StubProbe(QUNS_RUNNING_D3D_FULL_SCREEN)
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), probe)
+    assert sch.run_once().intervened is True
+
+    probe.value = QUNS_ACCEPTS_NOTIFICATIONS  # 游戏退出
+    sch._clock.advance(minutes=10)  # noqa: SLF001
+    assert sch.run_once().outcomes_closed == 1
+
+    row = store.fetch_outcome(_intervention_id(store))
+    assert row["ent_before"] == 45.0, "前侧要用触发那一轮记下的全屏取值（游戏在跑）"
+    assert row["ent_after"] == 0.0, "后侧用当下的取值（游戏已退出）"
+    assert row["outcome"] == "disengaged"
+
+
+def test_missing_trigger_evaluation_leaves_the_before_side_unknown(config, store, caplog):
+    """取不到触发评估行时**保留未知**，绝不拿当下的全屏取值冒充历史。
+
+    未知 = 不提权（保守），于是前侧通常被算成 0 并落成 no_data。那是如实记录，
+    不是失败：把前侧「修好」的唯一诚实办法是当时就把那一轮的取值存下来。
+    """
+    import logging
+
+    probe = _StubProbe(QUNS_RUNNING_D3D_FULL_SCREEN)
+    sch = _probe_scheduler(config, store, _unnamed_game(45.0), probe)
+    assert sch.run_once().intervened is True
+
+    # 模拟「触发评估行不在了」：老库或行被清理过。外键挡得住正常写入，
+    # 所以这里显式关掉它来构造这个状态。
+    with store._conn:  # noqa: SLF001
+        store._conn.execute("PRAGMA foreign_keys = OFF")  # noqa: SLF001
+        store._conn.execute("UPDATE interventions SET evaluation_id = 999999")  # noqa: SLF001
+        store._conn.execute("PRAGMA foreign_keys = ON")  # noqa: SLF001
+
+    with caplog.at_level(logging.WARNING, logger="statesense.scheduler"):
+        sch._clock.advance(minutes=10)  # noqa: SLF001
+        assert sch.run_once().outcomes_closed == 1
+
+    assert "找不到触发评估行" in caplog.text
+    row = store.fetch_outcome(_intervention_id(store))
+    assert row["ent_before"] == 0.0
+    assert row["outcome"] == "no_data"
+
+
+def test_evaluation_row_carries_the_rule_version(config, store):
+    """每行判定都带上「用哪套规则判的」——库里的行本身读不出分类清单与阈值。"""
+    from statesense.rulebook import version_of
+
+    sch = _probe_scheduler(config, store, _unnamed_game(0.0), _StubProbe(None))
+    report = sch.run_once()
+    assert sch.rule_version == version_of(config)
+    assert store.fetch_evaluation(report.evaluation_id)["rule_version"] == version_of(config)
 
 
 def test_run_forever_logs_start_abort_and_end(config, store, monkeypatch, caplog):

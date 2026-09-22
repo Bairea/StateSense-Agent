@@ -11,6 +11,9 @@ from statesense.store.db import Store
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
 
+#: 写入接口要求显式给出规则版本，不给默认值（见 store/db.py）。
+RV = "test-rule-v1"
+
 
 @pytest.fixture()
 def store(tmp_path):
@@ -45,7 +48,7 @@ _SKIP = Decision(intervene=False, action_id=None, reason="测试", gate_trace=()
 
 def test_list_evaluations_is_ordered_and_filters_by_since(store):
     for i in range(3):
-        store.insert_evaluation(T0 + timedelta(minutes=10 * i), _verdict(), _SKIP)
+        store.insert_evaluation(T0 + timedelta(minutes=10 * i), _verdict(), _SKIP, rule_version=RV)
 
     assert len(store.list_evaluations()) == 3
     rows = store.list_evaluations(since=T0 + timedelta(minutes=10))
@@ -54,9 +57,9 @@ def test_list_evaluations_is_ordered_and_filters_by_since(store):
 
 def test_list_evaluations_is_ordered_by_time_not_insert_order(store):
     """乱序插入也要按时间返回 —— report 的缺口检测依赖时间序。"""
-    store.insert_evaluation(T0 + timedelta(minutes=20), _verdict(), _SKIP)
-    store.insert_evaluation(T0, _verdict(), _SKIP)
-    store.insert_evaluation(T0 + timedelta(minutes=10), _verdict(), _SKIP)
+    store.insert_evaluation(T0 + timedelta(minutes=20), _verdict(), _SKIP, rule_version=RV)
+    store.insert_evaluation(T0, _verdict(), _SKIP, rule_version=RV)
+    store.insert_evaluation(T0 + timedelta(minutes=10), _verdict(), _SKIP, rule_version=RV)
     ats = [r["at"] for r in store.list_evaluations()]
     assert ats == sorted(ats)
 
@@ -86,7 +89,7 @@ def test_list_methods_work_when_tables_are_empty(store):
 
 def _eval_row(store, at, *, ent=45.0, total=60.0, state="PASSIVE_CONSUMPTION",
               data_status="ok", skipped=0, entries=None, gates=None,
-              fullscreen_state=None):
+              fullscreen_state=None, version=RV):
     verdict = StateVerdict(
         state=State(state),
         late_night=False,
@@ -108,7 +111,19 @@ def _eval_row(store, at, *, ent=45.0, total=60.0, state="PASSIVE_CONSUMPTION",
         reason="t",
         gate_trace=tuple(GateResult(n, p, v, th) for n, p, v, th in (gates or [])),
     )
-    return store.insert_evaluation(at, verdict, decision)
+    return store.insert_evaluation(at, verdict, decision, rule_version=version)
+
+
+def _strip_version(store, evaluation_id: int) -> None:
+    """把某行的规则版本改回 NULL —— 「迁移前写入的行」在库里就长这样。
+
+    写入接口不接受 None（不给默认值、必填），所以只能事后抹掉；
+    这与 v6 之前写入的历史行在数据上完全同形。
+    """
+    with store._conn:
+        store._conn.execute(
+            "UPDATE evaluations SET rule_version = NULL WHERE id = ?", (evaluation_id,)
+        )
 
 
 def test_overview_reports_gap_when_ticks_missing(store):
@@ -248,6 +263,33 @@ def test_verdict_breakdown_counts_rows_without_entry_detail(store):
 
     bd = queries.build_verdict_breakdown(store.list_evaluations())
     assert bd.entries_unknown == 1
+
+
+def test_verdict_breakdown_counts_rule_versions_and_keeps_unknown_apart(store):
+    """规则版本要能分得开，`unknown` 单独一档。
+
+    分类清单与阈值不落在结果行里，跨版本比较只能靠这一档分开样本。
+    把 unknown 并进任何已知版本，都会让「两组规则混算」这件事从数据上消失。
+    """
+    old = _eval_row(store, T0, version="v-old")
+    _strip_version(store, old)
+    _eval_row(store, T0 + timedelta(minutes=5), version="v-new")
+    _eval_row(store, T0 + timedelta(minutes=10), version="v-new")
+
+    bd = queries.build_verdict_breakdown(store.list_evaluations())
+    assert dict(bd.rule_versions) == {"v-new": 2, "unknown": 1}
+
+
+def test_group_by_rule_version_separates_samples_and_orders_stably(store):
+    """分组是跨版本比较的第一步，且顺序必须稳定 —— 否则测试与报告都没法对比。"""
+    _eval_row(store, T0, version="v-b")
+    _eval_row(store, T0 + timedelta(minutes=5), version="v-a")
+    unknown = _eval_row(store, T0 + timedelta(minutes=10), version="v-a")
+    _strip_version(store, unknown)
+
+    groups = queries.group_by_rule_version(store.list_evaluations())
+    assert [name for name, _ in groups] == ["v-a", "v-b", "unknown"]
+    assert [len(rows) for _, rows in groups] == [1, 1, 1]
 
 
 def test_gate_breakdown_names_the_blocking_gate(store):

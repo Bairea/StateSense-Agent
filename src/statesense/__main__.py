@@ -19,6 +19,7 @@ from statesense.perception import default_probe, describe
 from statesense.replay.scenarios import SCENARIOS, check_scenario
 from statesense.report import queries, render
 from statesense.report.models import LeakWindowDetail, ReportData
+from statesense import rulebook
 from statesense.scheduler import Scheduler
 from statesense.store.db import SCHEMA_VERSION, Store
 
@@ -156,11 +157,12 @@ def log_startup(config: Config, *, dry_run: bool) -> None:
     带时间戳和 pid 的启动记录，重启历史变成可读的。
     """
     log.info(
-        "常驻启动 pid=%d 分支=%s schema=v%d 库=%s screenpipe=%s 通道=%s "
+        "常驻启动 pid=%d 分支=%s schema=v%d 规则版本=%s 库=%s screenpipe=%s 通道=%s "
         "每 %d 分钟一轮/窗口 %d 分钟",
         os.getpid(),
         _current_branch() or "未知",
         SCHEMA_VERSION,
+        rulebook.version_of(config),
         config.store_path,
         config.screenpipe.base_url,
         "recording(dry-run)" if dry_run else config.notify.channel,

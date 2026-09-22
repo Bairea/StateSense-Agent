@@ -24,6 +24,18 @@ def _ent(snapshot: ActivitySnapshot) -> float:
     return sum(e.minutes for e in snapshot.entries)
 
 
+def _evaluate(before: ActivitySnapshot, after: ActivitySnapshot) -> "object":
+    """两侧用同一个口径的便捷入口。**接口本身要求两侧各传一个可调用对象** ——
+    便捷入口是为了让「两侧本来就该同源」的用例读起来短，不是为了把它变回一个参数。"""
+    return evaluate(
+        before,
+        after,
+        ent_before_minutes=_ent,
+        ent_after_minutes=_ent,
+        config=CFG,
+    )
+
+
 # ── 标签边界（45 → 22.5 / 36.0）─────────────────────────────
 
 def test_disengaged_when_drop_is_steep():
@@ -55,7 +67,7 @@ def test_more_activity_after_is_still_continued():
 # ── 完整评估 ────────────────────────────────────────────────
 
 def test_evaluate_returns_raw_values_and_label():
-    verdict = evaluate(_snap(45.0), _snap(12.0), _ent, CFG)
+    verdict = _evaluate(_snap(45.0), _snap(12.0))
     assert verdict.outcome == "disengaged"
     assert verdict.ent_before == 45.0
     assert verdict.ent_after == 12.0
@@ -63,19 +75,19 @@ def test_evaluate_returns_raw_values_and_label():
 
 
 def test_evaluate_returns_no_data_when_after_snapshot_is_untrustworthy():
-    verdict = evaluate(_snap(45.0), _snap(0.0, data_status="no_capture_in_range"), _ent, CFG)
+    verdict = _evaluate(_snap(45.0), _snap(0.0, data_status="no_capture_in_range"))
     assert verdict.outcome == "no_data"
     assert verdict.ent_before == 45.0
 
 
 def test_evaluate_returns_no_data_when_before_snapshot_is_untrustworthy():
-    verdict = evaluate(_snap(45.0, data_status="unreachable"), _snap(12.0), _ent, CFG)
+    verdict = _evaluate(_snap(45.0, data_status="unreachable"), _snap(12.0))
     assert verdict.outcome == "no_data"
 
 
 def test_zero_before_is_no_data_not_disengaged():
     """理论上前提是 ent>=40，但真出现 0 时不能当成「干预成功」。"""
-    assert evaluate(_snap(0.0), _snap(0.0), _ent, CFG).outcome == "no_data"
+    assert _evaluate(_snap(0.0), _snap(0.0)).outcome == "no_data"
 
 
 def test_zero_before_also_warns(caplog):
@@ -83,11 +95,89 @@ def test_zero_before_also_warns(caplog):
     import logging
 
     with caplog.at_level(logging.WARNING, logger="statesense.outcome.tracker"):
-        evaluate(_snap(0.0), _snap(0.0), _ent, CFG)
+        _evaluate(_snap(0.0), _snap(0.0))
     assert "回执不可信" in caplog.text
 
 
 def test_raw_values_are_recorded_even_when_no_data():
-    verdict = evaluate(_snap(45.0), _snap(12.0, data_status="unreachable"), _ent, CFG)
+    verdict = _evaluate(_snap(45.0), _snap(12.0, data_status="unreachable"))
     assert verdict.ent_before == 45.0
     assert verdict.ent_after == 12.0
+
+
+# ── 两侧各用可归属其时段的证据（阶段 2.2）────────────────────
+
+
+def _snap_other(minutes: float) -> ActivitySnapshot:
+    """未命中任何规则的条目 —— 游戏窗口的样子（进程名就是游戏自身）。"""
+    return ActivitySnapshot(
+        window_start=T0,
+        window_end=T0 + timedelta(minutes=10),
+        window_minutes=10,
+        total_active_minutes=10.0,
+        entries=(Entry("Brotato.exe", "Brotato", "", minutes),),
+        data_status="ok",
+        captured_at=T0 + timedelta(minutes=10),
+    )
+
+
+def _ent_with(fullscreen: int | None):
+    """给定全屏取值时的娱乐分钟口径 —— 与 `Scheduler.ent_minutes` 同一算法。"""
+    import re
+
+    from statesense.config import TaxonomyConfig
+    from statesense.perception import is_gaming
+    from statesense.state.engine import effective_entertainment_minutes
+    from statesense.state.taxonomy import bucket_minutes
+
+    taxonomy = TaxonomyConfig(
+        entertainment=(re.compile("bilibili", re.IGNORECASE),), gray=(), work=()
+    )
+
+    def inner(snapshot: ActivitySnapshot) -> float:
+        return effective_entertainment_minutes(
+            bucket_minutes(snapshot.entries, taxonomy),
+            trustworthy=snapshot.is_trustworthy,
+            gaming=is_gaming(fullscreen),
+        )
+
+    return inner
+
+
+def test_each_side_uses_its_own_fullscreen_evidence():
+    """打游戏时触发、随后退出游戏：前侧按「游戏还在跑」算，后侧按「已退出」算。
+
+    同一批未归类条目，两侧的取值不同不是矛盾，而是各自时段的事实。
+    """
+    from statesense.perception import QUNS_ACCEPTS_NOTIFICATIONS, QUNS_BUSY
+
+    verdict = evaluate(
+        _snap_other(45.0),
+        _snap_other(30.0),
+        ent_before_minutes=_ent_with(QUNS_BUSY),
+        ent_after_minutes=_ent_with(QUNS_ACCEPTS_NOTIFICATIONS),
+        config=CFG,
+    )
+    assert verdict.ent_before == 45.0  # 前侧：游戏在跑，未归类条目算娱乐
+    assert verdict.ent_after == 0.0  # 后侧：游戏退出，同样的条目不再算娱乐
+    assert verdict.outcome == "disengaged"
+
+
+def test_shared_evidence_understates_the_before_side_and_loses_the_receipt():
+    """把两侧绑成同一个取值（旧写法）会把前侧清零，回执直接落成 no_data。
+
+    这条测的是缺陷本身，留着它有两个作用：证明上面的修正确实改了行为，
+    以及提醒后来者「共用一个取值」为什么会把「退出游戏」读成「干预有效」。
+    """
+    from statesense.perception import QUNS_ACCEPTS_NOTIFICATIONS
+
+    shared = _ent_with(QUNS_ACCEPTS_NOTIFICATIONS)
+    verdict = evaluate(
+        _snap_other(45.0),
+        _snap_other(0.0),
+        ent_before_minutes=shared,
+        ent_after_minutes=shared,
+        config=CFG,
+    )
+    assert verdict.ent_before == 0.0
+    assert verdict.outcome == "no_data"
