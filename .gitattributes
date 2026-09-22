@@ -1,0 +1,23 @@
+# 统一行尾：入库一律 LF，checkout 也用 LF。
+#
+# 本机 core.autocrlf=false，规则必须放进库里，否则每台机器的 checkout 结果不一致。
+# 2026-09-22 的评审发现：4bd9a4b 一次把 8 个文件整文件 LF→CRLF，导致
+# `git diff e3681a2...HEAD` 报 8434 行，忽略空白后只剩 3514 行 —— 58% 是噪声。
+# 行尾规则写在这里之后，`git add --renormalize .` 可以随时把偏差纠回来。
+* text=auto eol=lf
+
+# 二进制不做文本转换。本项目目前没有跟踪的二进制文件，先写上以免以后误伤。
+*.db binary
+*.db-wal binary
+*.db-shm binary
+*.sqlite binary
+*.sqlite3 binary
+*.parquet binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.xlsx binary
