@@ -52,7 +52,7 @@ Notification          ← 轻推一下
 
 ## 当前状态
 
-**V0 已实现并通过端到端验证**（详见验证日志）。
+**V0 已实现并通过端到端验证；V0.5 的回放、报表、健康信号和全屏信号已写入代码，真实运行验收尚未全部完成。** 2026-09-22 在当前检出的代码上运行：374 个测试通过，五个回放剧本全部通过。连续运行五天、跨天阈值判断与真实弹窗回执仍须按阶段 0 计划重新取证；当前工作区没有生产配置或数据库，不能据此判断运行机器此刻的状态。
 
 | 文档 | 内容 |
 | --- | --- |
@@ -64,6 +64,10 @@ Notification          ← 轻推一下
 | [`docs/plans/2026-09-16-v0-implementation.md`](./docs/plans/2026-09-16-v0-implementation.md) | V0 实现计划（11 任务 / 56 步 / TDD） |
 | [`docs/plans/2026-09-16-v0-verification-log.md`](./docs/plans/2026-09-16-v0-verification-log.md) | **V0 验证日志**：端到端实测结果、投递通道实测矩阵、实施中发现的缺陷 |
 | [`docs/plans/2026-09-17-v0.5-verification-log.md`](./docs/plans/2026-09-17-v0.5-verification-log.md) | **V0.5 验证日志**：逐条判据的证据、真实联调结果、缺陷与偏差记录 |
+| [`docs/plans/2026-09-22-stage-0-v0.5-acceptance.md`](./docs/plans/2026-09-22-stage-0-v0.5-acceptance.md) | 后续阶段 0：完成 V0.5 真实运行验收 |
+| [`docs/plans/2026-09-22-stage-1-v1-classification-and-thresholds.md`](./docs/plans/2026-09-22-stage-1-v1-classification-and-thresholds.md) | 后续阶段 1：V1 分类与阈值校准 |
+| [`docs/plans/2026-09-22-stage-2-v1-intervention-effectiveness.md`](./docs/plans/2026-09-22-stage-2-v1-intervention-effectiveness.md) | 后续阶段 2：V1 干预时机与动作效果分析 |
+| [`docs/plans/2026-09-22-stage-3-v2-llm.md`](./docs/plans/2026-09-22-stage-3-v2-llm.md) | 后续阶段 3：V2 受控引入 LLM |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | 协作仓库布局、分支策略与 PR 流程 |
 
 ## 迭代路线
