@@ -158,6 +158,23 @@ class CohortLayer:
 
 
 @dataclass(frozen=True)
+class RuleVersionSlice:
+    """主分析层里属于某一个规则版本的那一部分。
+
+    存在的理由只有一个：**跨版本不混算**（阶段 1.1 验收）。分类清单或阈值换过
+    之后，两个版本的行混在一起算「同一批样本」，差异既可能来自阈值也可能来自
+    规则本身，而数据里分不出来 —— 所以跨版本时合并均值直接给 `None`，
+    由这些分片顶上。
+    """
+
+    version: str
+    interventions: int
+    days: int
+    ent_before_mean: float | None
+    ent_after_mean: float | None
+
+
+@dataclass(frozen=True)
 class CohortBreakdown:
     """真实干预的同一批记录（阶段 2.1）。
 
@@ -175,10 +192,16 @@ class CohortBreakdown:
     main_days: tuple[str, ...]
     #: 主分析层的触发规则版本分布。跨版本时主分析层内部也不能合并比较。
     main_rule_versions: tuple[tuple[str, int], ...]
+    #: 主分析层的前后娱乐分钟。**跨规则版本时为 `None`** —— 宁可空着，
+    #: 也不给一个混了两个版本、无法归因的数。见 `RuleVersionSlice`。
     main_ent_before_mean: float | None
     main_ent_after_mean: float | None
     main_ent_before_median: float | None
     main_ent_after_median: float | None
+    #: 按规则版本拆开的主分析层。**单版本时为空**（那时分片与合并值必然相同，
+    #: 重复一遍只会让人以为有两套口径）；跨版本时一定非空，且各分片之和等于
+    #: `main_interventions`。
+    versions: tuple[RuleVersionSlice, ...]
     #: 区间起点之前投递、区间内才检查的回执。取数改成单一时间轴后这里应为 0；
     #: 一旦非 0，说明又出现了两个时间轴拼分母的写法。
     orphan_outcomes: int

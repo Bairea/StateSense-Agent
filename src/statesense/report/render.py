@@ -256,17 +256,29 @@ def _cohort_lines(data: ReportData) -> list[str]:
                 f"      {'':<14} 按钮 {_pairs(layer.user_responses)}"
                 f"    回执 {_pairs(layer.outcomes)}"
             )
-    lines.append(
-        f"  主分析层前后娱乐  均值 {c.main_ent_before_mean} → {c.main_ent_after_mean}"
-        f"    中位数 {c.main_ent_before_median} → {c.main_ent_after_median}"
-    )
+    if c.versions:
+        # 跨版本时这里**没有**合并均值可打（查询层给的是 None）。与其打一行
+        # 「None → None」让人以为取数失败，不如说清为什么空着。
+        lines.append(
+            f"  主分析层前后娱乐  不合并 —— 区间内有 {len(c.versions)} 个规则版本"
+        )
+        lines.append("  按规则版本分组（分类清单/阈值换过之后，跨版本不能当同一批样本）：")
+        for slice_ in c.versions:
+            lines.append(
+                f"    {slice_.version:<14} {slice_.interventions:>3} 次"
+                f"  {slice_.days} 天"
+                f"    均值 {slice_.ent_before_mean} → {slice_.ent_after_mean}"
+            )
+    else:
+        lines.append(
+            f"  主分析层前后娱乐  均值 {c.main_ent_before_mean} → {c.main_ent_after_mean}"
+            f"    中位数 {c.main_ent_before_median} → {c.main_ent_after_median}"
+        )
     if "unknown" in dict(c.main_rule_versions):
         lines.append(
             "              ⚠ 主分析层含版本未知的行（迁移前写入），"
             "它的判定用的是当时的规则，不能当作当前版本"
         )
-    if len(c.main_rule_versions) > 1:
-        lines.append("              ⚠ 主分析层跨规则版本，前后对比须再按版本分组")
     if c.orphan_outcomes:
         lines.append(
             f"              ⚠ {c.orphan_outcomes} 条主分析行缺少回执检查时刻 —— "
