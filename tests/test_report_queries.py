@@ -555,6 +555,28 @@ def _cohort_rows(store, since=None):
     return store.list_intervention_cohort(since=since)
 
 
+def _timing(store, *, gap_threshold_minutes=15, events=None):
+    """按 `__main__` 的同一条路径组装视图 8。
+
+    「消费事件数」与「合并前的可干预轮次数」必须出自同一次切分，测试里也不许
+    各算一遍 —— 分开构造会让「19 轮合并成 1 个事件」和「19 轮合并成 2 个事件」
+    同时通过测试。
+    """
+    evaluations = store.list_evaluations()
+    if events is None:
+        events = queries.build_consumption_events(
+            evaluations, gap_threshold_minutes=gap_threshold_minutes
+        )
+    return queries.build_action_timing_breakdown(
+        _cohort_rows(store),
+        events,
+        raw_ticks=queries.count_intervenable_rounds(
+            evaluations, gap_threshold_minutes=gap_threshold_minutes
+        ),
+        gap_threshold_minutes=gap_threshold_minutes,
+    )
+
+
 def test_cohort_layers_are_mutually_exclusive_and_sum_to_total(store):
     """各层互斥、相加等于干预总数 —— 主分析的分母不能凭空变小。
 
@@ -729,6 +751,50 @@ def test_consumption_events_merge_overlapping_ticks_into_one_event(store):
     assert events[0].minutes == 90.0
 
 
+def test_raw_ticks_counts_rounds_before_merging_not_deliveries(store):
+    """`raw_ticks` 是合并前的可干预轮次数，不是投递数。
+
+    它 ÷ `total_events` 才是窗口重叠把样本量放大的倍数。旧实现写成
+    `raw_ticks = len(delivered)`，与 `total_deliveries` 恒等 —— 于是「19 轮合并成
+    1 个事件」这层信息在 JSON 里彻底看不见，读者只会看到两个相同的数字，
+    而它们看起来本可以互相校验。
+    """
+    first = _eval_row(store, T0, state="PASSIVE_CONSUMPTION")
+    for i in range(1, 19):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), state="PASSIVE_CONSUMPTION")
+    # 不可干预的轮次既不算事件、也不算轮次 —— 阈值测的是「进入被动消费了吗」。
+    _eval_row(store, T0 + timedelta(minutes=120), state="NORMAL", ent=5.0)
+    _receipt(store, at=T0, trigger_fullscreen=QUNS_ACCEPTS_NOTIFICATIONS,
+             action_id="walk5", evaluation_id=first)
+
+    timing = _timing(store)
+    assert timing.total_events == 1
+    assert timing.total_deliveries == 1
+    assert timing.raw_ticks == 19
+    assert timing.raw_ticks != timing.total_deliveries, "旧实现里这两个数恒等"
+
+
+def test_count_intervenable_rounds_matches_events_ticks(store):
+    """轮次数必须等于各事件 `ticks` 之和：两个数出自同一次切分。
+
+    各算一遍的后果是「19 轮合并成 1 个事件」与「19 轮合并成 2 个事件」能同时
+    出现在同一份报告里，而报表上并排的两个数字看起来能互相校验。
+    """
+    for i in range(4):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), state="PASSIVE_CONSUMPTION")
+    for i in range(2):
+        _eval_row(store, T0 + timedelta(minutes=90 + 5 * i),
+                  state="HIGH_RISK_PASSIVE_CONSUMPTION")
+
+    evaluations = store.list_evaluations()
+    events = queries.build_consumption_events(evaluations, gap_threshold_minutes=15)
+    rounds = queries.count_intervenable_rounds(
+        evaluations, gap_threshold_minutes=15
+    )
+    assert rounds == sum(e.ticks for e in events) == 6
+    assert len(events) == 2, "跨过关机的一段必须是两个事件"
+
+
 def test_consumption_events_split_on_a_continuity_gap_and_skip_non_intervenable(store):
     """跨过关机的一段不能算同一次消费；NORMAL / WATCH 不算消费。"""
     for i in range(4):
@@ -756,12 +822,7 @@ def test_action_timing_layers_use_only_the_main_cohort(store):
     _receipt(store, at=T0 + timedelta(minutes=1), trigger_fullscreen=QUNS_ACCEPTS_NOTIFICATIONS,
              action_id="stretch", evaluation_id=eid, channel="recording")
 
-    events = queries.build_consumption_events(
-        store.list_evaluations(), gap_threshold_minutes=15
-    )
-    timing = queries.build_action_timing_breakdown(
-        _cohort_rows(store), events, gap_threshold_minutes=15
-    )
+    timing = _timing(store)
     assert [layer.action_id for layer in timing.layers] == ["walk5"]
     assert timing.total_deliveries == 1
     assert timing.layers[0].valid_receipts == 1
@@ -785,12 +846,7 @@ def test_action_timing_layers_carry_days_events_and_missing_receipts(store):
     # 另一天的一次投递，回执还没结算。
     _insert_intervention(store, eid2, at=day2, action_id="walk5", response=None)
 
-    events = queries.build_consumption_events(
-        store.list_evaluations(), gap_threshold_minutes=15
-    )
-    timing = queries.build_action_timing_breakdown(
-        _cohort_rows(store), events, gap_threshold_minutes=15
-    )
+    timing = _timing(store)
     layer = timing.layers[0]
     assert timing.total_deliveries == 3, "分母是真实投递，含 no_data 与未结算"
     assert timing.total_events == 2
@@ -812,10 +868,7 @@ def test_action_timing_layers_are_sorted_stably(store):
         _receipt(store, at=T0 + timedelta(minutes=len(action_id)), trigger_fullscreen=5,
                  action_id=action_id, evaluation_id=eid)
 
-    events = ()
-    timing = queries.build_action_timing_breakdown(
-        _cohort_rows(store), events, gap_threshold_minutes=15
-    )
+    timing = _timing(store, events=())
     assert [layer.action_id for layer in timing.layers] == [
         "calligraphy", "stretch", "walk5"
     ]

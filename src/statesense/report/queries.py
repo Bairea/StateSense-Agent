@@ -565,20 +565,19 @@ def build_receipt_audit(rows: Sequence[Any]) -> ReceiptAudit:
     )
 
 
-def build_consumption_events(
+def _intervenable_runs(
     evaluations: Sequence[Any], *, gap_threshold_minutes: float
-) -> tuple[ConsumptionEvent, ...]:
-    """把连续可干预的评估轮次合并成消费事件。
-
-    **为什么必须在 report 里做这件事**：判定按五分钟一轮、窗口回看 60 分钟，
-    所以同一次被动消费会被反复评估十几次。把每个轮次当一个样本，会把
-    「今晚刷了 1 次」读成「有 19 个样本」—— 样本量被窗口重叠凭空放大，
-    而所有比例与均值都建立在这个分母上。
+) -> list[list[Any]]:
+    """把评估行按「连续可干预」切成若干段。**可干预轮次的唯一判定处。**
 
     合并条件是两件事同时成立：状态可干预，且与上一轮的间隔不超过
     `gap_threshold_minutes`（与缺口视图同一个阈值：跨过关机的一段不能被算成
     同一次消费）。状态与间隔缺一不可 —— 只看状态的相同会把两段时间上不连续的
     行为合并，算出来的「事件时长」就没有意义。
+
+    段数与段内轮次数都由这里给出：事件数（段数）与合并前轮次数（段内行数之和）
+    必须出自同一次切分，各算一遍就会出现「19 轮合并成 1 个事件」与
+    「19 轮合并成 2 个事件」并存。
     """
     runs: list[list[Any]] = []
     for row in evaluations:
@@ -591,9 +590,38 @@ def build_consumption_events(
             runs[-1].append(row)
         else:
             runs.append([row])
+    return runs
 
+
+def count_intervenable_rounds(
+    evaluations: Sequence[Any], *, gap_threshold_minutes: float
+) -> int:
+    """合并前的可干预轮次数。与 `build_consumption_events` 的段数配对使用。
+
+    两者之比就是「样本量被窗口重叠放大了几倍」—— 判定按五分钟一轮、窗口回看
+    60 分钟，同一次消费会被评估十几次，不把这个倍数摆在报表里，读者会把
+    「19 轮」当成 19 次独立观察。
+    """
+    runs = _intervenable_runs(evaluations, gap_threshold_minutes=gap_threshold_minutes)
+    return sum(len(run) for run in runs)
+
+
+def build_consumption_events(
+    evaluations: Sequence[Any], *, gap_threshold_minutes: float
+) -> tuple[ConsumptionEvent, ...]:
+    """把连续可干预的评估轮次合并成消费事件。
+
+    **为什么必须在 report 里做这件事**：判定按五分钟一轮、窗口回看 60 分钟，
+    所以同一次被动消费会被反复评估十几次。把每个轮次当一个样本，会把
+    「今晚刷了 1 次」读成「有 19 个样本」—— 样本量被窗口重叠凭空放大，
+    而所有比例与均值都建立在这个分母上。
+
+    切分规则见 `_intervenable_runs`；本函数只负责把每一段写成事件。
+    """
     events: list[ConsumptionEvent] = []
-    for run in runs:
+    for run in _intervenable_runs(
+        evaluations, gap_threshold_minutes=gap_threshold_minutes
+    ):
         peak = max((r["state"] for r in run), key=_STATE_RANK.__getitem__)
         events.append(
             ConsumptionEvent(
@@ -637,6 +665,7 @@ def build_action_timing_breakdown(
     rows: Sequence[Any],
     events: Sequence[ConsumptionEvent],
     *,
+    raw_ticks: int,
     gap_threshold_minutes: float,
 ) -> ActionTimingBreakdown:
     """动作 × 时机的联合分层（阶段 2.3）。
@@ -649,6 +678,10 @@ def build_action_timing_breakdown(
     计划 2.3 明确要求「低样本层只列数据，不给最佳动作排名」—— 之所以要这么克制，
     是因为同一消费事件内的多次提醒不是独立观察，排序得到的「最佳」可能只反映
     「谁恰好被分给了那一次长长的消费」。
+
+    `raw_ticks` 是**合并前的可干预轮次数**，由 `count_intervenable_rounds` 给出。
+    它与 `total_events` 的比值就是窗口重叠把样本量放大的倍数：报表必须同时给出
+    这两个数，否则「19」会被读成 19 次独立观察。
     """
     grouped: dict[tuple[str, str, bool, str, str], list[Any]] = {}
     for row in rows:
@@ -721,7 +754,7 @@ def build_action_timing_breakdown(
             {_local_day(r["at"]) for r in delivered}
         ),
         layers=tuple(layers),
-        raw_ticks=len(delivered),
+        raw_ticks=raw_ticks,
     )
 
 
