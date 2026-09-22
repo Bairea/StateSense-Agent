@@ -13,7 +13,7 @@ from statesense.intervention.models import Decision, dump_gate_trace
 from statesense.outcome.models import OutcomeVerdict
 from statesense.state.models import StateVerdict
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 #: 运行事件的封闭枚举。写入未知类型必须报错 —— 与 gate.enabled 的处理同一原则：
@@ -40,6 +40,10 @@ def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
 class DueIntervention:
     id: int
     at: datetime
+    #: 触发这条干预的评估行。回执要按「干预发生时那一轮的证据」来算，
+    #: 而全屏取值、ent 都在那一行里 —— 不带它出来，回执只能去问当下，
+    #: 那就成了用今天的全屏状态解释昨天的窗口（阶段 2.2 要修的正是这个）。
+    evaluation_id: int
 
 
 class Store:
@@ -85,6 +89,12 @@ class Store:
         # 通道本来就在 DeliveryResult 上，只是过去没有被落库。
         if "channel" not in _column_names(self._conn, "interventions"):
             self._conn.execute("ALTER TABLE interventions ADD COLUMN channel TEXT")
+        # v6 → v7：evaluations 增加 rule_version（判定规则标识）。
+        # 旧行留 NULL = 「版本未知」。**不回填成当前版本** —— 那时的判定是用
+        # 当时的规则做的，填上今天的版本等于伪造历史，而跨版本比较正是靠这一列
+        # 分组；一行错标就能把两套规则混成一份样本。
+        if "rule_version" not in _column_names(self._conn, "evaluations"):
+            self._conn.execute("ALTER TABLE evaluations ADD COLUMN rule_version TEXT")
 
     def user_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -100,16 +110,29 @@ class Store:
         ).fetchone()
         return row["state"] if row else None
 
-    def insert_evaluation(self, at: datetime, verdict: StateVerdict, decision: Decision) -> int:
+    def insert_evaluation(
+        self,
+        at: datetime,
+        verdict: StateVerdict,
+        decision: Decision,
+        *,
+        rule_version: str,
+    ) -> int:
+        """`rule_version` 与被记录的事实同列，因此不给默认值、且强制写成关键字。
+
+        一个「忘了传就取当前版本」的默认值，会在有人写第二处调用点时悄悄生效，
+        而后果是历史行被贴上错误的规则版本 —— 跨版本比较随即失真，
+        且从数据上查不出来。这与 `channel` 当初的处理是同一个原则。
+        """
         trace = dump_gate_trace(decision.gate_trace)
         with self._conn:
             cur = self._conn.execute(
                 """
                 INSERT INTO evaluations (
                   at, window_minutes, total_active_minutes, ent_minutes, gray_minutes,
-                  work_minutes, ent_ratio, entries_minutes, fullscreen_state, state, late_night,
-                  data_status, skipped, prev_state, decision, gate_trace
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  work_minutes, ent_ratio, entries_minutes, fullscreen_state, rule_version,
+                  state, late_night, data_status, skipped, prev_state, decision, gate_trace
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _iso(at),
@@ -121,6 +144,7 @@ class Store:
                     verdict.ent_ratio,
                     verdict.entries_minutes,
                     verdict.fullscreen_state,
+                    rule_version,
                     str(verdict.state),
                     int(verdict.late_night),
                     verdict.data_status,
@@ -241,7 +265,7 @@ class Store:
     def due_interventions(self, now: datetime) -> list[DueIntervention]:
         rows = self._conn.execute(
             """
-            SELECT i.id AS id, i.at AS at
+            SELECT i.id AS id, i.at AS at, i.evaluation_id AS evaluation_id
             FROM interventions i
             LEFT JOIN outcomes o ON o.intervention_id = i.id
             WHERE o.intervention_id IS NULL AND i.outcome_due_at <= ?
@@ -249,7 +273,10 @@ class Store:
             """,
             (_iso(now),),
         ).fetchall()
-        return [DueIntervention(id=r["id"], at=_parse(r["at"])) for r in rows]
+        return [
+            DueIntervention(id=r["id"], at=_parse(r["at"]), evaluation_id=r["evaluation_id"])
+            for r in rows
+        ]
 
     def last_intervention_at(self) -> datetime | None:
         row = self._conn.execute(

@@ -144,10 +144,39 @@ def build_liveness(
     )
 
 
+#: 规则版本缺失（迁移前写入的行）。与 `fullscreen_states` 的 unknown 同一约定：
+#: 「未知」要能与任何一个真实取值区分开，混成一个数就再也答不上「这些行是哪套规则判的」。
+UNKNOWN_VERSION = "unknown"
+
+
+def group_by_rule_version(
+    evaluations: Sequence[Any],
+) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    """按判定规则版本把评估行分组，`unknown` 始终单独一组并排在最后。
+
+    跨版本比较（阶段 1.3）的第一步就是这一步：分类清单与阈值改了之后，
+    历史行不会变，也读不出当时用的是哪套规则 —— 只有这个标识能分。
+    两个版本的行混在一起算「同一批样本」，得出的差异既可能是阈值造成的，
+    也可能是规则本身换了，而数据里分辨不出来。
+
+    排序刻意稳定（已知版本按键升序、unknown 殿后），否则分组结果的顺序会随
+    字典遍历顺序漂移，测试与报告的对比都无从谈起。
+    """
+    groups: dict[str, list[Any]] = defaultdict(list)
+    for row in evaluations:
+        groups[row["rule_version"] or UNKNOWN_VERSION].append(row)
+    known = sorted((name, rows) for name, rows in groups.items() if name != UNKNOWN_VERSION)
+    tail = (
+        [(UNKNOWN_VERSION, groups[UNKNOWN_VERSION])] if UNKNOWN_VERSION in groups else []
+    )
+    return tuple((name, tuple(rows)) for name, rows in [*known, *tail])
+
+
 def build_verdict_breakdown(evaluations: Sequence[Any]) -> VerdictBreakdown:
     states: Counter[str] = Counter()
     statuses: Counter[str] = Counter()
     fullscreen: Counter[str] = Counter()
+    versions: Counter[str] = Counter()
     skipped = late_night = entries_unknown = 0
     for row in evaluations:
         states[row["state"]] += 1
@@ -159,6 +188,7 @@ def build_verdict_breakdown(evaluations: Sequence[Any]) -> VerdictBreakdown:
         # 「明细缺失」是**值**层面的问题（见下面的 entries_unknown），不是列层面的。
         value = row["fullscreen_state"]
         fullscreen["unknown" if value is None else str(value)] += 1
+        versions[row["rule_version"] or UNKNOWN_VERSION] += 1
         skipped += int(row["skipped"])
         late_night += int(row["late_night"])
         # 报了活跃却没有任何条目明细：这些轮次上漏判视图无法判定。
@@ -174,6 +204,7 @@ def build_verdict_breakdown(evaluations: Sequence[Any]) -> VerdictBreakdown:
         skipped=skipped,
         late_night=late_night,
         fullscreen_states=_ranked(fullscreen),
+        rule_versions=_ranked(versions),
         entries_unknown=entries_unknown,
     )
 

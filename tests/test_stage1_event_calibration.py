@@ -19,9 +19,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -33,7 +30,6 @@ from statesense.config import (
     GATE_RATIO_MIN,
     GATE_STATE_MIN,
     Config,
-    TaxonomyConfig,
     ThresholdConfig,
 )
 from statesense.intervention.decider import decide
@@ -47,6 +43,7 @@ from statesense.perception import (
 )
 from statesense.state.engine import classify
 from statesense.state.models import State, StateVerdict
+from statesense.rulebook import version_of
 from statesense.state.taxonomy import Category, classify as classify_entry
 
 #: 本地正午起点。与回放剧本同款取法，避免样本在不同时区滑进 late_night。
@@ -365,56 +362,6 @@ def consumption_events(evals: Sequence[Evaluation], gap_minutes: float = GAP) ->
     return _merge_runs(evals, predicate=_is_consuming, gap_minutes=gap_minutes)
 
 
-# ── 任务 1.1：规则版本标识（生成方式原型，未落库）────────────────────
-
-#: 提权语义的手写标记。`effective_entertainment_minutes` 的**语义**改动无法从
-#: 配置里看出来（它写在代码里），所以必须留一个人工开关：谁改了提权规则，
-#: 谁就得改这一行，否则版本号不会变，跨版本比较会静默混算。
-PROMOTION_RULE = "OTHER->ENTERTAINMENT@effective_entertainment_minutes"
-
-
-def rule_version(
-    taxonomy: TaxonomyConfig,
-    thresholds: ThresholdConfig,
-    *,
-    gaming_states: Iterable[int] = GAMING_STATES,
-    promotion: str = PROMOTION_RULE,
-) -> str:
-    """分类清单 + 阈值 + 全屏规则 → 稳定的短标识。
-
-    计划 1.1 要求「在实现前确定稳定生成方式」，这里就是那个方式的原型。
-    三条性质各有代价与理由：
-
-      · **只取模式文本，不取 flags** —— flags 目前恒为 IGNORECASE，多带一层会让
-        版本号随无关实现细节漂移；
-      · **清单排序后参与** —— 分类是「任一命中」，清单顺序不改变语义，
-        不排序的话调一下书写顺序就会换版本号；
-      · **阈值按数值参与，不按文本** —— `20` 与 `20.0` 是同一个阈值的两种写法。
-
-    落库形态（`evaluations` 新增一列、旧行留 NULL）属于 schema 变更，需要单独批准；
-    本函数只负责生成，不碰数据库。
-    """
-    payload = {
-        "entertainment": sorted(p.pattern for p in taxonomy.entertainment),
-        "gray": sorted(p.pattern for p in taxonomy.gray),
-        "work": sorted(p.pattern for p in taxonomy.work),
-        "watchers": [
-            float(thresholds.watch_minutes),
-            float(thresholds.passive_minutes),
-            float(thresholds.high_risk_minutes),
-        ],
-        "late_night": [
-            int(thresholds.late_night_start_hour),
-            int(thresholds.late_night_end_hour),
-            float(thresholds.late_night_min_active_minutes),
-        ],
-        "gaming_states": sorted(int(s) for s in gaming_states),
-        "promotion": promotion,
-    }
-    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
-
-
 # ── 任务 1.3：候选阈值比较 ──────────────────────────────────────────
 
 
@@ -564,6 +511,19 @@ def test_current_config_on_the_synthetic_day(config: Config, day_ticks):
     assert metrics.labels[1].startswith("窗口化打游戏")
 
 
+def test_each_candidate_carries_its_own_rule_version(config: Config):
+    """候选阈值各自是一套规则，因此各有各的版本号 —— 两者的样本不可混算。
+
+    这条把阶段 1.1 落库的那一列与阶段 1.3 的比较接起来：库里两批行的版本号不同，
+    它们就不是同一批样本。真实数据到位后，比较的第一步就是按这一列分组，
+    而不是先算出一个跨版本的均值。
+    """
+    versions = {candidate.name: version_of(candidate.apply(config)) for candidate in CANDIDATES}
+    assert versions["current"] == version_of(config)
+    assert versions["eager"] != versions["current"]
+    assert len(set(versions.values())) == len(CANDIDATES)
+
+
 def test_no_threshold_candidate_rescues_a_classification_miss(config: Config, day_ticks):
     """阈值调不动分类漏判 —— 这条结论不依赖真实数据，它是口径的性质。
 
@@ -658,42 +618,3 @@ def test_every_candidate_keeps_high_risk_reachable_and_state_min_intact(config: 
             if r.name == GATE_STATE_MIN
         )
         assert gate.passed is False, f"{candidate.name}: 低阈值把 state_min 绕过了"
-
-
-# ── 任务 1.1：规则版本 ──────────────────────────────────────────────
-
-
-def test_rule_version_is_stable_and_order_insensitive(config: Config):
-    """同一套规则 → 同一版本号；清单书写顺序不改变语义，因此也不该改变版本号。"""
-    base = rule_version(config.taxonomy, config.thresholds)
-    assert base == rule_version(config.taxonomy, config.thresholds)
-    assert len(base) == 12 and all(c in "0123456789abcdef" for c in base)
-
-    shuffled = TaxonomyConfig(
-        entertainment=tuple(reversed(config.taxonomy.entertainment)),
-        gray=tuple(reversed(config.taxonomy.gray)),
-        work=tuple(reversed(config.taxonomy.work)),
-    )
-    assert rule_version(shuffled, config.thresholds) == base
-
-
-def test_rule_version_distinguishes_all_three_layers(config: Config):
-    """版本至少要能区分分类清单、阈值、全屏规则的改变（计划 1.1 原文）。
-
-    只区分其中两层是不够的：阶段 1.4 要「一次只上线一组规则变更」，若两类变更
-    共用一个版本号，「这次变好是因为改了哪一类」就永远答不上来。
-    """
-    base = rule_version(config.taxonomy, config.thresholds)
-
-    with_new_pattern = TaxonomyConfig(
-        entertainment=config.taxonomy.entertainment,
-        gray=config.taxonomy.gray,
-        work=tuple(config.taxonomy.work) + (re.compile("brotato", re.IGNORECASE),),
-    )
-    assert rule_version(with_new_pattern, config.thresholds) != base
-
-    assert rule_version(
-        config.taxonomy, replace(config.thresholds, passive_minutes=45)
-    ) != base
-    assert rule_version(config.taxonomy, config.thresholds, gaming_states=(3,)) != base
-    assert rule_version(config.taxonomy, config.thresholds, promotion="ANY->ENTERTAINMENT") != base

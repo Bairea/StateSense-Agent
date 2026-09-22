@@ -24,7 +24,7 @@ def store(tmp_path):
 # ── schema 版本与迁移 ───────────────────────────────────────
 
 def test_user_version_is_current(store):
-    assert store.user_version() == 6
+    assert store.user_version() == 7
 
 
 def test_entries_minutes_column_exists(store):
@@ -118,7 +118,7 @@ def test_v3_database_upgrades_in_place(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 6
+    assert s.user_version() == 7
 
     columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(evaluations)")}
     assert "entries_minutes" in columns

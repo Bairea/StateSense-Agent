@@ -146,6 +146,17 @@ def _verdict_lines(data: ReportData) -> list[str]:
     lines.append(f"  late_night  {v.late_night}（{v.late_night / total:.1%}）" if total else "  late_night  0")
     lines.append(f"  全屏信号    {_pairs_pct(v.fullscreen_states, total)}")
     lines.append("              （2/3=判为游戏；1/4/5/6/7=未判为游戏；unknown=无法判定）")
+    lines.append(f"  规则版本    {_pairs_pct(v.rule_versions, total)}")
+    # 分类清单与阈值不落在结果行里，所以「这些样本是哪套规则判的」只能从这一档读。
+    # 混读的后果不是误差，是把两次变更的效果算成一次 —— 必须写在报告里，
+    # 而不是留给读者去猜。
+    if any(name == "unknown" for name, _ in v.rule_versions):
+        lines.append("              （unknown=迁移前写入的行，规则版本未知，不能当作某一版）")
+    if len(v.rule_versions) > 1:
+        lines.append(
+            "              ⚠ 区间内跨规则版本：逐条结论必须先按版本分组，"
+            "否则「阈值调优的效果」与「规则换了」分辨不出来"
+        )
     # 这是视图 5 的盲区，必须写在判定面上：它决定了「漏判结论覆盖了多少轮」。
     if v.entries_unknown:
         lines.append(

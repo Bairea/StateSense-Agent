@@ -141,7 +141,7 @@ def test_report_survives_a_gbk_only_stdout(make_config, tmp_path):
         intervene=False, action_id=None, reason="t",
         gate_trace=(GateResult("ratio_min", False, 0.7, 0.75),),
     )
-    store.insert_evaluation(T0, verdict, decision)
+    store.insert_evaluation(T0, verdict, decision, rule_version="t")
     with store._conn:
         store._conn.execute(
             "UPDATE evaluations SET gate_trace = 'not json' WHERE at = ?",
@@ -179,6 +179,7 @@ def _leak_anchor_row(store, at):
     store.insert_evaluation(
         at, verdict,
         Decision(intervene=False, action_id=None, reason="t", gate_trace=()),
+        rule_version="t",
     )
 
 
@@ -393,7 +394,8 @@ def test_log_startup_records_what_is_running(config, caplog):
     assert "常驻启动" in text
     assert f"pid={os.getpid()}" in text
     assert "分支=" in text          # 曾经从错误分支起过 daemon，分支必须可见
-    assert "schema=v6" in text
+    assert "schema=v7" in text
+    assert "规则版本=" in text  # 判定规则换了没有，启动行要能看见
     assert "recording(dry-run)" in text
     assert config.screenpipe.base_url in text
 
