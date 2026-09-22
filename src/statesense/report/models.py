@@ -143,6 +143,48 @@ class OutcomeBreakdown:
 
 
 @dataclass(frozen=True)
+class CohortLayer:
+    """一批干预里的一层。各层互斥，相加等于干预总数。
+
+    分层的用途是**把不能进主分析的记录挑出来并说清原因**，而不是把它们删掉：
+    「排练 2 次、通道未知 3 次」这种话本身就是要看的运行事实。
+    """
+
+    name: str
+    reason: str
+    interventions: int
+    user_responses: tuple[tuple[str, int], ...]
+    outcomes: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class CohortBreakdown:
+    """真实干预的同一批记录（阶段 2.1）。
+
+    与 `OutcomeBreakdown` 的区别：那个按用户回应分层，回答「按了按钮的结果如何」；
+    这个按**能否作为效果证据**分层，回答「分母里到底有几次是真的弹了窗、真的收到了
+    可用的回执」。前者会把排练与真实混在一起 —— 那正是这一版要修的口径问题。
+    """
+
+    total: int
+    layers: tuple[CohortLayer, ...]
+    #: 主分析层：channel=foreground_popup 且 delivery_status=delivered 且有可用回执。
+    main_interventions: int
+    #: 主分析层跨越的自然日数。五分钟重叠窗口里同一次消费可以弹出多次，
+    #: 只看次数会把「一天里被提醒了很多次」读成「很多天的证据」。
+    main_days: tuple[str, ...]
+    #: 主分析层的触发规则版本分布。跨版本时主分析层内部也不能合并比较。
+    main_rule_versions: tuple[tuple[str, int], ...]
+    main_ent_before_mean: float | None
+    main_ent_after_mean: float | None
+    main_ent_before_median: float | None
+    main_ent_after_median: float | None
+    #: 区间起点之前投递、区间内才检查的回执。取数改成单一时间轴后这里应为 0；
+    #: 一旦非 0，说明又出现了两个时间轴拼分母的写法。
+    orphan_outcomes: int
+
+
+@dataclass(frozen=True)
 class LeakAnchor:
     at: datetime
     total_active_minutes: float
@@ -203,6 +245,8 @@ class ReportData:
     gates: GateBreakdown
     interventions: InterventionBreakdown
     outcomes: OutcomeBreakdown
+    #: 效果分析的分母（阶段 2.1）：同一批干预、按能否作为证据分层。
+    cohort: CohortBreakdown
     leaks: tuple[LeakAnchor, ...]
     trace: tuple[TraceRow, ...]
     #: 二级漏判视图的回查结果（窗口标题只在这里出现，绝不落库）。可能为空。

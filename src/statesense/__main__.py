@@ -311,6 +311,10 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
         run_events = store.list_run_events(since=since)
         interventions = store.list_interventions(since=since)
         outcomes = store.list_outcomes(since=since)
+        # 效果分析取的是**同一批干预**：一条干预一行，带上回执与触发时那一轮评估，
+        # 过滤轴只有干预发生时刻一个。视图 3/4 仍读上面两条原始表（运行事实），
+        # 这一份只服务于「哪些记录能当效果证据」。
+        cohort_rows = store.list_intervention_cohort(since=since)
 
         gates = queries.build_gate_breakdown(evaluations)
         data = ReportData(
@@ -332,6 +336,7 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
             # 只能有一个来源。
             interventions=queries.build_intervention_breakdown(interventions, gates),
             outcomes=queries.build_outcome_breakdown(outcomes, interventions),
+            cohort=queries.build_cohort_breakdown(cohort_rows),
             leaks=queries.find_leak_anchors(
                 evaluations,
                 min_active_minutes=config.report.leak_min_active_minutes,

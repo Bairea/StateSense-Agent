@@ -22,6 +22,8 @@ from statesense.config import (
 )
 from statesense.intervention.models import first_failed, parse_gate_trace
 from statesense.report.models import (
+    CohortBreakdown,
+    CohortLayer,
     ContinuityGap,
     GateBlock,
     GateBreakdown,
@@ -334,6 +336,131 @@ def build_outcome_breakdown(
         ent_after_mean=round(statistics.fmean(after), 2) if after else None,
         ent_before_median=round(statistics.median(before), 2) if before else None,
         ent_after_median=round(statistics.median(after), 2) if after else None,
+    )
+
+
+#: 分层名。封闭枚举写在这里，渲染层与测试引用同一批字面量 ——
+#: 各写各的拼法正是「报告里少了一层而没人发现」的土壤。
+COHORT_MAIN = "main"
+COHORT_RECORDING = "recording"
+COHORT_CHANNEL_UNKNOWN = "channel_unknown"
+COHORT_UNDELIVERED = "undelivered"
+COHORT_MISSING_OUTCOME = "missing_outcome"
+COHORT_NO_DATA = "no_data"
+
+#: 主分析口径的准入条件，以「为什么不能进主分析」的形式写全 —— 判据只有一个方向，
+#: 多出来的东西必然是被某一条理由挡住的。
+COHORT_LAYER_NAMES: tuple[str, ...] = (
+    COHORT_MAIN,
+    COHORT_RECORDING,
+    COHORT_CHANNEL_UNKNOWN,
+    COHORT_UNDELIVERED,
+    COHORT_MISSING_OUTCOME,
+    COHORT_NO_DATA,
+)
+
+_COHORT_REASONS: dict[str, str] = {
+    COHORT_MAIN: "真实弹出 + 已投递 + 有可用回执，计入效果分析",
+    COHORT_RECORDING: "--dry-run 的排练，不是真实投递",
+    COHORT_CHANNEL_UNKNOWN: "迁移前写入的行，投递通道未知",
+    COHORT_UNDELIVERED: "投递未成功，用户根本没看到",
+    COHORT_MISSING_OUTCOME: "回执尚未结算（未到期或进程没跑到）",
+    COHORT_NO_DATA: "回执取不到数，不是「没影响」",
+}
+
+
+def cohort_layer(row: Any) -> str:
+    """一条干预属于哪一层。**恰好一层**，判定按下面的顺序短路。
+
+    顺序是刻意的，每一跳都有具体理由：
+      1. 通道未知 → 不知道它是不是排练，谈不上效果；
+      2. 排练（channel 不是 foreground_popup）→ 没人看见，谈不上效果；
+      3. 投递未成功 → 同上；
+      4. 没有回执行 → 还没到期，或者进程没跑到那一刻；
+      5. 回执是 `no_data` → 取不到数，按「无结论」处理，不进均值；
+      6. 其余才是主分析。
+
+    先判通道再判投递，是因为「排练 + delivered」的组合是常态（排练本来就返回
+    delivered）；倒过来判会让大量排练落进 `undelivered` 之外的层里，
+    分母看起来对了，含义已经错了。
+    """
+    channel = row["channel"]
+    if channel is None:
+        return COHORT_CHANNEL_UNKNOWN
+    if channel != "foreground_popup":
+        return COHORT_RECORDING
+    if row["delivery_status"] != "delivered":
+        return COHORT_UNDELIVERED
+    outcome = row["outcome"]
+    if outcome is None:
+        return COHORT_MISSING_OUTCOME
+    if outcome == "no_data":
+        return COHORT_NO_DATA
+    return COHORT_MAIN
+
+
+def build_cohort_breakdown(rows: Sequence[Any]) -> CohortBreakdown:
+    """把同一批干预切成互斥的层，并给出主分析层的分母与前后娱乐。
+
+    取数由 `Store.list_intervention_cohort` 完成，且**只按干预发生时刻过滤**。
+    之前 report 用两个时间轴拼分母（干预按 `at`、回执按 `checked_at`），
+    于是「区间起点前投递、区间内检查」的回执进得来、对应干预进不来，
+    报告里凭空多出一层 `orphan` —— 那不是数据脏，是口径错。这里把这类行
+    单独数出来（正常应为 0），以免同样的写法再长回来。
+
+    各层计数相加必须等于干预总数。这不是巧合而是不变式：`cohort_layer` 是
+    一个全定义函数，每条干预恰好落一层；哪里少算了，下面这行断言会当场炸，
+    而不是让分母悄悄变小。
+    """
+    counts: dict[str, int] = {name: 0 for name in COHORT_LAYER_NAMES}
+    outcomes: dict[str, Counter[str]] = {name: Counter() for name in COHORT_LAYER_NAMES}
+    responses: dict[str, Counter[str]] = {name: Counter() for name in COHORT_LAYER_NAMES}
+    days: set[str] = set()
+    versions: Counter[str] = Counter()
+    before: list[float] = []
+    after: list[float] = []
+    orphan = 0
+
+    for row in rows:
+        layer = cohort_layer(row)
+        counts[layer] += 1
+        responses[layer][row["user_response"] or NO_RESPONSE] += 1
+        if row["outcome"] is not None:
+            outcomes[layer][row["outcome"]] += 1
+        if layer != COHORT_MAIN:
+            continue
+        days.add(_parse(row["at"]).astimezone().date().isoformat())
+        versions[row["eval_rule_version"] or UNKNOWN_VERSION] += 1
+        before.append(row["ent_before"])
+        after.append(row["ent_after"])
+        # 主分析层的行必然有回执；拿到行却没有检查时刻，说明取数又漏了关联。
+        if row["outcome_checked_at"] is None:
+            orphan += 1
+
+    layers = tuple(
+        CohortLayer(
+            name=name,
+            reason=_COHORT_REASONS[name],
+            interventions=counts[name],
+            user_responses=_ranked(responses[name]),
+            outcomes=_ranked(outcomes[name]),
+        )
+        for name in COHORT_LAYER_NAMES
+    )
+    total = sum(layer.interventions for layer in layers)
+    assert total == len(rows), f"分层计数 {total} 与干预总数 {len(rows)} 不一致"
+
+    return CohortBreakdown(
+        total=len(rows),
+        layers=layers,
+        main_interventions=len(before),
+        main_days=tuple(sorted(days)),
+        main_rule_versions=_ranked(versions),
+        main_ent_before_mean=round(statistics.fmean(before), 2) if before else None,
+        main_ent_after_mean=round(statistics.fmean(after), 2) if after else None,
+        main_ent_before_median=round(statistics.median(before), 2) if before else None,
+        main_ent_after_median=round(statistics.median(after), 2) if after else None,
+        orphan_outcomes=orphan,
     )
 
 

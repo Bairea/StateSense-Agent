@@ -12,7 +12,7 @@ from statesense.__main__ import (
     main,
 )
 from statesense.config import ConfigError
-from statesense.report.render import LEAK_VIEW, VIEW_IDS
+from statesense.report.render import COHORT_VIEW, LEAK_VIEW, VIEW_IDS
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
 
@@ -83,9 +83,14 @@ def test_requested_views_expands_all():
 
 
 def test_view_ids_cover_the_specs_documented_set():
-    """spec §11 写的是 `all|0,1,2,3,4,5`，一个都不能少。"""
-    assert VIEW_IDS == ("0", "1", "2", "3", "4", "5")
+    """spec §11 的 0–5 一个都不能少；阶段 2 起在其后追加新视图。
+
+    只锁前缀而不是整串：新增视图是常态，但**改动既有编号**会让所有历史
+    调用与文档一起失效，那才是要挡住的事。
+    """
+    assert VIEW_IDS[:6] == ("0", "1", "2", "3", "4", "5")
     assert LEAK_VIEW in VIEW_IDS
+    assert COHORT_VIEW in VIEW_IDS
 
 
 def test_unknown_view_id_is_rejected_not_ignored():
