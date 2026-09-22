@@ -315,6 +315,11 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
         # 过滤轴只有干预发生时刻一个。视图 3/4 仍读上面两条原始表（运行事实），
         # 这一份只服务于「哪些记录能当效果证据」。
         cohort_rows = store.list_intervention_cohort(since=since)
+        # 消费事件由评估行合并而来：判定按五分钟一轮，同一次消费会被评估十几次，
+        # 按轮次当样本会把样本量凭空放大十几倍（阶段 2.3 的「避免伪样本量」）。
+        events = queries.build_consumption_events(
+            evaluations, gap_threshold_minutes=config.report.gap_threshold_minutes
+        )
 
         gates = queries.build_gate_breakdown(evaluations)
         data = ReportData(
@@ -337,6 +342,12 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
             interventions=queries.build_intervention_breakdown(interventions, gates),
             outcomes=queries.build_outcome_breakdown(outcomes, interventions),
             cohort=queries.build_cohort_breakdown(cohort_rows),
+            receipt_audit=queries.build_receipt_audit(cohort_rows),
+            timing=queries.build_action_timing_breakdown(
+                cohort_rows,
+                events,
+                gap_threshold_minutes=config.report.gap_threshold_minutes,
+            ),
             leaks=queries.find_leak_anchors(
                 evaluations,
                 min_active_minutes=config.report.leak_min_active_minutes,

@@ -185,6 +185,101 @@ class CohortBreakdown:
 
 
 @dataclass(frozen=True)
+class ReceiptAuditStratum:
+    """按**触发那一刻的全屏取值**分层的一档回执。
+
+    这是阶段 2.2 的审计口径：全屏提权只作用于未归类条目，所以「触发时正在全屏
+    游戏」的那一类回执，其前侧娱乐分钟最容易受历史全屏取值影响 ——
+    修好之前它们会被按当下的取值重算，游戏退出时 ent_before 偏低甚至清零。
+    """
+
+    name: str
+    description: str
+    receipts: int
+    no_data: int
+    outcomes: tuple[tuple[str, int], ...]
+    #: 看起来「变好」的回执（ent_after <= ent_before）。数字本身不作因果解读：
+    #: 游戏退出、用户离开电脑都会让它变大。
+    after_not_worse: int
+    ent_before_mean: float | None
+    ent_after_mean: float | None
+
+
+@dataclass(frozen=True)
+class ReceiptAudit:
+    """回执口径审计（阶段 2.2）。
+
+    审计的是**取数口径**，不是效果：`ent_before` 与 `ent_after` 由同一段代码、
+    同一套提权规则算出，通道与排练与否都不改变它。所以这里刻意不再按通道分层 ——
+    要做效果结论请用视图 6 的主分析层。
+    """
+
+    total_receipts: int
+    strata: tuple[ReceiptAuditStratum, ...]
+    #: 触发时在全屏游戏中的回执总数与其中 no_data 的条数。
+    affected_receipts: int
+    affected_no_data: int
+
+
+@dataclass(frozen=True)
+class ConsumptionEvent:
+    """连续可干预轮次合并成的消费事件。**这是系统视角，不是人工标注。**
+
+    库里只有评估结果、没有标注，所以这里的「事件」= 状态处于可干预档的连续轮次。
+    它可以回答「这段时间是几次消费」，但不能替代「这几次是不是真的被动消费」。
+    """
+
+    start: datetime
+    end: datetime
+    ticks: int
+    #: 事件内出现过的最高状态（阶梯越高，事件越"深"）。
+    peak_state: str
+
+    @property
+    def minutes(self) -> float:
+        return (self.end - self.start).total_seconds() / 60
+
+
+@dataclass(frozen=True)
+class ActionTimingLayer:
+    """动作 × 时机的一层。每一层都同时给出分母与样本量的旁证。
+
+    低样本层**只列数据、不给排名**：轮次不是独立观察（五分钟重叠窗口里同一次
+    消费可以触发多次），层的排序因此不能当因果结论用。
+    """
+
+    action_id: str
+    state: str
+    late_night: bool
+    ent_bucket: str
+    hour_bucket: str
+    #: 该层的真实投递数（真的弹了窗：foreground_popup + delivered）。
+    #: 注意它**不等于**视图 6 的主分析口径：主分析还要求回执可用，
+    #: 因为均值不能被 no_data 污染；而「提醒了多少次」应当把它们算进去。
+    deliveries: int
+    #: 回执可用（非 no_data）与取不到数的条数，以及还没结算的条数。
+    valid_receipts: int
+    no_data: int
+    missing_receipts: int
+    #: 该层跨越的自然日数与落在几个消费事件里 —— 次数不等于证据量。
+    days: int
+    events: int
+    outcomes: tuple[tuple[str, int], ...]
+    ent_before_mean: float | None
+    ent_after_mean: float | None
+
+
+@dataclass(frozen=True)
+class ActionTimingBreakdown:
+    total_deliveries: int
+    total_events: int
+    total_days: int
+    layers: tuple[ActionTimingLayer, ...]
+    #: 事件被合并前的轮次数与事件数 —— 「按事件看」与「按轮次看」的差别写在这里。
+    raw_ticks: int
+
+
+@dataclass(frozen=True)
 class LeakAnchor:
     at: datetime
     total_active_minutes: float
@@ -247,6 +342,10 @@ class ReportData:
     outcomes: OutcomeBreakdown
     #: 效果分析的分母（阶段 2.1）：同一批干预、按能否作为证据分层。
     cohort: CohortBreakdown
+    #: 回执口径审计（阶段 2.2）：哪些回执的前侧证据容易受全屏切换影响。
+    receipt_audit: ReceiptAudit
+    #: 动作 × 时机（阶段 2.3）。分组用的行与视图 6 同源，只是换了个切法。
+    timing: ActionTimingBreakdown
     leaks: tuple[LeakAnchor, ...]
     trace: tuple[TraceRow, ...]
     #: 二级漏判视图的回查结果（窗口标题只在这里出现，绝不落库）。可能为空。

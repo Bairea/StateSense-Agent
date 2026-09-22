@@ -27,9 +27,11 @@ from statesense.report.models import (
 #: 视图编号的封闭枚举。`--views` 只接受这些值，未知编号在解析层就报错，
 #: 而不是被静默丢掉 —— 静默丢掉会让 `--views 5` 看起来「没输出」而不是「参数错了」。
 #: 6 起是阶段 2 新增：6=效果分母（分层与排除原因），7=动作×时机，8=回执口径审计。
-VIEW_IDS: tuple[str, ...] = ("0", "1", "2", "3", "4", "5", "6")
+VIEW_IDS: tuple[str, ...] = ("0", "1", "2", "3", "4", "5", "6", "7", "8")
 LEAK_VIEW = "5"
 COHORT_VIEW = "6"
+AUDIT_VIEW = "7"
+TIMING_VIEW = "8"
 #: `skipped` 占比到这个数就高亮：它高说明「看起来正常」是假的。
 SKIPPED_ALERT_RATIO = 0.2
 
@@ -273,6 +275,76 @@ def _cohort_lines(data: ReportData) -> list[str]:
     return lines
 
 
+def _audit_lines(data: ReportData) -> list[str]:
+    """视图 7：回执口径审计。
+
+    这一节不是效果结论，而是**口径体检**：按触发那一刻的全屏取值把回执分开，
+    看「游戏退出被读成干预有效」这一类失真有多大的面。修完前侧证据之后，
+    新行不再失真，但历史行不会改变 —— 所以两件事必须能分开看。
+    """
+    a = data.receipt_audit
+    lines = [
+        "回执口径审计（按触发那一刻的全屏取值分层，与通道无关）",
+        f"  有回执的干预 {a.total_receipts}",
+        "              （审计取数口径：前后两侧用的是同一段代码与同一套提权规则）",
+    ]
+    for stratum in a.strata:
+        lines.append(
+            f"    {stratum.name:<22} {stratum.receipts:>3} 条"
+            f"  no_data {stratum.no_data}"
+            f"  前后均值 {stratum.ent_before_mean} → {stratum.ent_after_mean}"
+        )
+        lines.append(f"      {stratum.description}")
+        if stratum.receipts:
+            lines.append(
+                f"      回执 {_pairs(stratum.outcomes)}    "
+                f"未变差（ent_after ≤ ent_before）{stratum.after_not_worse} 条"
+            )
+    if a.affected_receipts:
+        lines.append(
+            f"  ⚠ 其中 {a.affected_receipts} 条在触发时正处于全屏游戏"
+            f"（no_data {a.affected_no_data} 条）—— 这一类的前侧娱乐分钟最容易被"
+            "历史全屏取值误算，比较动作之前先把它们的占比写下来"
+        )
+    return lines
+
+
+def _timing_lines(data: ReportData) -> list[str]:
+    """视图 8：动作 × 时机。
+
+    刻意只给「次数 + 旁证」，不排序、不排名。计划 2.3 写明了原因：五分钟重叠
+    窗口里同一次消费会触发多次，层与层之间的排序差异无法归因到动作本身。
+    """
+    t = data.timing
+    lines = [
+        "动作 × 时机（分母为真实投递；低样本层只列数据，不作排名）",
+        f"  真实投递    {t.total_deliveries} 次",
+        f"  消费事件    {t.total_events} 个（同一事件内可能触发多次）",
+        f"  跨越自然日  {t.total_days} 天",
+    ]
+    if not t.layers:
+        lines.append("  （无）")
+        return lines
+    lines.append(
+        "  动作        状态                 深夜 触发ent    时段    投递 有效 无数据 未结算 天 事件 回执"
+    )
+    for layer in t.layers:
+        lines.append(
+            f"  {layer.action_id:<11} {layer.state:<20} {'是' if layer.late_night else '否':<4}"
+            f" {layer.ent_bucket:<9} {layer.hour_bucket:<7}"
+            f" {layer.deliveries:>4} {layer.valid_receipts:>4} {layer.no_data:>6}"
+            f" {layer.missing_receipts:>6} {layer.days:>3} {layer.events:>4}"
+            f"  {_pairs(layer.outcomes)}"
+        )
+    thin = [layer for layer in t.layers if layer.events <= 1]
+    if thin:
+        lines.append(
+            f"  注意：{len(thin)} 层的投递全部落在同一个消费事件内（或跨不过事件边界），"
+            "它们不是独立观察，不能据此说某个动作更好"
+        )
+    return lines
+
+
 def _leak_lines(data: ReportData) -> list[str]:
     lines = ["疑似漏判（这一轮有活动，但规则一条都没命中）"]
     for anchor in data.leaks:
@@ -340,6 +412,8 @@ def render_text(data: ReportData, *, views: Collection[str] = ()) -> str:
         "4": _outcome_lines,
         "5": _leak_lines,
         "6": _cohort_lines,
+        "7": _audit_lines,
+        "8": _timing_lines,
     }
     for key in VIEW_IDS:
         if key != "0" and key in views:
