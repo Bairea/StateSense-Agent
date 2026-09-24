@@ -50,9 +50,21 @@ timeout_seconds = 3
 C:\Users\baizhicong\.bun\bin\screenpipe.exe record --port 3131 --disable-audio
 ```
 
+**首次运行会弹「connect your AI: found Claude Code — add screenpipe MCP +
+supported skills? [Y/n]」**：按 `n` 回车（**默认是 Y**，直接回车就会接受）。
+这是 screenpipe 往检测到的 AI 工具里装集成的推广提示，与 StateSense 无关——
+daemon 直连 `http://localhost:3131` 的 REST API，不需要任何 MCP；且该工具的
+postinstall 有过遥测与提示注入前科（2026-09-22 实测），这类「帮你连接 AI」
+一律拒绝。
+
 验证：`uv run python -m statesense --check --config config/config.toml` 的
 `data_status` 变成 ok。若 recorder 在跑却仍 unreachable → token 可能失效，
 重跑 `screenpipe auth token` 并 `setx SCREENPIPE_LOCAL_API_KEY`。
+
+**计划任务的前瞻坑**：这个提示若在无交互终端的 ONLOGON 场景再次弹出，可能
+卡住后台任务。注册 `StateSense screenpipe` 任务后注销重登一次，检查
+`netstat -ano | findstr 3131` 有没有监听；卡住的话改用 `echo n| <record 命令>`
+或预置其配置文件（届时再定）。
 
 ## 第 3 步：自检（连 .env 完整性一起验）
 
