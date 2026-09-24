@@ -93,6 +93,14 @@ def test_view_ids_cover_the_specs_documented_set():
     assert COHORT_VIEW in VIEW_IDS
 
 
+#: 一定不存在的视图编号，从视图表派生而不是写死。
+#:
+#: 原先这里写的是字面量 "9" —— 阶段 3 把 9 变成真视图之后，这两条测试就从
+#: 「拒绝未知编号」变成了「接受已知编号」，而它们仍然会（以不同的方式）通过或
+#: 失败得莫名其妙。派生出来的值不受后续新增视图影响。
+UNKNOWN_VIEW = str(max(int(view) for view in VIEW_IDS) + 1)
+
+
 def test_unknown_view_id_is_rejected_not_ignored():
     """曾经 `--views 5` 被静默丢掉，用户看到的是空白，而不是「参数写错了」。
 
@@ -100,14 +108,14 @@ def test_unknown_view_id_is_rejected_not_ignored():
     而不是「这个编号不存在」的方向排查。
     """
     with pytest.raises(ConfigError, match="未知视图编号"):
-        _requested_views("1,9")
+        _requested_views(f"1,{UNKNOWN_VIEW}")
     with pytest.raises(ConfigError, match="未知视图编号"):
         _requested_views("abc")
 
 
 def test_unknown_view_id_exits_2_at_the_cli(make_config, tmp_path, capsys):
     _empty_migrated_db(tmp_path)
-    assert main(["--report", "--config", str(make_config()), "--views", "9"]) == 2
+    assert main(["--report", "--config", str(make_config()), "--views", UNKNOWN_VIEW]) == 2
     assert "未知视图编号" in capsys.readouterr().err
 
 
@@ -158,7 +166,11 @@ def test_report_survives_a_gbk_only_stdout(make_config, tmp_path):
     with open(out, "w", encoding="gbk") as fake_stdout, \
             redirect_stdout(fake_stdout):
         assert main([
-            "--report", "--config", str(make_config()), "--views", "2"
+            "--report", "--config", str(make_config()), "--views", "2",
+            # 数据钉在 T0，而默认的 7d 回看区间随日历滚动 —— 2026-09-23 起 T0
+            # 被滚出窗口，这两条测试就开始以「区间内无任何评估记录」失败。
+            # 区间锚定到数据本身，测试不再依赖「今天几号」。
+            "--since", (T0 - timedelta(days=1)).isoformat(),
         ]) == 0
     text = out.read_text(encoding="utf-8")
     assert "闸门数据损坏 1 轮" in text
@@ -234,6 +246,9 @@ def test_views5_from_screenpipe_output_is_golden(make_config, tmp_path, capsys, 
     assert main([
         "--report", "--config", str(make_config()),
         "--views", "5", "--from-screenpipe",
+        # 同 test_report_survives_a_gbk_only_stdout：锚点行来自按 since 过滤的
+        # 评估行，区间必须盖住 T0，否则金样例的明细整体缺席。
+        "--since", (T0 - timedelta(days=1)).isoformat(),
     ]) == 0
     out = capsys.readouterr().out
 
@@ -391,6 +406,7 @@ def test_log_startup_records_what_is_running(config, caplog):
     import os
 
     from statesense.__main__ import log_startup
+    from statesense.store.db import SCHEMA_VERSION
 
     with caplog.at_level(logging.INFO):
         log_startup(config, dry_run=True)
@@ -399,7 +415,7 @@ def test_log_startup_records_what_is_running(config, caplog):
     assert "常驻启动" in text
     assert f"pid={os.getpid()}" in text
     assert "分支=" in text          # 曾经从错误分支起过 daemon，分支必须可见
-    assert "schema=v7" in text
+    assert f"schema=v{SCHEMA_VERSION}" in text
     assert "规则版本=" in text  # 判定规则换了没有，启动行要能看见
     assert "recording(dry-run)" in text
     assert config.screenpipe.base_url in text

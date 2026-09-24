@@ -20,8 +20,13 @@ from statesense.report.models import (
     ReportData,
     RuleVersionSlice,
     RunEvent,
+    ShadowBreakdown,
+    ShadowDivergence,
+    ShadowLeadTime,
+    ShadowStratum,
     VerdictBreakdown,
 )
+from statesense.shadow.models import ShadowOutcome
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
 
@@ -66,6 +71,35 @@ def _cohort(**over) -> CohortBreakdown:
     return CohortBreakdown(**base)
 
 
+def _shadow(**over) -> ShadowBreakdown:
+    """一份「影子没开」的默认 —— 各档都在，计数为 0。
+
+    结局与分歧都按**封闭枚举全量**列出（而不是空元组）：报表就是按枚举打印的，
+    夹具若省掉某一档，测试就再也发现不了「实现漏掉了那一档」。
+    """
+    base = dict(
+        evaluations=0,
+        asked=0,
+        outcomes=tuple(ShadowStratum(o.value, f"{o.value} 的说明", 0) for o in ShadowOutcome),
+        divergences=(
+            ShadowDivergence("一致", "候选与规则判定同档", 0),
+            ShadowDivergence("候选更重", "候选比规则深", 0),
+            ShadowDivergence("候选更轻", "候选比规则浅", 0),
+            ShadowDivergence("候选不下结论", "uncertain / refused", 0),
+        ),
+        candidate_only_ticks=0,
+        rule_only_ticks=0,
+        lead=ShadowLeadTime(0, 0, 0, 0, 0, 0, None),
+        latency_mean_ms=None,
+        latency_median_ms=None,
+        latency_max_ms=None,
+        refused=0,
+        model_versions=(),
+    )
+    base.update(over)
+    return ShadowBreakdown(**base)
+
+
 def _data(**over) -> ReportData:
     base = ReportData(
         overview=Overview(T0, T0, 2, 2, 1.0, ()),
@@ -77,6 +111,7 @@ def _data(**over) -> ReportData:
         cohort=_cohort(),
         receipt_audit=ReceiptAudit(0, (), 0, 0),
         timing=ActionTimingBreakdown(0, 0, 0, (), 0),
+        shadow=_shadow(),
         leaks=(),
         trace=(),
         leak_details=(),

@@ -44,16 +44,32 @@ from statesense.report.models import (
     ReceiptAuditStratum,
     RuleVersionSlice,
     RunEvent,
+    ShadowBreakdown,
+    ShadowDivergence,
+    ShadowLeadTime,
+    ShadowStratum,
     TraceRow,
     VerdictBreakdown,
 )
-from statesense.state.models import State
+from statesense.shadow.models import ModelCandidate, ShadowOutcome
+from statesense.state.models import State, severity_rank
 from statesense.state.taxonomy import Category, classify
 
 #: 可干预状态的字面量集合与阶梯次序。从 `State` 派生而不是另写一遍字符串 ——
 #: 状态枚举改名时这里跟着走，不会留下一个永远不命中的字面量。
 _INTERVENABLE_STATES = frozenset(str(state) for state in INTERVENABLE)
-_STATE_RANK = {state.value: rank for rank, state in enumerate(State)}
+
+
+def _state_rank(name: str) -> int:
+    """状态字面量 → 深浅名次。
+
+    **顺序的唯一来源是 `state.models.SEVERITY_ORDER`。** 这里曾经自己写
+    `enumerate(State)`：那等于又定义了一遍状态顺序，而枚举的声明顺序与
+    「谁比谁深」本来就是两件事 —— 改一处不会带动另一处，两处哪天不一致时
+    也没有任何东西会报错，只会让「峰值状态」与「候选更重还是更轻」悄悄错位。
+    """
+    return severity_rank(State(name))
+
 
 #: 干预行存在，但用户压根没理会弹窗（`user_response IS NULL`）。
 #: 名字直接写 "null"，与库里的 SQL NULL 对齐 —— 报告的使用者要能把这一行
@@ -664,7 +680,7 @@ def build_consumption_events(
     for run in _intervenable_runs(
         evaluations, gap_threshold_minutes=gap_threshold_minutes
     ):
-        peak = max((r["state"] for r in run), key=_STATE_RANK.__getitem__)
+        peak = max((r["state"] for r in run), key=_state_rank)
         events.append(
             ConsumptionEvent(
                 start=_parse(run[0]["at"]),
@@ -797,6 +813,199 @@ def build_action_timing_breakdown(
         ),
         layers=tuple(layers),
         raw_ticks=raw_ticks,
+    )
+
+
+# ── 影子模型（阶段 3.4） ─────────────────────────────────────
+
+#: 影子结局的中文说明。键取自 `ShadowOutcome` 的字面量。
+#: 少了某一档的说明，报表会打出一个没人能读的英文原值 —— 而这一列正是
+#: 「模型失败在哪一步」的唯一线索，读不出来等于没记。
+_SHADOW_OUTCOME_NOTES: dict[str, str] = {
+    ShadowOutcome.OK.value: "模型给出了候选（含 uncertain / refused）",
+    ShadowOutcome.TIMEOUT.value: "超时：传输层中断，或返回时已过期",
+    ShadowOutcome.INVALID_OUTPUT.value: "返回值不在有限枚举里",
+    ShadowOutcome.PROVIDER_ERROR.value: "调用失败（网络 / 鉴权 / 实现抛错）",
+    ShadowOutcome.NO_DATA.value: "输入不可信，本轮未调用",
+}
+
+#: 候选与规则关系的分档，顺序即渲染顺序。
+_RELATION_AGREE = "一致"
+_RELATION_DEEPER = "候选更重"
+_RELATION_SHALLOWER = "候选更轻"
+_RELATION_ABSTAIN = "候选不下结论"
+
+_SHADOW_RELATIONS: tuple[tuple[str, str], ...] = (
+    (_RELATION_AGREE, "候选与规则判定同档"),
+    (_RELATION_DEEPER, "候选比规则深：更早达到可提醒档"),
+    (_RELATION_SHALLOWER, "候选比规则浅：更晚提醒，或整段不到档"),
+    (_RELATION_ABSTAIN, "uncertain / refused —— 模型明确没有作答"),
+)
+
+
+def _candidate_of(row: Any) -> ModelCandidate | None:
+    """行里的候选字面量 → 枚举。空值或枚举外的值都给 `None`。
+
+    枚举外的值只可能来自手工改库：写入路径已经被 `ModelSignal` 校过一遍。
+    这里不抛异常也不猜 —— 报表宁可把一行算进失败档，也不能因为一行脏数据
+    整体打不出来。
+    """
+    raw = row["candidate"]
+    if not raw:
+        return None
+    try:
+        return ModelCandidate(raw)
+    except ValueError:
+        return None
+
+
+def _candidate_reaches_bar(row: Any) -> bool:
+    """候选是否够到「该提醒」那一档。
+
+    不下结论（uncertain / refused）**不算够到**：它没有断言任何状态，
+    把它算成「模型认为该提醒」会让候选侧的计数凭空变大。
+    """
+    candidate = _candidate_of(row)
+    if candidate is None or candidate.state is None:
+        return False
+    return candidate.state in INTERVENABLE
+
+
+def _shadow_relation(row: Any) -> str | None:
+    """候选与规则的关系档；没有候选（调用失败 / 未问）时给 `None`。"""
+    candidate = _candidate_of(row)
+    if candidate is None:
+        return None
+    state = candidate.state
+    if state is None:
+        return _RELATION_ABSTAIN
+    delta = severity_rank(state) - severity_rank(State(row["state"]))
+    if delta > 0:
+        return _RELATION_DEEPER
+    if delta < 0:
+        return _RELATION_SHALLOWER
+    return _RELATION_AGREE
+
+
+def _shadow_lead_time(
+    rows: Sequence[Any], events: Sequence[ConsumptionEvent]
+) -> ShadowLeadTime:
+    """按规则侧消费事件比较「各自何时够到可提醒档」。
+
+    每段事件看的是**从上一段事件结束到本段结束**的全部影子行，而不只是段内的行。
+    这是必需的：段起点就是规则第一次够到档的那一轮，若只在段内找，模型永远只能
+    「同一轮」或「更晚」——「模型提前看出苗头」这一档**结构上不可达**，
+    而那恰恰是这一版最想知道的答案。
+
+    跨段不重复归因：一段行只服务它之后最近的那一段事件；行归给哪一段是确定的，
+    否则同一行会同时抬高两段事件的提前量。
+    """
+    ordered = sorted(rows, key=lambda row: _parse(row["at"]))
+    earlier = same = later = absent = 0
+    covered = 0
+    leads: list[float] = []
+    previous_end: datetime | None = None
+    for event in events:
+        window = [
+            row
+            for row in ordered
+            if _parse(row["at"]) <= event.end
+            and (previous_end is None or _parse(row["at"]) > previous_end)
+        ]
+        previous_end = event.end
+        if not window:
+            # 这一段规则侧有判定、影子侧一行都没有：可能影子中途才开，
+            # 也可能落库失败。不计入任何一档，但由 covered 与总数之差显出来。
+            continue
+        covered += 1
+        first = next(
+            (_parse(row["at"]) for row in window if _candidate_reaches_bar(row)), None
+        )
+        if first is None:
+            absent += 1
+            continue
+        minutes = (event.start - first).total_seconds() / 60
+        if minutes > 0:
+            earlier += 1
+            leads.append(minutes)
+        elif minutes == 0:
+            same += 1
+        else:
+            later += 1
+    return ShadowLeadTime(
+        events_total=len(events),
+        events_with_shadow=covered,
+        model_earlier=earlier,
+        same_tick=same,
+        model_later=later,
+        model_absent=absent,
+        earlier_mean_minutes=_mean(leads),
+    )
+
+
+def build_shadow_breakdown(
+    rows: Sequence[Any],
+    events: Sequence[ConsumptionEvent],
+    *,
+    evaluations: int,
+) -> ShadowBreakdown:
+    """影子模型与规则的分歧。
+
+    `rows` 来自 `Store.list_shadow_signals` —— 它已经 join 过评估行，因此每一行
+    都带着**同一时刻**的规则判定；`events` 是规则侧的消费事件，用来回答
+    「各自何时够到可提醒档」；`evaluations` 是区间内的评估轮次数，只用于算覆盖度。
+
+    **只列数据，不给结论。** 本视图不回答「模型更好」：那要把两侧分别与人工真值
+    比，而真值还不存在。它回答的是「两者在哪些地方不一样、代价是多少、样本有多少」。
+    """
+    outcome_counts = Counter(row["outcome"] for row in rows)
+    known_outcomes = {outcome.value for outcome in ShadowOutcome}
+    # 枚举外的取值单列一档而不是丢掉：丢掉会让「结局分布之和 ≠ 被问次数」，
+    # 而那个差正是发现「写入方与枚举已漂移」的唯一线索。
+    extra_outcomes = {
+        name: count for name, count in outcome_counts.items() if name not in known_outcomes
+    }
+
+    relation_counts = Counter(
+        relation for row in rows if (relation := _shadow_relation(row)) is not None
+    )
+    latencies = [row["latency_ms"] for row in rows if row["latency_ms"] is not None]
+
+    return ShadowBreakdown(
+        evaluations=evaluations,
+        asked=len(rows),
+        outcomes=tuple(
+            ShadowStratum(
+                outcome=outcome.value,
+                note=_SHADOW_OUTCOME_NOTES[outcome.value],
+                count=outcome_counts.get(outcome.value, 0),
+            )
+            for outcome in ShadowOutcome
+        )
+        + tuple(
+            ShadowStratum(outcome=name, note="未知结局（不在封闭枚举里）", count=count)
+            for name, count in sorted(extra_outcomes.items())
+        ),
+        divergences=tuple(
+            ShadowDivergence(name=name, description=note, count=relation_counts.get(name, 0))
+            for name, note in _SHADOW_RELATIONS
+        ),
+        candidate_only_ticks=sum(
+            1
+            for row in rows
+            if _candidate_reaches_bar(row) and row["state"] not in _INTERVENABLE_STATES
+        ),
+        rule_only_ticks=sum(
+            1
+            for row in rows
+            if row["state"] in _INTERVENABLE_STATES and not _candidate_reaches_bar(row)
+        ),
+        lead=_shadow_lead_time(rows, events),
+        latency_mean_ms=_mean(latencies),
+        latency_median_ms=_median(latencies),
+        latency_max_ms=max(latencies) if latencies else None,
+        refused=sum(1 for row in rows if _candidate_of(row) is ModelCandidate.REFUSED),
+        model_versions=_ranked(Counter(row["model_version"] for row in rows)),
     )
 
 

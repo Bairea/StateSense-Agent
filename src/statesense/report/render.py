@@ -23,15 +23,21 @@ from statesense.report.models import (
     RunEvent,
     VerdictBreakdown,
 )
+from statesense.shadow.models import ShadowOutcome
 
 #: 视图编号的封闭枚举。`--views` 只接受这些值，未知编号在解析层就报错，
 #: 而不是被静默丢掉 —— 静默丢掉会让 `--views 5` 看起来「没输出」而不是「参数错了」。
 #: 6 起是阶段 2 新增：6=效果分母（分层与排除原因），7=回执口径审计，8=动作×时机。
-VIEW_IDS: tuple[str, ...] = ("0", "1", "2", "3", "4", "5", "6", "7", "8")
+#: 9 是阶段 3 新增：影子模型与规则的分歧。
+#:
+#: **新视图只能往后排。** 改动既有编号会让历史调用（`--views 7`）与文档里的
+#: 编号说明一起失效，而且失效时没有任何东西会报错 —— 只是打出了别的内容。
+VIEW_IDS: tuple[str, ...] = ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
 LEAK_VIEW = "5"
 COHORT_VIEW = "6"
 AUDIT_VIEW = "7"
 TIMING_VIEW = "8"
+SHADOW_VIEW = "9"
 #: `skipped` 占比到这个数就高亮：它高说明「看起来正常」是假的。
 SKIPPED_ALERT_RATIO = 0.2
 
@@ -375,6 +381,80 @@ def _timing_lines(data: ReportData) -> list[str]:
     return lines
 
 
+def _shadow_lines(data: ReportData) -> list[str]:
+    """视图 9：影子模型与规则的分歧（阶段 3.4）。
+
+    刻意不使用「漏判 / 误报」这两个词：它们是与人工真值比出来的结论，而真值还不
+    存在。这里能说的只有「两侧口径不一样在哪、代价多少、样本多少」——
+    把一份口径对比写成「模型更准」，是拿夹具当真实数据的那类错误。
+    """
+    s = data.shadow
+    lines = [
+        "影子模型（不参与判定与投递；只记录候选与规则的分歧）"
+    ]
+    if s.asked == 0:
+        lines.append(
+            f"  本区间没有影子记录（评估 {s.evaluations} 轮）。"
+            "影子默认关闭，见配置 [shadow] enabled"
+        )
+        return lines
+
+    coverage = s.asked / s.evaluations * 100 if s.evaluations else 0.0
+    lines += [
+        f"  被问轮次    {s.asked} / {s.evaluations} 轮（覆盖 {coverage:.1f}%）",
+        f"  结局        {_pairs(((item.outcome, item.count) for item in s.outcomes))}",
+    ]
+    for item in s.outcomes:
+        if item.outcome != ShadowOutcome.OK.value and item.count:
+            lines.append(f"                {item.outcome}: {item.note}")
+    lines.append(
+        f"  拒答        {s.refused} 次"
+        f"（占被问轮次的 {s.refused / s.asked * 100:.1f}%）"
+    )
+    latency_bits = [
+        f"均值 {s.latency_mean_ms:.1f}" if s.latency_mean_ms is not None else "均值 —",
+        f"中位 {s.latency_median_ms:.1f}" if s.latency_median_ms is not None else "中位 —",
+        f"最大 {s.latency_max_ms:.1f}" if s.latency_max_ms is not None else "最大 —",
+    ]
+    lines.append(f"  延迟(ms)    {' / '.join(latency_bits)}")
+
+    lines.append("  候选 vs 规则（只在模型给出候选的轮次上分档）")
+    for item in s.divergences:
+        lines.append(f"    {item.name:<14} {item.count:>4}    {item.description}")
+
+    lines.append(
+        f"  够档差异    候选够档而规则没到 {s.candidate_only_ticks} 轮；"
+        f"规则够档而候选没到 {s.rule_only_ticks} 轮"
+    )
+    lines.append(
+        "                这两项是两侧口径的差，**不是**与人工真值比出来的漏判/误报"
+    )
+
+    lead = s.lead
+    lines.append(
+        f"  首次可提醒  规则侧消费事件 {lead.events_total} 个，"
+        f"其中有影子记录的 {lead.events_with_shadow} 个"
+    )
+    if lead.events_with_shadow:
+        earlier_note = (
+            f"，平均提前 {lead.earlier_mean_minutes:.1f} 分钟"
+            if lead.earlier_mean_minutes is not None
+            else ""
+        )
+        lines.append(
+            f"                候选更早 {lead.model_earlier} 个{earlier_note}；"
+            f"同一轮 {lead.same_tick} 个；候选更晚 {lead.model_later} 个；"
+            f"整段未够档 {lead.model_absent} 个"
+        )
+    lines.append(f"  模型版本    {_pairs(s.model_versions)}")
+    if all(name.startswith("offline") for name, _ in s.model_versions):
+        lines.append(
+            "  注意：以上全部来自离线替身（名字以 offline 开头），**它不是模型**。"
+            "这些数字只说明记录链路通，不能用来判断模型的增量价值"
+        )
+    return lines
+
+
 def _leak_lines(data: ReportData) -> list[str]:
     lines = ["疑似漏判（这一轮有活动，但规则一条都没命中）"]
     for anchor in data.leaks:
@@ -429,7 +509,8 @@ def _trace_lines(data: ReportData) -> list[str]:
 
 
 def render_text(data: ReportData, *, views: Collection[str] = ()) -> str:
-    """`views` 控制附加小节（0 概览 / 1 判定 / 2 闸门 / 3 干预 / 4 效果 / 5 漏判）。
+    """`views` 控制附加小节（0 概览 / 1 判定 / 2 闸门 / 3 干预 / 4 效果 / 5 漏判
+    / 6 效果分母 / 7 回执口径 / 8 动作×时机 / 9 影子模型）。
 
     概览是默认输出的主体，因此 `--views 0` 是显式写下默认行为，不额外打印一遍。
     """
@@ -444,6 +525,7 @@ def render_text(data: ReportData, *, views: Collection[str] = ()) -> str:
         "6": _cohort_lines,
         "7": _audit_lines,
         "8": _timing_lines,
+        "9": _shadow_lines,
     }
     for key in VIEW_IDS:
         if key != "0" and key in views:
