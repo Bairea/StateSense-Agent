@@ -9,6 +9,7 @@ from pathlib import Path
 from statesense.activity.models import ActivitySnapshot
 from statesense.clock import FrozenClock
 from statesense.config import Config
+from statesense.intervention.wording import Wording
 from statesense.notify.base import RecordingNotifier
 from statesense.replay.scenario import Scenario
 from statesense.replay.synthesize import snapshot_at
@@ -92,6 +93,7 @@ def run_scenario(
     start: datetime,
     db_path: Path | None = None,
     shadow: ShadowProvider | None = None,
+    wording: Wording | None = None,
 ) -> ReplayRun:
     """用 FrozenClock + 脚本 reader 驱动**真实的 Scheduler**。
 
@@ -101,6 +103,9 @@ def run_scenario(
     `shadow` 与全屏探针同理：**回放绝不能去问一个真实模型。** 它既不可重复，
     又会让「跑回放」变成一次真实的对外调用。传 `None` 即影子关闭 —— 这与生产的
     默认状态一致，因此「影子关闭时投递与从前完全一样」这件事在回放里也能验。
+
+    `wording` 同理只接受本地实现（模板或带模板回退的适配器）：文案是弹窗正文，
+    交给真实远端等于回放期间对外发请求。`None` 即默认模板。
     """
     store = Store(db_path or config.store_path)
     store.migrate()
@@ -119,5 +124,6 @@ def run_scenario(
         notifier=RecordingNotifier(clock=clock),
         fullscreen=ScriptedFullscreenProbe(scenario.fullscreen_state),
         shadow=collector,
+        wording=wording,
     )
     return ReplayRun(store=store, scheduler=scheduler, clock=clock)
