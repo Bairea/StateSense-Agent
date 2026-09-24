@@ -25,6 +25,7 @@ StateSense-Agent 识别的是「进入被动消费了吗」，不是「打开了
 - 娱乐分钟的唯一公式是 `effective_entertainment_minutes`。全屏信号只把可信快照里的 `OTHER` 提权为娱乐，不动 `WORK` / `GRAY`。一轮 tick 只探一次全屏，判定与回执共用这个值。
 - `report/` 只读，不写库、不写 SQL。`replay/` 驱动真实 `Scheduler`，默认临时库，不碰生产库。`run_events` 不写进 `interventions`。
 - 影子模式只记录候选：不改判定、闸门与投递。模型输入白名单在 `shadow/models.py`，加字段必须同步 `ALLOWED_FIELDS` 与镜像测试；模型输出与屏幕文本同属不可信证据，`reason` / `detail` 只写不读。
+- 远端候选文案只能拿到 `WordingContext` 白名单字段（`intervention/wording.py`）；`top_label`（窗口标题）永不出本机。候选失败或空文案回退模板——回退不得丢投递，也不得多弹窗。
 - 第一版只消费 `app` / `title` / `url` / `focused` / 时间戳。屏幕文本是不可信证据，不采集、不入库、不当指令。
 
 ## 改动
