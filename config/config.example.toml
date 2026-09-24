@@ -43,6 +43,19 @@ delay_minutes = 10
 disengaged_ratio = 0.5
 continued_ratio = 0.8
 
+[shadow]
+# 影子模型信号（阶段 3.2 / 3.4）。**默认关闭，且不改变任何真实行为。**
+# 打开后每一轮会问一次模型，把「模型给的候选」与规则判定并排落进
+# shadow_signals 表，供 `--report --views 9` 查看两者在哪里分歧。
+# 它不影响 Decision、闸门与投递 —— 模型说了什么都不会让今晚多一个弹窗。
+enabled = false
+# 目前只有 "offline"：测试与回放用的确定性替身，**它不是模型**。
+# 真实实现（本地或远端）落地前，这个值不要改成别的东西 —— 未知取值会在启动时被拒绝。
+provider = "offline"
+# 结果层超时（秒）：返回时已超过它的候选一律丢弃，记成 timeout。
+# 传输层自己的超时由 provider 实现负责，两层分工见 shadow/collector.py。
+timeout_seconds = 3
+
 [notify]
 # 前台弹窗。不用 Windows Toast 的原因：本机全局通知开关是关的，
 # 且 Windows 在全屏应用下默认抑制通知 —— 而本项目核心场景正是全屏刷视频。

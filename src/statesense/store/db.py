@@ -11,19 +11,26 @@ from statesense._time import iso as _iso
 from statesense._time import parse_iso as _parse
 from statesense.intervention.models import Decision, dump_gate_trace
 from statesense.outcome.models import OutcomeVerdict
+from statesense.shadow.models import ModelSignal
 from statesense.state.models import StateVerdict
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 #: 运行事件的封闭枚举。写入未知类型必须报错 —— 与 gate.enabled 的处理同一原则：
 #: 不认识的取值意味着写入方与 schema 已漂移，静默接受会让观测结论失真。
-RUN_EVENT_KINDS: tuple[str, ...] = ("sleep_gap", "tick_error")
+#: `shadow_error` 单独一类，不与 `tick_error` 合并：影子落库失败**不影响投递**，
+#: 把它记成 tick_error 会让人以为那一轮的判定也出了问题。
+RUN_EVENT_KINDS: tuple[str, ...] = ("sleep_gap", "tick_error", "shadow_error")
 
 #: report 的只读查询能读的表 → 该表的时间列。写成封闭字面量表而不是让调用方
 #: 传表名：表名不来自外部输入，拼进 SQL 才是安全的。
 #: 时间过滤走 SQL 字符串比较 —— `_iso()` 统一转本地时区后序列化，所有落库
 #: 字符串的偏移量一致，字典序即时间序。`since` 必须先经 `_iso()` 转换。
+#:
+#: `shadow_signals` **刻意不在表里**：它没有自己的时间列，时刻只能来自
+#: 被外键指向的 `evaluations.at`，因此它走 `list_shadow_signals` 里的显式 join，
+#: 而不是这个「一表一列」的通用模式。给它补一份 `at` 会让同一个时刻被存两遍。
 _LISTABLE: dict[str, str] = {
     "evaluations": "at",
     "interventions": "at",
@@ -95,6 +102,13 @@ class Store:
         # 分组；一行错标就能把两套规则混成一份样本。
         if "rule_version" not in _column_names(self._conn, "evaluations"):
             self._conn.execute("ALTER TABLE evaluations ADD COLUMN rule_version TEXT")
+        # v7 → v8：新增 shadow_signals 表（影子模型候选）。
+        # 由 schema.sql 的 CREATE TABLE IF NOT EXISTS 建出，无需 ALTER 分支 ——
+        # 与 run_events 当初一样。老库里这张表是空的，即「那些行没有影子候选」，
+        # **不是「模型判为正常」**；这个区别写在 schema.sql 的表注释里。
+        #
+        # 也不回填任何行：影子信号是「当时真的问过模型」的证据，
+        # 事后补一行等于伪造一次不存在的调用。
 
     def user_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -246,6 +260,36 @@ class Store:
                 "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", (key, value)
             )
 
+    def insert_shadow_signal(self, evaluation_id: int, signal: ModelSignal) -> None:
+        """写下一轮的影子候选。
+
+        `evaluation_id` 必须显式给出，没有「按时刻找最近一轮」之类的兜底：
+        影子行与评估行必须指向同一个时刻，靠时间戳去猜迟早会配错 ——
+        而错配的表现是「分歧率看起来有数」，比没有数据更难发现。
+
+        这个方法**不参与投递链路**。调用点（`Scheduler`）负责把它的失败吞成一条
+        运行事件：影子落库失败不该让今晚少一次干预，也不该让一次真实投递丢失。
+        """
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO shadow_signals (
+                  evaluation_id, outcome, candidate, model_version, prompt_version,
+                  latency_ms, reason, detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evaluation_id,
+                    str(signal.outcome),
+                    str(signal.candidate) if signal.candidate is not None else None,
+                    signal.model_version,
+                    signal.prompt_version,
+                    signal.latency_ms,
+                    signal.reason,
+                    signal.detail,
+                ),
+            )
+
     # ── 读取 ────────────────────────────────────────────────
 
     def get_kv(self, key: str) -> str | None:
@@ -315,6 +359,45 @@ class Store:
 
     def list_run_events(self, since: datetime | None = None) -> list[sqlite3.Row]:
         return self._list("run_events", since)
+
+    def list_shadow_signals(self, since: datetime | None = None) -> list[sqlite3.Row]:
+        """影子候选，带上它所属那一轮评估的判定结果，按评估时刻过滤。
+
+        **这是一条 join，不是读单表**，所以它不走 `_LISTABLE` 那套「一表一列」的
+        通用模式：影子表里没有自己的时间列 —— 「什么时候」只能有一个来源，
+        那就在 `evaluations.at`。另存一份会让同一个时刻被写两处，
+        而两处哪天不一致时没有任何东西会报错。
+
+        同时带出 `state`、`rule_version` 与 `ent_minutes`：分歧分析要拿候选与
+        **同一时刻的**规则结果并排比较。分两次查会在两次查询之间留下不一致的窗口，
+        而影子分析正是靠「候选与规则来自同一行」才成立。
+
+        `since` 过滤的是评估时刻。用内连接而不是左连接：候选不可能脱离评估行存在
+        （外键保证），所以左连接只会多出一种「有候选却没有判定」的不可能状态，
+        而那本该在写入时就被拒绝。
+        """
+        sql = """
+            SELECT
+              s.evaluation_id  AS evaluation_id,
+              e.at             AS at,
+              e.state          AS state,
+              e.rule_version   AS rule_version,
+              e.ent_minutes    AS ent_minutes,
+              s.outcome        AS outcome,
+              s.candidate      AS candidate,
+              s.model_version  AS model_version,
+              s.prompt_version AS prompt_version,
+              s.latency_ms     AS latency_ms,
+              s.reason         AS reason,
+              s.detail         AS detail
+            FROM shadow_signals s
+            JOIN evaluations e ON e.id = s.evaluation_id
+        """
+        if since is None:
+            return self._conn.execute(f"{sql} ORDER BY e.at").fetchall()
+        return self._conn.execute(
+            f"{sql} WHERE e.at >= ? ORDER BY e.at", (_iso(since),)
+        ).fetchall()
 
     def list_intervention_cohort(self, since: datetime | None = None) -> list[sqlite3.Row]:
         """同一批受试干预：一条干预一行，带上它的回执与触发时那一轮的评估。

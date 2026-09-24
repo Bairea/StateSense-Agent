@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
 
+from statesense._detail import error_detail
 from statesense.activity.base import ActivitySource
 from statesense.activity.models import ActivitySnapshot
 from statesense.clock import Clock
@@ -21,24 +23,15 @@ from statesense.notify.base import Notifier
 from statesense.outcome.tracker import evaluate as evaluate_outcome
 from statesense.perception import FullscreenProbe, default_probe, is_gaming
 from statesense.rulebook import version_of
-from statesense.state.engine import classify, effective_entertainment_minutes
-from statesense.state.taxonomy import bucket_minutes
+from statesense.shadow.collector import ShadowCollector
+from statesense.shadow.models import ModelSignal, StateShadowInput
+from statesense.state.engine import classify, effective_entertainment_minutes, is_late_night
+from statesense.state.taxonomy import Category, bucket_minutes
 from statesense.store.db import Store
 
 log = logging.getLogger(__name__)
 
 ACTION_CURSOR_KEY = "action_cursor"
-
-
-def _error_detail(exc: BaseException) -> str:
-    """异常类名 + 消息**首行**，截断至 200 字符（spec §7.2）。
-
-    取首行而不是整条消息：包装过的异常，消息里往往重复堆叠同一条信息，
-    换行还会把 report 缺口视图里「一行一条运行事件」的版式冲掉。
-    """
-    message = str(exc).strip()
-    first_line = message.splitlines()[0] if message else ""
-    return f"{type(exc).__name__}: {first_line}"[:200]
 
 
 @dataclass(frozen=True)
@@ -60,6 +53,7 @@ class Scheduler:
         notifier: Notifier,
         wording: Wording | None = None,
         fullscreen: FullscreenProbe | None = None,
+        shadow: ShadowCollector | None = None,
     ) -> None:
         self._config = config
         self._clock = clock
@@ -68,6 +62,11 @@ class Scheduler:
         self._notifier = notifier
         self._wording = wording or TemplateWording()
         self._fullscreen = fullscreen or default_probe()
+        #: `None` = 影子模式关闭。这是**唯一**的表达方式 —— 不用一个「always-there
+        #: 但什么都不做的 collector」代替：那种写法会让「关着」与「开着但模型一直
+        #: 没被问到」在代码里看起来一样，而它们在数据里必须分得开（库里没有影子行
+        #: 只说明没开，而开了就一定会有行，见 _collect_shadow 的失败处理）。
+        self._shadow = shadow
         self._last_evaluation_at: datetime | None = None
         # 判定规则在一次进程生命周期内不会变（配置是 frozen 的），所以算一次就够。
         # 它是**判定**的标识，因此写在 evaluations 行上：跨版本比较阈值时靠它分组。
@@ -156,10 +155,76 @@ class Scheduler:
         except Exception as exc:  # noqa: BLE001 - 常驻进程不能因为单轮失败就退出
             log.exception("本轮评估失败，跳过")
             try:
-                self._store.insert_run_event(now, "tick_error", _error_detail(exc))
+                self._store.insert_run_event(now, "tick_error", error_detail(exc))
             except Exception:  # noqa: BLE001
                 log.exception("写入 tick_error 运行事件失败")
             return None
+
+    # ── 影子模式（阶段 3.4） ─────────────────────────────────
+    # 这三个方法的全部意义是**让影子永远无法影响真实行为**。它们不返回
+    # 「要不要干预」之类的判断，也没有任何一条路径能让本轮 tick 抛出。
+
+    def _collect_shadow(
+        self,
+        snapshot: ActivitySnapshot,
+        fullscreen: int | None,
+        buckets: Mapping[Category, float],
+        now: datetime,
+    ) -> ModelSignal | None:
+        """产生本轮的模型候选。**任何失败都只能变成一条记录，不能变成异常。**
+
+        `try` 的覆盖范围刻意包含「构造输入」这一段，而不只是调用模型：影子模式的
+        前提是「绝不改变真实行为」，那么任何能让本轮 tick 抛出的东西都属于这一类 ——
+        包括这几行新代码自己。用一条 `shadow_error` 运行事件换掉「今晚少一次干预」，
+        这个交换在任何情况下都划算。
+
+        `fullscreen` 用本轮探到的那一个值（与判定、回执同一个），不再探第二次：
+        探针是一次系统调用，多探一次就可能给出不同答案，而同一个量在同一轮里
+        出现两个取值是这类缺陷的经典形态。
+        """
+        if self._shadow is None:
+            return None
+        try:
+            payload = StateShadowInput(
+                ent_minutes=effective_entertainment_minutes(
+                    buckets,
+                    trustworthy=snapshot.is_trustworthy,
+                    gaming=is_gaming(fullscreen),
+                ),
+                gray_minutes=buckets[Category.GRAY],
+                work_minutes=buckets[Category.WORK],
+                total_active_minutes=snapshot.total_active_minutes,
+                window_minutes=snapshot.window_minutes,
+                late_night=is_late_night(
+                    snapshot.captured_at,
+                    snapshot.total_active_minutes,
+                    self._config.thresholds,
+                ),
+            )
+            return self._shadow.collect(payload, trustworthy=snapshot.is_trustworthy)
+        except Exception as exc:  # noqa: BLE001 - 影子不许把异常抛给 tick
+            log.exception("影子采样失败，本轮不记录候选（判定与投递照常）")
+            self._record_shadow_error(now, exc)
+            return None
+
+    def _store_shadow(self, evaluation_id: int, signal: ModelSignal, now: datetime) -> None:
+        """落库影子候选。失败只记运行事件 —— 影子写不进去不该影响投递。
+
+        单独归一类 `shadow_error` 而不并进 `tick_error`：那一轮的判定与投递
+        其实都成功了，记成 tick_error 会让人以为判定出了问题。
+        """
+        try:
+            self._store.insert_shadow_signal(evaluation_id, signal)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("影子候选落库失败，跳过（本轮照常投递）")
+            self._record_shadow_error(now, exc)
+
+    def _record_shadow_error(self, now: datetime, exc: BaseException) -> None:
+        """最后一道兜底：连运行事件都写不进去时，只能退回日志。"""
+        try:
+            self._store.insert_run_event(now, "shadow_error", error_detail(exc))
+        except Exception:  # noqa: BLE001
+            log.exception("写入 shadow_error 运行事件失败")
 
     # ── 内部 ────────────────────────────────────────────────
 
@@ -225,11 +290,19 @@ class Scheduler:
         self._last_evaluation_at = now
 
         snapshot = self._reader.read(now - timedelta(minutes=window), now, window, now)
+        # 归类是全轮最贵的一步，只做一次：判定与影子采样共用它。
+        # 影子关闭时，这一行与从前完全等价（classify 本来也要算它）。
+        buckets = bucket_minutes(snapshot.entries, self._config.taxonomy)
+        # 影子候选必须在**判定之前**产生。放到判定之后的话，`verdict.state` 就在
+        # 手边，而「顺手把它带上」会让这个对比退化成「抄一遍规则」——
+        # 白名单类型能拦住字段，拦不住「先看答案再作答」。
+        shadow_signal = self._collect_shadow(snapshot, fullscreen, buckets, now)
         verdict = classify(
             snapshot,
             self._config.taxonomy,
             self._config.thresholds,
             fullscreen_state=fullscreen,
+            buckets=buckets,
         )
 
         day_start = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -247,6 +320,11 @@ class Scheduler:
         evaluation_id = self._store.insert_evaluation(
             now, verdict, decision, rule_version=self._rule_version
         )
+
+        # 影子的写入**只在此处**发生，且与投递完全解耦：它既不影响下面的
+        # `decision.intervene`，也不会因为写失败而让本轮提前返回。
+        if shadow_signal is not None:
+            self._store_shadow(evaluation_id, shadow_signal, now)
 
         if not decision.intervene or decision.action_id is None:
             return TickReport(evaluation_id, str(verdict.state), False, closed, decision.reason)

@@ -8,7 +8,7 @@ from statesense.activity.reader import ActivityReader
 from statesense.clock import FrozenClock
 from statesense.notify.base import RecordingNotifier
 from statesense.scheduler import Scheduler
-from statesense.store.db import RUN_EVENT_KINDS, Store
+from statesense.store.db import RUN_EVENT_KINDS, SCHEMA_VERSION, Store
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
 
@@ -24,7 +24,7 @@ def store(tmp_path):
 # ── schema 版本与迁移 ───────────────────────────────────────
 
 def test_user_version_is_current(store):
-    assert store.user_version() == 7
+    assert store.user_version() == SCHEMA_VERSION
 
 
 def test_entries_minutes_column_exists(store):
@@ -118,7 +118,7 @@ def test_v3_database_upgrades_in_place(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 7
+    assert s.user_version() == SCHEMA_VERSION
 
     columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(evaluations)")}
     assert "entries_minutes" in columns
