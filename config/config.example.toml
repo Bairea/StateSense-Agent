@@ -49,11 +49,17 @@ continued_ratio = 0.8
 # shadow_signals 表，供 `--report --views 9` 查看两者在哪里分歧。
 # 它不影响 Decision、闸门与投递 —— 模型说了什么都不会让今晚多一个弹窗。
 enabled = false
-# 目前只有 "offline"：测试与回放用的确定性替身，**它不是模型**。
-# 真实实现（本地或远端）落地前，这个值不要改成别的东西 —— 未知取值会在启动时被拒绝。
+# 封闭枚举，两种实现：
+#   offline — 测试与回放用的确定性替身，**它不是模型**（真实运行下每轮都会
+#             如实记成 provider_error，那是失败隔离的现场演示）；
+#   http    — 真实远端供应器（OpenAI 兼容 chat/completions）。url / model /
+#             api key 从 .env 读取：把 .env.example 复制为 .env 并填入真实值，
+#             .env 不入库；缺项在启动与 --check 时即报错（fail closed）。
+# 未知取值会在启动时被拒绝。
 provider = "offline"
 # 结果层超时（秒）：返回时已超过它的候选一律丢弃，记成 timeout。
-# 传输层自己的超时由 provider 实现负责，两层分工见 shadow/collector.py。
+# http 的传输层超时也用这一个旋钮（传输层掐断，结果层丢迟到答复），
+# 两层分工见 shadow/collector.py。
 timeout_seconds = 3
 
 [notify]
