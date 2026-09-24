@@ -10,7 +10,14 @@ from statesense.replay.scenarios import (
 
 
 def test_all_expected_scenarios_exist():
-    assert set(SCENARIOS) == {"ladder", "outcome", "gates", "degraded", "sleep_gap"}
+    assert set(SCENARIOS) == {
+        "ladder",
+        "outcome",
+        "gates",
+        "degraded",
+        "sleep_gap",
+        "shadow",
+    }
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
