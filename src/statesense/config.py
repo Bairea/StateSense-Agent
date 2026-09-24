@@ -31,6 +31,14 @@ KNOWN_GATES: tuple[str, ...] = (GATE_STATE_MIN, GATE_RATIO_MIN, GATE_COOLDOWN, G
 #: 必须始终启用的闸门。state_min 是「只在真的被困住时才打扰」这条安全属性的唯一守卫。
 MANDATORY_GATES: tuple[str, ...] = (GATE_STATE_MIN,)
 
+#: 影子模型的可选实现。**封闭枚举，不是自由字符串。**
+#:
+#: 目前只有 `offline` —— 测试与回放用的确定性替身，**它不是模型**。
+#: 真实实现在落地时应当与它的传输层实现一起加进这里：先把名字接进配置、
+#: 实现却还没写，会让 `shadow.enabled = true` 变成一次静默空转
+#: （与 `gate.enabled` 里拼错闸门名同一类缺陷）。
+KNOWN_SHADOW_PROVIDERS: tuple[str, ...] = ("offline",)
+
 
 @dataclass(frozen=True)
 class ScreenpipeConfig:
@@ -58,6 +66,27 @@ class ThresholdConfig:
     late_night_start_hour: int = 1
     late_night_end_hour: int = 6
     late_night_min_active_minutes: float = 10
+
+
+@dataclass(frozen=True)
+class ShadowConfig:
+    """影子模型信号（阶段 3.2 的输入契约 / 3.4 的候选信号）。
+
+    **默认关闭。** 关闭时不会有任何模型调用，也不会写 `shadow_signals`。
+    「默认关闭」不是保守，恰恰是阶段 3.4 的前置条件：影子模式的作用是先看清
+    模型与规则在哪里不一样，在拿到证据之前它不该产生任何行为差异 ——
+    因此它连「默认打开但只记录」都不该做，那会让「没开影子」的库与
+    「影子开着但模型一直拒答」的库在数据结构上难以区分。
+
+    这一节**不参与 `rulebook.rule_version`**：影子模式不改变任何判定规则，
+    把它算进版本号会让「仅仅是打开了记录」看起来像「换了规则」。
+    """
+
+    enabled: bool = False
+    provider: str = "offline"
+    #: **结果层**超时（秒）：返回时已超过它的候选一律丢弃。
+    #: 传输层自己的超时由 provider 实现负责，两层分工见 `shadow/collector.py`。
+    timeout_seconds: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -134,6 +163,8 @@ class Config:
     gate: GateConfig
     outcome: OutcomeConfig
     notify: NotifyConfig
+    #: 影子模型信号。关闭时整条链路（采样、调用、落库）都不存在。
+    shadow: ShadowConfig
     store_path: Path
     report: ReportConfig
     taxonomy: TaxonomyConfig
@@ -236,6 +267,20 @@ def load_config(path: Path) -> Config:
     outcome = _section(OutcomeConfig, raw, "outcome")
     notify = _section(NotifyConfig, raw, "notify")
 
+    shadow = _section(ShadowConfig, raw, "shadow")
+    # provider 名必须逐一可识别。写错一个名字的后果是「以为在收影子数据、
+    # 实际一次都没调用」，而库看起来完全正常 —— 只是 `shadow_signals` 是空的，
+    # 那既可能是没开、也可能是模型一直没被问到。
+    if shadow.provider not in KNOWN_SHADOW_PROVIDERS:
+        raise ConfigError(
+            f"shadow.provider 未知：{shadow.provider!r}；"
+            f"已知实现：{list(KNOWN_SHADOW_PROVIDERS)}"
+        )
+    if shadow.timeout_seconds <= 0:
+        raise ConfigError(
+            f"shadow.timeout_seconds 必须为正数，当前为 {shadow.timeout_seconds}"
+        )
+
     store_raw = raw.get("store", {})
     store_path = (path.parent / store_raw.get("path", "statesense.db")).resolve()
 
@@ -283,6 +328,7 @@ def load_config(path: Path) -> Config:
         gate=gate,
         outcome=outcome,
         notify=notify,
+        shadow=shadow,
         store_path=store_path,
         report=report,
         taxonomy=taxonomy,

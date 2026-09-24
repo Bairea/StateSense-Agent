@@ -59,6 +59,37 @@ CREATE TABLE IF NOT EXISTS outcomes (
   after_window_minutes REAL NOT NULL
 );
 
+-- shadow_signals：影子模型给出的候选。**与投递完全无关** —— 影子模式不产生
+-- 任何干预，它只把「模型怎么判」与「规则怎么判」并排记下来，供只读视图比较。
+--
+-- evaluation_id 既是主键又是外键：一轮评估最多一个候选，且候选不能脱离评估行
+-- 单独存在（`PRAGMA foreign_keys = ON` 强制）。**表里刻意没有 `at` 列** ——
+-- 「什么时候」只能有一个来源，那就在 evaluations.at；另存一份会让同一个时刻
+-- 被写两处，而两处哪天不一致时没有任何东西会报错。
+--
+-- 没有这一行 = 「那一轮影子模式没开」（或该评估行来自 v8 之前的库）。
+-- **绝不等于「模型判为正常」** —— 后者会写成 outcome='ok' + candidate='NORMAL'。
+-- 这个区别是本表存在的理由：把「没问」记成「答了否」，分歧率的分母就是假的。
+CREATE TABLE IF NOT EXISTS shadow_signals (
+  evaluation_id INTEGER PRIMARY KEY REFERENCES evaluations(id),
+  -- 封闭枚举：ok | timeout | invalid_output | provider_error | no_data
+  outcome TEXT NOT NULL,
+  -- 模型候选（有限枚举，含 uncertain / refused 两档「不下结论」）。
+  -- 仅 outcome='ok' 时非空；NULL 不是 NORMAL。
+  candidate TEXT,
+  -- 模型版本与提示/输入契约版本。阶段 3.5 要求把「模型参与的」与「纯规则的」
+  -- 分开统计，靠的就是这两列 —— 缺了它们，换模型前后会混成一批样本。
+  model_version TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  -- 毫秒。NULL 仅当 outcome='no_data'（根本没调用就没有耗时；写 0 会与
+  -- 「一次极快的成功调用」同值）。
+  latency_ms REAL,
+  -- 模型给的理由与失败详情。**只写不读**：没有任何代码路径把这两列当指令、
+  -- 当判定输入或当配置。模型输出与屏幕文本同属不可信证据，落库只为事后复盘。
+  reason TEXT,
+  detail TEXT
+);
+
 -- kv：少量运行期状态（动作池轮转游标等）
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
@@ -70,7 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_interventions_due ON interventions(outcome_due_at
 CREATE INDEX IF NOT EXISTS idx_interventions_at ON interventions(at);
 
 -- run_events：只记录异常轮次，正常存活由 evaluations.at 派生。
--- 补上这两类事件后，「无记录」只剩「进程死了」一个解释。
+-- 补上这几类事件后，「无记录」只剩「进程死了」一个解释。
 --
 -- `at` 是主键（spec §7.2 的规定），因此同一秒内只能留下一行 —— 写入用的是
 -- INSERT OR REPLACE，同一时刻的第二条会**覆盖**第一条而不是并存。
@@ -78,6 +109,7 @@ CREATE INDEX IF NOT EXISTS idx_interventions_at ON interventions(at);
 -- 所以这是有意的取巧而非缺陷；但它确实是「已知边界」，见 spec §7.6。
 CREATE TABLE IF NOT EXISTS run_events (
   at     TEXT PRIMARY KEY,
-  kind   TEXT NOT NULL,   -- 封闭枚举：sleep_gap | tick_error
-  detail TEXT NOT NULL    -- sleep_gap: 空档分钟数；tick_error: 异常类名 + 消息首行
+  -- 封闭枚举：sleep_gap | tick_error | shadow_error
+  kind   TEXT NOT NULL,
+  detail TEXT NOT NULL    -- sleep_gap: 空档分钟数；tick_error / shadow_error: 异常类名 + 消息首行
 );

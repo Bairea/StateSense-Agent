@@ -13,6 +13,8 @@ from statesense.notify.base import RecordingNotifier
 from statesense.replay.scenario import Scenario
 from statesense.replay.synthesize import snapshot_at
 from statesense.scheduler import Scheduler, TickReport
+from statesense.shadow.collector import ShadowCollector
+from statesense.shadow.provider import ShadowProvider
 from statesense.store.db import Store
 
 
@@ -89,16 +91,26 @@ def run_scenario(
     *,
     start: datetime,
     db_path: Path | None = None,
+    shadow: ShadowProvider | None = None,
 ) -> ReplayRun:
     """用 FrozenClock + 脚本 reader 驱动**真实的 Scheduler**。
 
     不重跑判定逻辑 —— 被验证的必须是生产链路本身。但链路里的每一个外部输入
     （时间、活动数据、全屏信号）都必须由剧本给定，不能漏一个去读真实环境。
+
+    `shadow` 与全屏探针同理：**回放绝不能去问一个真实模型。** 它既不可重复，
+    又会让「跑回放」变成一次真实的对外调用。传 `None` 即影子关闭 —— 这与生产的
+    默认状态一致，因此「影子关闭时投递与从前完全一样」这件事在回放里也能验。
     """
     store = Store(db_path or config.store_path)
     store.migrate()
     clock = FrozenClock(start)
     reader = ScriptedReader(scenario, start)
+    collector = (
+        None
+        if shadow is None
+        else ShadowCollector(shadow, timeout_seconds=config.shadow.timeout_seconds)
+    )
     scheduler = Scheduler(
         config=config,
         clock=clock,
@@ -106,5 +118,6 @@ def run_scenario(
         store=store,
         notifier=RecordingNotifier(clock=clock),
         fullscreen=ScriptedFullscreenProbe(scenario.fullscreen_state),
+        shadow=collector,
     )
     return ReplayRun(store=store, scheduler=scheduler, clock=clock)

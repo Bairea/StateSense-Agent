@@ -6,7 +6,7 @@ import pytest
 from statesense.intervention.models import Decision, GateResult
 from statesense.outcome.models import OutcomeVerdict
 from statesense.state.models import State, StateVerdict
-from statesense.store.db import Store
+from statesense.store.db import SCHEMA_VERSION, Store
 
 T0 = datetime(2026, 9, 16, 4, 0, tzinfo=timezone.utc)
 
@@ -54,7 +54,7 @@ def test_migrate_is_idempotent(tmp_path):
     s = Store(tmp_path / "x.db")
     s.migrate()
     s.migrate()
-    assert s.user_version() == 7
+    assert s.user_version() == SCHEMA_VERSION
     s.close()
 
 
@@ -89,7 +89,7 @@ def test_migrates_v1_database_by_adding_user_response(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 7
+    assert s.user_version() == SCHEMA_VERSION
     intervention_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(interventions)")}
     evaluation_columns = {r["name"] for r in s._conn.execute("PRAGMA table_info(evaluations)")}
     assert "user_response" in intervention_columns
@@ -141,7 +141,7 @@ def test_v6_database_gets_rule_version_column_with_old_rows_unknown(tmp_path):
 
     s = Store(path)
     s.migrate()
-    assert s.user_version() == 7
+    assert s.user_version() == SCHEMA_VERSION
     old = s.list_evaluations()[0]
     assert old["rule_version"] is None, "老行的规则版本必须是未知，不能被回填"
     s.close()

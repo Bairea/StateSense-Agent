@@ -64,8 +64,17 @@ def classify(
     # `StateVerdict.fullscreen_state` 则不给默认值：那是被记录下来的事实，
     # 必须永远显式写。
     fullscreen_state: int | None = None,
+    # 默认 None = 「自己归类」。传进来则复用调用方已经算好的那一份。
+    #
+    # 归类是整轮里最贵的一步，而一轮 tick 里可能需要它两次（判定 + 影子输入的
+    # 采样）。两次各算一遍不会算出不同结果（纯函数、同一输入），但会把最贵的
+    # 那一步做两遍 —— 影子模式默认关闭，这条参数只为「打开它时不额外付费」。
+    #
+    # 这个默认值不违反「不给默认值」的原则：它不改变任何被记录的事实，
+    # 只影响要不要重算一次纯函数；两种取值下的 `StateVerdict` 必然相同。
+    buckets: Mapping[Category, float] | None = None,
 ) -> StateVerdict:
-    buckets = bucket_minutes(snapshot.entries, taxonomy)
+    by_category = bucket_minutes(snapshot.entries, taxonomy) if buckets is None else buckets
     # 全屏应用在跑 → 把「没命中任何规则」的条目算作娱乐。
     #
     # 游戏窗口的标题与进程名就是游戏自身（实测 Brotato.exe / Brotato），平台名
@@ -75,12 +84,12 @@ def classify(
     # 提权规则与阈值都在 effective_entertainment_minutes 里，与回执共用同一口径。
     # 数据不可信时 `trustworthy=False`，连 ent 本身都不该有结论。
     ent = effective_entertainment_minutes(
-        buckets,
+        by_category,
         trustworthy=snapshot.is_trustworthy,
         gaming=is_gaming(fullscreen_state),
     )
-    gray = _round2(buckets[Category.GRAY])
-    work = _round2(buckets[Category.WORK])
+    gray = _round2(by_category[Category.GRAY])
+    work = _round2(by_category[Category.WORK])
     total = _round2(snapshot.total_active_minutes)
 
     entries = _round2(sum(e.minutes for e in snapshot.entries))
