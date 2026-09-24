@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+from collections import Counter
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
 from statesense._time import parse_iso
-from statesense.config import GATE_COOLDOWN, GATE_DAILY_CAP, Config
+from statesense.config import GATE_COOLDOWN, GATE_DAILY_CAP, GATE_STATE_MIN, Config
 from statesense.intervention.models import GateResult, first_failed, parse_gate_trace
 from statesense.perception import QUNS_BUSY
 from statesense.replay.runner import ReplayRun, run_scenario
 from statesense.replay.scenario import Scenario, Segment
+from statesense.shadow.models import ModelCandidate, RawModelReply
+from statesense.shadow.provider import ScriptedShadowProvider
+from statesense.state.models import State, severity_rank
 
 #: 剧本原点取**本地正午**。
 #:
@@ -41,6 +45,18 @@ def _fun(minutes: float) -> Segment:
     return Segment(0, minutes, "chrome.exe", BILIBILI, BILIBILI_URL)
 
 
+#: 影子剧本的活动时间线：90 分钟连续娱乐，与 ladder 同长。
+#: 用一条**独立**的 Scenario 而不是复用 `SCENARIOS["ladder"]`：影子剧本靠这条时间线
+#: 走完整个状态阶梯，并据此构造逐轮答复；复用的话，哪天为了调 ladder 而改了它，
+#: 这里的分歧断言会跟着变，却看不出是为什么。
+_SHADOW = Scenario("shadow", 90, (_fun(90),))
+
+#: 无数据那一档：`data_status != ok` 时**根本不该去问模型**。
+#: 剧本的答复池刻意是空的 —— 一旦实现真的调了一次，替身会因缺答复抛错，
+#: 于是记录下来的会是 provider_error 而不是 no_data。空答复池就是这条断言的反向对照。
+_SHADOW_DEGRADED = Scenario("shadow-degraded", 30, (), data_status="unreachable")
+
+
 SCENARIOS: dict[str, Scenario] = {
     "ladder": Scenario("ladder", 90, (_fun(90),)),
     # 展示用的主剧本：行为继续，回执应为 continued。
@@ -48,6 +64,8 @@ SCENARIOS: dict[str, Scenario] = {
     "gates": Scenario("gates", 300, (_fun(300),)),
     "degraded": Scenario("degraded", 30, (), data_status="unreachable"),
     "sleep_gap": Scenario("sleep_gap", 30, (_fun(30),)),
+    # 影子剧本的活动时间线，由 `_drive_shadow` 驱动（它还要再跑两个变体）。
+    "shadow": _SHADOW,
 }
 
 #: 行为停止的对照剧本：娱乐恰好在触发点结束。
@@ -332,12 +350,182 @@ def _drive_sleep_gap(config: Config, workdir: Path) -> list[str]:
     return failures
 
 
+# ── 剧本六：影子模型（阶段 3.4） ──────────────────────────────
+#
+# 这个剧本要证的是**两件不同的事**，所以它跑三次：
+#   1. 影子开与不开，规则侧的判定、闸门留痕与投递**逐行相同** —— 影子不改变行为；
+#   2. 五种情形都真的被记录成了对应的档（无数据 / 拒答 / 超时 / 错误输出 / 规则冲突），
+#      而不是塌缩成一句「没有候选」。
+#
+# 它证不了「模型有没有增量价值」—— 那需要真实模型与人工真值，两样都没有。
+
+#: 走完整条阶梯所需的轮数（0 → 90 分钟，每轮 5 分钟）。
+_SHADOW_TICKS = 19
+
+_STATE_VALUES = frozenset(state.value for state in State)
+
+
+def _other_state(state: str) -> str:
+    """给一个与规则**不同**的状态候选。
+
+    从浅档往深走、从深档往浅走，两侧都要出现 —— 只造一个方向的冲突，
+    另一个方向的计数逻辑（候选更重 / 候选更轻）等于没测。
+    """
+    if state in ("NORMAL", "WATCH"):
+        return State.PASSIVE_CONSUMPTION.value
+    return State.WATCH.value
+
+
+def _shadow_replies(states: list[str]) -> list[RawModelReply | BaseException]:
+    """逐轮答复。**按控制组实际判出的状态来构造，不是凭空写的。**
+
+    这样每条断言说的都是「报表把这一行算成了什么」，而不是「我摆的姿势对不对」；
+    阈值若被改动，构造出的答复与规则的关系会随之改变，断言会立刻失败并说明原因。
+
+    前六轮把五种情形各走一遍，之后全部走「与规则不同档」——
+    分歧要成为常态才测得到分布，只在某一轮造一次冲突，计数逻辑几乎等于空跑。
+    """
+    replies: list[RawModelReply | BaseException] = []
+    for index, state in enumerate(states):
+        if index == 0:
+            replies.append(RawModelReply(state, "与规则同档"))
+        elif index == 1:
+            replies.append(RawModelReply("uncertain", "证据不足以判断"))
+        elif index == 2:
+            replies.append(RawModelReply(ModelCandidate.REFUSED.value, "我不判断这件事"))
+        elif index == 3:
+            replies.append(TimeoutError("影子替身：模拟传输层超时"))
+        elif index == 4:
+            # 枚举外的值。用 `PASSIVE` 这种「像但不合法」的缩写，而不是乱码 ——
+            # 真实模型最常给出的畸形输出正是这种近义词。
+            replies.append(RawModelReply("PASSIVE"))
+        elif index == 5:
+            replies.append(RuntimeError("影子替身：模拟调用失败"))
+        else:
+            replies.append(RawModelReply(_other_state(state), "按替身的替代表判断"))
+    return replies
+
+
+def _drive_shadow(config: Config, workdir: Path) -> list[str]:
+    failures: list[str] = []
+
+    # ── 控制组：影子关闭 ────────────────────────────────────
+    control = run_scenario(_SHADOW, config, start=START, db_path=workdir / "control.db")
+    try:
+        _advance(control, _SHADOW_TICKS)
+        control_rows = control.evaluations()
+        control_interventions = control.store.list_interventions()
+    finally:
+        control.close()
+
+    if not control_rows:
+        return ["影子剧本的控制组一轮都没跑起来"]
+
+    # ── 影子开启，同一条时间线 ──────────────────────────────
+    provider = ScriptedShadowProvider(
+        _shadow_replies([row["state"] for row in control_rows]),
+        prompt_version="shadow-drill@v1",
+    )
+    run = run_scenario(_SHADOW, config, start=START, db_path=workdir / "shadow.db", shadow=provider)
+    try:
+        _advance(run, _SHADOW_TICKS)
+        rows = run.evaluations()
+
+        # 1) 影子绝不改变判定、闸门与投递 —— 与控制组逐行比对。
+        if len(rows) != len(control_rows):
+            failures.append(f"影子开启后轮次数从 {len(control_rows)} 变成 {len(rows)}")
+        for before, after in zip(control_rows, rows, strict=False):
+            for column in ("state", "decision", "gate_trace", "ent_minutes", "fullscreen_state"):
+                if before[column] != after[column]:
+                    failures.append(
+                        f"{after['at']} 的 {column} 被影子改动了："
+                        f"{before[column]!r} → {after[column]!r}"
+                    )
+        if len(run.store.list_interventions()) != len(control_interventions):
+            failures.append(
+                f"影子开启后投递次数从 {len(control_interventions)} 变成 "
+                f"{len(run.store.list_interventions())}"
+            )
+
+        # state_min 仍是投递的必经路径：每一轮的闸门留痕里都得有它。
+        for row in rows:
+            trace = _trace(row)
+            if not any(gate.name == GATE_STATE_MIN for gate in trace):
+                failures.append(f"{row['at']} 的闸门留痕里没有 state_min")
+                break
+
+        # 2) 五种情形都真的落成了对应的档。
+        shadow_rows = run.store.list_shadow_signals()
+        if len(shadow_rows) != len(rows):
+            failures.append(
+                f"影子行数 {len(shadow_rows)} 与评估轮次 {len(rows)} 不一致"
+                "（影子开着时每一轮都该有一行）"
+            )
+        observed = {row["outcome"] for row in shadow_rows}
+        for expected in ("ok", "timeout", "invalid_output", "provider_error"):
+            if expected not in observed:
+                failures.append(f"影子剧本没有覆盖结局 {expected}；实际 {sorted(observed)}")
+        candidates = {row["candidate"] for row in shadow_rows if row["candidate"]}
+        if ModelCandidate.REFUSED.value not in candidates:
+            failures.append("影子剧本没有覆盖拒答（refused）")
+        if ModelCandidate.UNCERTAIN.value not in candidates:
+            failures.append("影子剧本没有覆盖不确定（uncertain）")
+
+        # 3) 冲突的两个方向都要出现，且「同档」也要有一次 —— 三档合起来才说明
+        #    分档函数不是把什么都算成一类。
+        relations: Counter[str] = Counter()
+        for row in shadow_rows:
+            candidate = row["candidate"]
+            if candidate not in _STATE_VALUES:
+                continue
+            delta = severity_rank(State(candidate)) - severity_rank(State(row["state"]))
+            relations["候选更重" if delta > 0 else "候选更轻" if delta < 0 else "一致"] += 1
+        for expected in ("候选更重", "候选更轻", "一致"):
+            if not relations[expected]:
+                failures.append(f"影子剧本没有造出「{expected}」这一档；实际 {dict(relations)}")
+
+        # 4) 失败的那几轮也要带延迟，`no_data` 则必须没有。
+        for row in shadow_rows:
+            has_latency = row["latency_ms"] is not None
+            if row["outcome"] == "no_data" and has_latency:
+                failures.append(f"{row['at']} 记成 no_data 却带了延迟")
+            if row["outcome"] != "no_data" and not has_latency:
+                failures.append(f"{row['at']} 的结局是 {row['outcome']} 却没有延迟")
+    finally:
+        run.close()
+
+    # ── 无数据：不去问模型 ──────────────────────────────────
+    # 答复池为空，因此「真的调了一次」会自动变成 provider_error —— 断言随即失败。
+    silent = ScriptedShadowProvider(())
+    degraded = run_scenario(
+        _SHADOW_DEGRADED, config, start=START, db_path=workdir / "degraded.db", shadow=silent
+    )
+    try:
+        _advance(degraded, 6)
+        degraded_rows = degraded.store.list_shadow_signals()
+        if not degraded_rows:
+            failures.append("输入不可信时没有留下影子记录（「没问」也必须写得出来）")
+        for row in degraded_rows:
+            if row["outcome"] != "no_data":
+                failures.append(
+                    f"输入不可信却记成了 {row['outcome']}；应当是 no_data 且不调用模型"
+                )
+        if silent.calls:
+            failures.append(f"输入不可信时仍然调用了模型 {len(silent.calls)} 次")
+        if degraded.store.list_interventions():
+            failures.append("输入不可信的轮次居然产生了投递")
+    finally:
+        degraded.close()
+    return failures
+
+
 DRIVERS: dict[str, Callable[[Config, Path], list[str]]] = {
     "ladder": _drive_ladder,
     "outcome": _drive_outcome,
     "gates": _drive_gates,
     "degraded": _drive_degraded,
     "sleep_gap": _drive_sleep_gap,
+    "shadow": _drive_shadow,
 }
 
 
