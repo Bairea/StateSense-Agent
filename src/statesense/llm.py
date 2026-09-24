@@ -1,4 +1,4 @@
-"""远端 LLM 的 .env 装载。密钥只住在这里与 os.environ，绝不进 Config / 日志。
+"""远端 LLM 的 .env 装载与唯一传输实现。密钥只住在这里与 os.environ。
 
 三条规则：
 
@@ -18,10 +18,14 @@
 
 from __future__ import annotations
 
+import json
 import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from statesense._detail import clip
 from statesense.config import ConfigError
 
 #: 远端 LLM 的环境变量名。前缀把「本项目的 LLM 配置」与机器上其他 .env 变量隔开。
@@ -95,3 +99,97 @@ def load_llm_env(config_dir: Path) -> LlmEnv:
         # 白名单载荷虽然不含私密字段，但带着 API key 的请求头只许走 https。
         raise ConfigError(f"{ENV_URL} 必须是 https:// 开头（当前值不是）。")
     return LlmEnv(url=url, model=model, api_key=api_key)
+
+
+class LlmClient:
+    """OpenAI 兼容 `chat/completions` 的**唯一**传输实现。
+
+    影子与文案两个供应器共用：请求形状、Bearer 头、超时翻译只此一处——
+    两处各写一份，超时语义与错误处理迟早漂移。
+
+    错误分两层，与影子供应器的失败分档对齐：
+
+      · **应答结构**损坏（非 JSON / 缺 choices / 缺 content）→ 抛 `ValueError`，
+        由调用方决定记哪一档（影子记 provider_error）；
+      · 传输层超时 → **必须**以 `TimeoutError` 形态抛出（裸抛或包在 URLError
+        里的都还原），这是 shadow/provider 协议第 2 条；
+      · 其余失败（HTTP 4xx/5xx 等）原样抛出——「拒答率 / 失败率」的真实性
+        靠这条，绝不吞掉换一个看起来正常的回答。
+    """
+
+    def __init__(
+        self, url: str, model: str, api_key: str, *, timeout_seconds: float
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds 必须为正数，当前为 {timeout_seconds}")
+        self._url = url
+        self._model = model
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def complete(self, system: str, user: str) -> str:
+        """问一次，返回应答文本。应答**文本**原样返回——怎么解析是调用方的
+        事（影子要 JSON 枚举，文案要纯文本，解析纪律不同）。"""
+        body = json.dumps(
+            {
+                "model": self._model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0,
+                "stream": False,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            self._url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+            },
+        )
+        return self._extract_content(self._post(request))
+
+    def _post(self, request: urllib.request.Request) -> bytes:
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self._timeout_seconds
+            ) as response:
+                return response.read()
+        except TimeoutError:
+            # Python 3.10+ 里 socket.timeout 就是 TimeoutError，裸超时直接放行。
+            raise
+        except urllib.error.URLError as exc:
+            # 包在 URLError 里的超时必须还原成 TimeoutError——调用方只认
+            # 这个类型区分「超时」与「调用失败」。
+            if isinstance(exc.reason, TimeoutError):
+                raise TimeoutError(
+                    f"传输层超时（上限 {self._timeout_seconds:g} 秒）"
+                ) from exc
+            raise
+
+    @staticmethod
+    def _extract_content(raw: bytes) -> str:
+        """应答 JSON → `choices[0].message.content`。结构损坏抛错；
+        密钥不会出现在任何异常消息里（HTTPError 的 str 只有状态行）。"""
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except ValueError as exc:
+            raise ValueError(f"应答不是合法 JSON：{clip(str(exc))}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("应答不是 JSON 对象")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError(f"应答缺少 choices：{clip(json.dumps(data, ensure_ascii=False))}")
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str):
+            raise ValueError("应答缺少 message.content 文本")
+        return content

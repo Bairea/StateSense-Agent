@@ -335,6 +335,27 @@ class Store:
         ).fetchone()
         return int(row["n"])
 
+    def last_receipt_status(self) -> str | None:
+        """最近一次**已结算**的行为回执标签（continued / partial / disengaged /
+        no_data）；没有任何已结算回执时给 `None`。
+
+        「最近」按干预时刻排（interventions.at），不按结算时刻——文案想知道的是
+        「上一次提醒之后用户怎么了」，对应的是最近那次干预的回执，而不是
+        一条结算得更晚的更旧干预。调用方（Scheduler 文案上下文）自己兜
+        读取失败：这条查询只是文案的语气素材，读不到就按「没有先例」写，
+        不冒丢投递的风险。
+        """
+        row = self._conn.execute(
+            """
+            SELECT o.outcome AS outcome
+            FROM outcomes o
+            JOIN interventions i ON i.id = o.intervention_id
+            ORDER BY i.at DESC, o.checked_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return row["outcome"] if row else None
+
     # ── 只读查询（report 用） ────────────────────────────────
     # 一律以 list_ 开头，便于评审时一眼确认 report 路径不写库。
 

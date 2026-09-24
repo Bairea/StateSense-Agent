@@ -13,6 +13,8 @@ from pathlib import Path
 from statesense.activity.reader import ActivityReader
 from statesense.clock import Clock, SystemClock
 from statesense.config import Config, ConfigError, load_config
+from statesense.intervention.wording import RemoteWordingAdapter, TemplateWording, Wording
+from statesense.intervention.wording_http import HttpWordingProvider
 from statesense.notify.base import Notifier, RecordingNotifier
 from statesense.notify.foreground_popup import ForegroundPopupNotifier
 from statesense.perception import default_probe, describe
@@ -235,6 +237,44 @@ def log_startup(config: Config, *, dry_run: bool) -> None:
     )
 
 
+def make_wording(config: Config) -> Wording:
+    """按配置构造文案生成器。
+
+    `http` 的失败 / 空文案 / 超长回退都在适配层里，这里只装配——配置层
+    的责任是别让「名字可写而实现没接」（封闭枚举 + 启动期拒绝），运行期的
+    责任是别让一次文案失败变成丢投递。
+    """
+    if config.wording.provider == "template":
+        return TemplateWording()
+    if config.wording.provider == "http":
+        env = load_llm_env(config.config_dir)
+        return RemoteWordingAdapter(
+            HttpWordingProvider(
+                env.url,
+                env.model,
+                env.api_key,
+                timeout_seconds=config.wording.timeout_seconds,
+            )
+        )
+    # 配置层已经挡过一次（KNOWN_WORDING_PROVIDERS）。这里再抛一次是为了
+    # 不给「配置能写、运行时静默走模板」留后路。
+    raise ConfigError(f"未实现的 wording.provider: {config.wording.provider}")
+
+
+def wording_phrase(config: Config) -> str:
+    """`--check` 用的文案供应器描述。http 时能看到具体模型，配置不完整
+    时如实说——「看起来配了、实际一次都没调用」不能靠猜发现。"""
+    if config.wording.provider == "template":
+        return "template(内置模板)"
+    if config.wording.provider == "http":
+        try:
+            env = load_llm_env(config.config_dir)
+        except ConfigError as exc:
+            return f"http(配置不完整：{exc})"
+        return f"http model={env.model}(失败回退模板)"
+    return config.wording.provider
+
+
 def build_scheduler(config: Config, notifier: Notifier, clock: Clock) -> Scheduler:
     store = Store(config.store_path)
     store.migrate()
@@ -245,6 +285,7 @@ def build_scheduler(config: Config, notifier: Notifier, clock: Clock) -> Schedul
         store=store,
         notifier=notifier,
         shadow=make_shadow_collector(config),
+        wording=make_wording(config),
     )
 
 
@@ -261,13 +302,15 @@ def check(config: Config) -> int:
     # 影子是否开启必须在自检里可见：它是唯一一处「会向模型发数据」的开关，
     # 而默认关闭意味着「配置写对了」与「根本没启用」在外部看起来一样。
     print(f"影子        {shadow_phrase(config)}")
+    print(f"文案        {wording_phrase(config)}")
     # shadow.provider = "http" 时 .env 缺项必须在这里就炸（fail fast）：
     # 「配置写对了」的自检要连「远端真的配得上」一起验，不能等第一轮 tick
     # 才发现每次都是 provider_error。
     try:
         make_shadow_collector(config)
+        make_wording(config)
     except ConfigError as exc:
-        print(f"影子配置错误：{exc}", file=sys.stderr)
+        print(f"远端配置错误：{exc}", file=sys.stderr)
         return 2
     print(f"ratio_min   {config.gate.ratio_min}")
     print(f"回看窗口    最近 {window} 分钟")

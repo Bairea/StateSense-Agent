@@ -18,7 +18,7 @@ from statesense.config import Config
 from statesense.intervention.actions import candidates
 from statesense.intervention.decider import decide
 from statesense.intervention.gates import GateContext
-from statesense.intervention.wording import TemplateWording, Wording
+from statesense.intervention.wording import TemplateWording, Wording, WordingContext
 from statesense.notify.base import Notifier
 from statesense.outcome.tracker import evaluate as evaluate_outcome
 from statesense.perception import FullscreenProbe, default_probe, is_gaming
@@ -226,6 +226,27 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             log.exception("写入 shadow_error 运行事件失败")
 
+    def _wording_context(
+        self, verdict, action, interventions_today: int
+    ) -> WordingContext:
+        """文案上下文（阶段 3.3 契约 v2）。构造点只此一处，与
+        `StateShadowInput` 同一纪律：文案要的数字由调度层显式递进来。
+
+        回执历史只是文案的语气素材：读取失败按「没有先例」处理并记日志——
+        不许让一次真实投递因为一句文案的素材缺失而丢失。
+        """
+        try:
+            last_receipt = self._store.last_receipt_status()
+        except Exception:  # noqa: BLE001 - 文案素材缺失不能变成丢投递
+            log.exception("读取最近回执失败，文案按「没有先例」处理")
+            last_receipt = None
+        return WordingContext.from_verdict(
+            verdict,
+            action,
+            reminders_today=interventions_today,
+            last_receipt=last_receipt,
+        )
+
     # ── 内部 ────────────────────────────────────────────────
 
     def _close_due_outcomes(self, now: datetime, fullscreen: int | None) -> int:
@@ -306,12 +327,14 @@ class Scheduler:
         )
 
         day_start = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        # 当日已投递次数在闸门与文案上下文里是同一个事实，只查一次。
+        interventions_today = self._store.intervention_count_since(day_start)
         ctx = GateContext(
             verdict=verdict,
             config=self._config.gate,
             now=now,
             last_intervention_at=self._store.last_intervention_at(),
-            interventions_today=self._store.intervention_count_since(day_start),
+            interventions_today=interventions_today,
         )
         last_action = self._store.get_kv(ACTION_CURSOR_KEY)
         pool = candidates(self._config.actions, verdict.state)
@@ -333,7 +356,7 @@ class Scheduler:
         top_label = (
             max(snapshot.entries, key=lambda e: e.minutes).title if snapshot.entries else None
         )
-        body = self._wording.render(verdict, action, top_label)
+        body = self._wording.render(self._wording_context(verdict, action, interventions_today), top_label)
         result = self._notifier.notify("StateSense 轻推", body)
 
         self._store.insert_intervention(
