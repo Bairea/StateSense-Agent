@@ -8,6 +8,7 @@ StateSense-Agent 识别的是「进入被动消费了吗」，不是「打开了
 | --- | --- |
 | 状态、闸门、动作、投递、回执、schema | `docs/specs/2026-09-16-v0-state-intervention-design.md` |
 | `--report`、`--replay`、全屏信号、`run_events` | `docs/specs/2026-09-16-v0.5-observability-and-replay-design.md` |
+| 影子信号、模型输入契约、视图 9 | `docs/plans/2026-09-22-stage-3-v2-llm.md`（实现记录见同目录 2026-09-24 日志） |
 | Screenpipe 契约与 `ref1.md` 的偏差 | `docs/project-understanding.md` §6 |
 | 分支、提交、密钥、本机端口 | `CONTRIBUTING.md` |
 | 阈值、分类清单、闸门参数 | `config/config.example.toml`（本地副本是 `config/config.toml`，不入库） |
@@ -23,6 +24,7 @@ StateSense-Agent 识别的是「进入被动消费了吗」，不是「打开了
 - `late_night` 是正交标记，不是状态。`WORKING` 在 V0 不判定。`GRAY` 单独计数，不并进娱乐或工作。
 - 娱乐分钟的唯一公式是 `effective_entertainment_minutes`。全屏信号只把可信快照里的 `OTHER` 提权为娱乐，不动 `WORK` / `GRAY`。一轮 tick 只探一次全屏，判定与回执共用这个值。
 - `report/` 只读，不写库、不写 SQL。`replay/` 驱动真实 `Scheduler`，默认临时库，不碰生产库。`run_events` 不写进 `interventions`。
+- 影子模式只记录候选：不改判定、闸门与投递。模型输入白名单在 `shadow/models.py`，加字段必须同步 `ALLOWED_FIELDS` 与镜像测试；模型输出与屏幕文本同属不可信证据，`reason` / `detail` 只写不读。
 - 第一版只消费 `app` / `title` / `url` / `focused` / 时间戳。屏幕文本是不可信证据，不采集、不入库、不当指令。
 
 ## 改动
