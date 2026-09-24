@@ -355,6 +355,95 @@ class TraceRow:
 
 
 @dataclass(frozen=True)
+class ShadowStratum:
+    """影子调用结局的一档（阶段 3.4）。"""
+
+    outcome: str
+    note: str
+    count: int
+
+
+@dataclass(frozen=True)
+class ShadowDivergence:
+    """候选与规则判定关系的一档。
+
+    `name` 是封闭的几个字面量，`description` 解释它意味着什么。
+    分档而不是给一个「分歧率」：把「候选更重」与「候选更轻」合并成一个数，
+    等于把「可能漏判」和「可能多打扰」加在一起 —— 两件方向相反的事。
+    """
+
+    name: str
+    description: str
+    count: int
+
+
+@dataclass(frozen=True)
+class ShadowLeadTime:
+    """模型与规则在**同一段规则侧消费事件**里各自何时达到可提醒档。
+
+    这是「首次可提醒时间」在无标注条件下的可算版本：事件由规则侧的可干预轮次
+    切分（`_intervenable_runs`），再看模型在**这段事件之前到它结束之间**
+    第一次够到可提醒档是什么时候。
+
+    「之前」不能省：段起点就是规则第一次够到档的那一轮，只看段内的话，
+    `model_earlier` 会永远为 0 —— 一个永远为 0 的档看起来像「模型从不更早」，
+    而它其实只是没算。跨段不重复归因，见 `_shadow_lead_time`。
+    """
+
+    #: 区间内的规则侧消费事件总数，与其中能被比出先后的事件数。
+    #: 两个数都要给：覆盖度不足时，下面的比例没有意义。
+    events_total: int
+    events_with_shadow: int
+    model_earlier: int
+    same_tick: int
+    #: 模型在段内够到档，但比规则晚。
+    model_later: int
+    #: 整段事件里模型都没到可提醒档（含候选明确更浅、以及全程不下结论）。
+    model_absent: int
+    #: `model_earlier` 那些事件的平均提前分钟数；没有这类事件时为 `None`。
+    earlier_mean_minutes: float | None
+
+
+@dataclass(frozen=True)
+class ShadowBreakdown:
+    """影子模型与规则的分歧（阶段 3.4）。
+
+    **这是系统视角，不能替代人工标注。** 库里只有「规则判了什么」与「模型答了
+    什么」，没有「当时到底算不算被动消费」。所以本视图能回答「两者在哪里不一样」，
+    答不了「谁对」—— 那要把两侧分别与人工真值比，而那批标注还不存在。
+
+    因此这里刻意**不使用「漏判 / 误报」**这两个词：它们是与真值比出来的结论，
+    在没有真值时借用它们，会让一份只说明「两侧口径不同」的报告看起来像
+    「已经知道模型更准」。
+    """
+
+    #: 区间内的评估轮次与被真正问到模型的轮次。覆盖度 = asked / evaluations。
+    #: 两者不等是正常的（影子可能中途打开、或输入不可信时不去问），
+    #: 但差得多时下面的所有比例都只能当局部证据读。
+    evaluations: int
+    asked: int
+    outcomes: tuple[ShadowStratum, ...]
+    divergences: tuple[ShadowDivergence, ...]
+    #: 候选够到可提醒档、而规则没到 —— 候选侧的「更早提醒」。
+    #: **不是漏判**：它没经过真值检验，可能只是模型过于积极。
+    candidate_only_ticks: int
+    #: 规则够到可提醒档、而候选没到（含候选更浅与全程不下结论）。
+    rule_only_ticks: int
+    lead: ShadowLeadTime
+    #: 延迟统计只覆盖真的发生了调用的行（`no_data` 没有耗时）。
+    latency_mean_ms: float | None
+    latency_median_ms: float | None
+    latency_max_ms: float | None
+    #: 模型明确拒答的轮次。拒答率 = refused / asked（而不是 / evaluations）——
+    #: 分母应当是「真的问了它几次」。
+    refused: int
+    #: 参与统计的模型版本分布。**换模型前后不混算**，与 `rule_version` 同一原则：
+    #: 两批不同模型的行混在一起，差异既可能来自模型也可能来自时间，
+    #: 而数据里分不出来。离线替身也在这里如实出现（它的名字就写着 offline）。
+    model_versions: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
 class ReportData:
     """把各视图的结果捆在一起交给渲染层。渲染层只读它，不再取数。"""
 
@@ -370,6 +459,9 @@ class ReportData:
     receipt_audit: ReceiptAudit
     #: 动作 × 时机（阶段 2.3）。分组用的行与视图 6 同源，只是换了个切法。
     timing: ActionTimingBreakdown
+    #: 影子模型与规则的分歧（阶段 3.4）。影子关闭时各计数为 0，
+    #: 渲染层据此明确打印「本区间没有影子记录」，而不是打一片空白。
+    shadow: ShadowBreakdown
     leaks: tuple[LeakAnchor, ...]
     trace: tuple[TraceRow, ...]
     #: 二级漏判视图的回查结果（窗口标题只在这里出现，绝不落库）。可能为空。

@@ -21,6 +21,8 @@ from statesense.report import queries, render
 from statesense.report.models import LeakWindowDetail, ReportData
 from statesense import rulebook
 from statesense.scheduler import Scheduler
+from statesense.shadow.collector import ShadowCollector
+from statesense.shadow.provider import ScriptedShadowProvider
 from statesense.store.db import SCHEMA_VERSION, Store
 
 #: 固定的 logger 名。用 `__name__` 的话，`python -m statesense` 下它是 `__main__`，
@@ -107,6 +109,38 @@ def make_notifier(config: Config, dry_run: bool, clock: Clock) -> Notifier:
     return ForegroundPopupNotifier(config.notify, clock)
 
 
+def shadow_phrase(config: Config) -> str:
+    """启动日志与 `--check` 共用的影子状态描述。
+
+    **「关着」必须写得出来。** 影子默认关闭，而「没开影子」与「开了但模型一直
+    失败」在库里是两种完全不同的数据（前者没有影子行，后者全是失败行）。
+    启动行把它们分开，事后翻日志才不必去猜当时到底开没开。
+    """
+    if not config.shadow.enabled:
+        return "关"
+    return f"{config.shadow.provider}(替身，非模型)"
+
+
+def make_shadow_collector(config: Config) -> ShadowCollector | None:
+    """按配置构造影子采集器。**返回 `None` 就是「影子关闭」** —— 整条链路
+    （采样、调用、落库）都不存在，而不是「存在但什么都不做」。
+
+    目前只注册了 `offline` 这个确定性替身，它**不是模型**。真实运行下它没有预设
+    答复，于是每轮都会如实记成 `provider_error` —— 那是「失败绝不影响投递」这条
+    性质的现场演示，不是缺陷。真实 provider 落地前，这里可用的名字不会变多。
+    """
+    if not config.shadow.enabled:
+        return None
+    if config.shadow.provider != "offline":
+        # 配置层已经挡过一次（KNOWN_SHADOW_PROVIDERS）。这里再抛一次是为了
+        # 不给「配置能写、运行时静默空转」留后路。
+        raise ConfigError(f"未实现的 shadow.provider: {config.shadow.provider}")
+    return ShadowCollector(
+        ScriptedShadowProvider(()),
+        timeout_seconds=config.shadow.timeout_seconds,
+    )
+
+
 def _current_branch(start: Path | None = None) -> str | None:
     """从 `.git/HEAD` 直接读分支名，**不起子进程**。
 
@@ -158,7 +192,7 @@ def log_startup(config: Config, *, dry_run: bool) -> None:
     """
     log.info(
         "常驻启动 pid=%d 分支=%s schema=v%d 规则版本=%s 库=%s screenpipe=%s 通道=%s "
-        "每 %d 分钟一轮/窗口 %d 分钟",
+        "影子=%s 每 %d 分钟一轮/窗口 %d 分钟",
         os.getpid(),
         _current_branch() or "未知",
         SCHEMA_VERSION,
@@ -166,6 +200,7 @@ def log_startup(config: Config, *, dry_run: bool) -> None:
         config.store_path,
         config.screenpipe.base_url,
         "recording(dry-run)" if dry_run else config.notify.channel,
+        shadow_phrase(config),
         config.schedule.evaluate_every_minutes,
         config.schedule.window_minutes,
     )
@@ -180,6 +215,7 @@ def build_scheduler(config: Config, notifier: Notifier, clock: Clock) -> Schedul
         reader=make_reader(config),
         store=store,
         notifier=notifier,
+        shadow=make_shadow_collector(config),
     )
 
 
@@ -193,6 +229,9 @@ def check(config: Config) -> int:
 
     print(f"配置        OK（store={config.store_path}）")
     print(f"通道        {config.notify.channel}")
+    # 影子是否开启必须在自检里可见：它是唯一一处「会向模型发数据」的开关，
+    # 而默认关闭意味着「配置写对了」与「根本没启用」在外部看起来一样。
+    print(f"影子        {shadow_phrase(config)}")
     print(f"ratio_min   {config.gate.ratio_min}")
     print(f"回看窗口    最近 {window} 分钟")
     print(f"data_status {snapshot.data_status}")
@@ -315,6 +354,9 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
         # 过滤轴只有干预发生时刻一个。视图 3/4 仍读上面两条原始表（运行事实），
         # 这一份只服务于「哪些记录能当效果证据」。
         cohort_rows = store.list_intervention_cohort(since=since)
+        # 影子记录同样是「带评估行的 join」：分歧分析必须拿候选与**同一时刻**的
+        # 规则判定并排比较，分两次查会在两次查询之间留下不一致的窗口。
+        shadow_rows = store.list_shadow_signals(since=since)
         # 消费事件由评估行合并而来：判定按五分钟一轮，同一次消费会被评估十几次，
         # 按轮次当样本会把样本量凭空放大十几倍（阶段 2.3 的「避免伪样本量」）。
         events = queries.build_consumption_events(
@@ -353,6 +395,14 @@ def run_report(config: Config, args: argparse.Namespace, clock: Clock) -> int:
                     gap_threshold_minutes=config.report.gap_threshold_minutes,
                 ),
                 gap_threshold_minutes=config.report.gap_threshold_minutes,
+            ),
+            # 影子视图的分母是「区间内的评估轮次」，用来算覆盖度；事件序列与
+            # 视图 8 同源（都由 _intervenable_runs 切出），但这里问的是另一个问题：
+            # 模型在每一段消费里何时够到可提醒档。
+            shadow=queries.build_shadow_breakdown(
+                shadow_rows,
+                events,
+                evaluations=len(evaluations),
             ),
             leaks=queries.find_leak_anchors(
                 evaluations,

@@ -6,6 +6,7 @@ import pytest
 from statesense.intervention.models import Decision, GateResult, parse_gate_trace
 from statesense.outcome.models import OutcomeVerdict
 from statesense.report import queries
+from statesense.shadow.models import ModelCandidate, ModelSignal, ShadowOutcome
 from statesense.state.models import State, StateVerdict
 from statesense.perception import QUNS_ACCEPTS_NOTIFICATIONS, QUNS_BUSY
 from statesense.store.db import Store
@@ -1055,3 +1056,272 @@ def test_build_trace_carries_gate_details(store):
     _eval_row(store, T0, gates=[("ratio_min", False, 0.70, 0.75)])
     trace = queries.build_trace(store.list_evaluations(), T0, window_ticks=1)
     assert trace[0].gates == (("ratio_min", False, 0.70, 0.75),)
+
+
+# ── 影子模型（阶段 3.4） ────────────────────────────────────
+
+def _shadow_row(
+    store,
+    evaluation_id: int,
+    *,
+    outcome="ok",
+    candidate="NORMAL",
+    model_version="m1",
+    latency_ms=12.0,
+    reason=None,
+    detail=None,
+) -> None:
+    """往库里写一行影子记录。走真实的写入接口，顺带覆盖外键与列映射。"""
+    store.insert_shadow_signal(
+        evaluation_id,
+        ModelSignal(
+            outcome=ShadowOutcome(outcome),
+            candidate=None if candidate is None else ModelCandidate(candidate),
+            model_version=model_version,
+            prompt_version="p1",
+            latency_ms=latency_ms,
+            reason=reason,
+            detail=detail,
+        ),
+    )
+
+
+def _shadow_breakdown(store, *, evaluations=None) -> "queries.ShadowBreakdown":
+    rows = store.list_evaluations()
+    return queries.build_shadow_breakdown(
+        store.list_shadow_signals(),
+        queries.build_consumption_events(rows, gap_threshold_minutes=15),
+        evaluations=len(rows) if evaluations is None else evaluations,
+    )
+
+
+def test_shadow_breakdown_reports_coverage_and_every_outcome(store):
+    """结局按封闭枚举**全量**出现，计 0 的档也在。
+
+    少一档就分不清「这一档不存在」与「这一档为 0」，而后者正是要看的：
+    「一次超时都没有」是好消息，「一次都没调用」是配置问题。
+    """
+    first = _eval_row(store, T0)
+    _shadow_row(store, first)
+
+    breakdown = _shadow_breakdown(store)
+
+    assert breakdown.evaluations == 1
+    assert breakdown.asked == 1
+    assert [item.outcome for item in breakdown.outcomes] == [
+        outcome.value for outcome in ShadowOutcome
+    ]
+    counts = {item.outcome: item.count for item in breakdown.outcomes}
+    assert counts["ok"] == 1
+    assert counts["timeout"] == counts["no_data"] == 0
+    assert all(item.note for item in breakdown.outcomes), "每一档都要有人能读的说明"
+
+
+def test_unknown_outcome_from_a_hand_edited_row_still_appears(store):
+    """枚举外的结局单列一档，不能被丢掉 —— 丢掉会让分布之和不等于被问次数。"""
+    evaluation_id = _eval_row(store, T0)
+    with store._conn:
+        store._conn.execute(
+            "INSERT INTO shadow_signals (evaluation_id, outcome, candidate, "
+            "model_version, prompt_version, latency_ms) VALUES (?, 'wat', NULL, 'm', 'p', 1.0)",
+            (evaluation_id,),
+        )
+
+    breakdown = _shadow_breakdown(store)
+
+    extra = [item for item in breakdown.outcomes if item.outcome == "wat"]
+    assert len(extra) == 1
+    assert extra[0].count == 1
+    assert sum(item.count for item in breakdown.outcomes) == breakdown.asked
+
+
+def test_relations_split_into_the_four_documented_buckets(store):
+    """一致 / 更重 / 更轻 / 不下结论。方向相反的档不能合并成一个「分歧率」。"""
+    ids = [
+        _eval_row(store, T0 + timedelta(minutes=5 * i), state="PASSIVE_CONSUMPTION")
+        for i in range(4)
+    ]
+    _shadow_row(store, ids[0], candidate="PASSIVE_CONSUMPTION")  # 一致
+    _shadow_row(store, ids[1], candidate="HIGH_RISK_PASSIVE_CONSUMPTION")  # 更重
+    _shadow_row(store, ids[2], candidate="WATCH")  # 更轻
+    _shadow_row(store, ids[3], candidate="uncertain")  # 不下结论
+
+    breakdown = _shadow_breakdown(store)
+
+    counts = {item.name: item.count for item in breakdown.divergences}
+    assert counts == {"一致": 1, "候选更重": 1, "候选更轻": 1, "候选不下结论": 1}
+
+
+def test_failed_rows_are_not_counted_as_any_relation(store):
+    """失败档没有候选，不属于任何关系档 —— 把它算进「一致」会让分歧率失真。"""
+    ids = [_eval_row(store, T0 + timedelta(minutes=5 * i)) for i in range(2)]
+    _shadow_row(store, ids[0], outcome="timeout", candidate=None, latency_ms=300.0)
+    _shadow_row(store, ids[1], candidate="PASSIVE_CONSUMPTION")
+
+    breakdown = _shadow_breakdown(store)
+
+    assert sum(item.count for item in breakdown.divergences) == 1
+
+
+def test_cross_bar_counts_are_symmetric_in_meaning(store):
+    """两侧各数「对面没到档」的轮次，方向相反、互不抵消。"""
+    ids = [_eval_row(store, T0 + timedelta(minutes=5 * i)) for i in range(3)]
+    _shadow_row(store, ids[0], candidate="PASSIVE_CONSUMPTION")  # 两侧都到档
+    _shadow_row(store, ids[1], candidate="uncertain")  # 只有规则到档
+    _shadow_row(store, ids[2], candidate="NORMAL")  # 只有规则到档
+
+    breakdown = _shadow_breakdown(store)
+
+    assert breakdown.rule_only_ticks == 2
+    assert breakdown.candidate_only_ticks == 0
+
+
+def test_candidate_reaching_the_bar_alone_is_counted(store):
+    """规则判 NORMAL、候选却够到可提醒档 —— 候选侧「更早提醒」的那一类。"""
+    evaluation_id = _eval_row(store, T0, ent=5.0, total=60.0, state="NORMAL")
+    _shadow_row(store, evaluation_id, candidate="HIGH_RISK_PASSIVE_CONSUMPTION")
+
+    breakdown = _shadow_breakdown(store)
+
+    assert breakdown.candidate_only_ticks == 1
+    assert breakdown.rule_only_ticks == 0
+
+
+def test_latency_stats_ignore_rows_that_did_not_call(store):
+    """没调用就没有耗时。若把 0 算进均值，延迟会被「没问的那几轮」拉低。"""
+    ids = [_eval_row(store, T0 + timedelta(minutes=5 * i)) for i in range(3)]
+    _shadow_row(store, ids[0], latency_ms=100.0)
+    _shadow_row(store, ids[1], latency_ms=300.0)
+    _shadow_row(store, ids[2], outcome="no_data", candidate=None, latency_ms=None)
+
+    breakdown = _shadow_breakdown(store)
+
+    assert breakdown.latency_mean_ms == 200.0
+    assert breakdown.latency_median_ms == 200.0
+    assert breakdown.latency_max_ms == 300.0
+
+
+def test_refusal_rate_denominator_is_asked_ticks(store):
+    """拒答率的分母是「真的问了它几次」，不是「区间内评估了几轮」。"""
+    ids = [_eval_row(store, T0 + timedelta(minutes=5 * i)) for i in range(2)]
+    _shadow_row(store, ids[0], candidate="refused")
+    _shadow_row(store, ids[1], candidate="NORMAL")
+
+    breakdown = _shadow_breakdown(store, evaluations=10)
+
+    assert breakdown.refused == 1
+    assert breakdown.asked == 2
+    assert breakdown.evaluations == 10
+
+
+def test_model_versions_are_grouped_so_models_are_not_mixed(store):
+    """换模型前后不混算 —— 与 rule_version 是同一个原则。"""
+    ids = [_eval_row(store, T0 + timedelta(minutes=5 * i)) for i in range(3)]
+    _shadow_row(store, ids[0], model_version="m-old")
+    _shadow_row(store, ids[1], model_version="m-old")
+    _shadow_row(store, ids[2], model_version="m-new")
+
+    breakdown = _shadow_breakdown(store)
+
+    assert dict(breakdown.model_versions) == {"m-old": 2, "m-new": 1}
+
+
+# ── 首次可提醒时间 ──────────────────────────────────────────
+
+def test_lead_time_counts_a_model_that_reaches_the_bar_before_the_rule(store):
+    """段起点是规则第一次够到档的那一轮，所以「更早」只可能发生在段**之前**。
+
+    这里就是那个场景：规则在 T0+15 才够到档，而模型在 T0+10 就够到了。
+    """
+    for i in range(3):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), ent=5.0, state="WATCH")
+    for i in range(3, 5):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), ent=45.0, state="PASSIVE_CONSUMPTION")
+    rows = store.list_evaluations()
+    _shadow_row(store, rows[0]["id"], candidate="NORMAL")
+    _shadow_row(store, rows[1]["id"], candidate="NORMAL")
+    _shadow_row(store, rows[2]["id"], candidate="PASSIVE_CONSUMPTION")
+    _shadow_row(store, rows[3]["id"], candidate="PASSIVE_CONSUMPTION")
+    _shadow_row(store, rows[4]["id"], candidate="PASSIVE_CONSUMPTION")
+
+    breakdown = _shadow_breakdown(store)
+
+    assert breakdown.lead.events_total == 1
+    assert breakdown.lead.model_earlier == 1
+    assert breakdown.lead.earlier_mean_minutes == 5.0
+    assert breakdown.lead.model_later == breakdown.lead.model_absent == 0
+
+
+def test_lead_time_reports_same_tick_when_the_model_waits_for_the_rule(store):
+    for i in range(3):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), ent=5.0, state="WATCH")
+    for i in range(3, 5):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), ent=45.0, state="PASSIVE_CONSUMPTION")
+    rows = store.list_evaluations()
+    for index, row in enumerate(rows):
+        _shadow_row(store, row["id"], candidate="PASSIVE_CONSUMPTION" if index >= 3 else "NORMAL")
+
+    breakdown = _shadow_breakdown(store)
+
+    assert breakdown.lead.same_tick == 1
+    assert breakdown.lead.model_earlier == 0
+    assert breakdown.lead.earlier_mean_minutes is None
+
+
+def test_lead_time_reports_absent_when_the_model_never_reaches_the_bar(store):
+    for i in range(5):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), ent=45.0, state="PASSIVE_CONSUMPTION")
+    for row in store.list_evaluations():
+        _shadow_row(store, row["id"], candidate="WATCH")
+
+    breakdown = _shadow_breakdown(store)
+
+    assert breakdown.lead.model_absent == 1
+    assert breakdown.lead.model_earlier == breakdown.lead.same_tick == 0
+
+
+def test_lead_time_does_not_let_one_row_serve_two_events(store):
+    """一段影子行只归给它之后最近的那一段事件。
+
+    否则同一行会同时抬高两段事件的提前量 —— 那是「分母被重复使用」的经典形态，
+    数字会变大而看不出原因。
+
+    摆法的关键：**唯一够档的影子行必须落在第一段事件的窗口内**，而第二段窗口里
+    全程不够档。这样，若窗口的下界（上一段事件的结束时刻）失效，第一段的行就会
+    再次服务第二段 —— 第二段凭空得到「提前 120 分钟」，恰好是本测试要拦住的数字。
+    """
+    # 第一段事件：T0 起（规则与模型同轮够档）。
+    _eval_row(store, T0, ent=45.0, state="PASSIVE_CONSUMPTION")
+    _eval_row(store, T0 + timedelta(minutes=5), ent=45.0, state="PASSIVE_CONSUMPTION")
+    # 第二段事件：越过缺口之后；窗口内模型全程不够档。
+    _eval_row(store, T0 + timedelta(minutes=120), ent=45.0, state="PASSIVE_CONSUMPTION")
+    _eval_row(store, T0 + timedelta(minutes=125), ent=45.0, state="PASSIVE_CONSUMPTION")
+    rows = store.list_evaluations()
+    _shadow_row(store, rows[0]["id"], candidate="PASSIVE_CONSUMPTION")  # 服务第一段
+    for row in rows[1:]:
+        _shadow_row(store, row["id"], candidate="WATCH")
+
+    breakdown = _shadow_breakdown(store)
+
+    assert breakdown.lead.events_total == 2
+    assert breakdown.lead.events_with_shadow == 2, "两段窗口里都有影子行，absent 不是「没问」"
+    assert breakdown.lead.same_tick == 1, "第一段里模型与规则同轮够档"
+    assert breakdown.lead.model_absent == 1, "第二段窗口内模型没有再次够档"
+    assert breakdown.lead.model_earlier == 0
+    assert breakdown.lead.earlier_mean_minutes is None
+
+
+def test_events_without_any_shadow_row_are_not_counted_as_agreeing(store):
+    """规则侧有消费、影子侧一行都没有：既不算「更早」也不算「更晚」。
+
+    这一类只由 `events_with_shadow` 与总数之差显出来 —— 冒充成任何一档，
+    都会把「影子没开那段时间」算成「模型同意规则」。
+    """
+    for i in range(5):
+        _eval_row(store, T0 + timedelta(minutes=5 * i), ent=45.0, state="PASSIVE_CONSUMPTION")
+
+    breakdown = _shadow_breakdown(store)
+
+    assert breakdown.lead.events_total == 1
+    assert breakdown.lead.events_with_shadow == 0
+    assert breakdown.lead.model_absent == breakdown.lead.same_tick == 0
