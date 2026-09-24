@@ -40,6 +40,12 @@ MANDATORY_GATES: tuple[str, ...] = (GATE_STATE_MIN,)
 #: （与 `gate.enabled` 里拼错闸门名同一类缺陷）——所以两者必须同一笔落地。
 KNOWN_SHADOW_PROVIDERS: tuple[str, ...] = ("offline", "http")
 
+#: 提醒文案的可选实现。**封闭枚举**，与 shadow.provider 同一纪律：
+#: `template` 是内置模板（默认基线）；`http` 是真实远端候选——失败、空文案
+#: 或超长时**自动回退模板**（回退逻辑在适配层，不在配置层），所以它的默认
+#: 关闭只是「没有证据不启用」，启用本身不会让投递链路多一份风险。
+KNOWN_WORDING_PROVIDERS: tuple[str, ...] = ("template", "http")
+
 
 @dataclass(frozen=True)
 class ScreenpipeConfig:
@@ -87,6 +93,25 @@ class ShadowConfig:
     provider: str = "offline"
     #: **结果层**超时（秒）：返回时已超过它的候选一律丢弃。
     #: 传输层自己的超时由 provider 实现负责，两层分工见 `shadow/collector.py`。
+    timeout_seconds: float = 3.0
+
+
+@dataclass(frozen=True)
+class WordingConfig:
+    """提醒文案供应器（阶段 3.3）。
+
+    默认内置模板；`http` 是真实远端候选，失败 / 空文案 / 超长时**自动回退
+    模板**（回退在适配层，不在配置层）——所以「启用 http」本身不会让投递
+    链路多一份风险，默认 template 只是「没有样本证据不常开」（计划 3.3
+    的验收线），不是保守。
+
+    这一节同样**不参与 `rulebook.rule_version`**：文案只改弹窗正文，
+    不改判定、闸门与投递决策。
+    """
+
+    provider: str = "template"
+    #: 单次文案调用的传输超时（秒）。文案调用发生在投递路径上，
+    #: 慢模型会拖住弹窗——这是它必须有自己的超时的原因。
     timeout_seconds: float = 3.0
 
 
@@ -166,6 +191,8 @@ class Config:
     notify: NotifyConfig
     #: 影子模型信号。关闭时整条链路（采样、调用、落库）都不存在。
     shadow: ShadowConfig
+    #: 提醒文案供应器。template 与 http 的切换见 `WordingConfig`。
+    wording: WordingConfig
     #: 配置文件所在目录。`shadow.provider = "http"` 时 `.env` 的查找兜底就在这里
     #: （先 CWD/.env，再本目录）。只存目录，不存内容——密钥绝不进 Config，
     #: repr 与日志里都不会出现。
@@ -286,6 +313,19 @@ def load_config(path: Path) -> Config:
             f"shadow.timeout_seconds 必须为正数，当前为 {shadow.timeout_seconds}"
         )
 
+    wording = _section(WordingConfig, raw, "wording")
+    # 同 shadow.provider：名字可写而实现没接，会让「以为换了文案、实际还是
+    # 模板」。封闭枚举 + 启动期拒绝，两头都堵死。
+    if wording.provider not in KNOWN_WORDING_PROVIDERS:
+        raise ConfigError(
+            f"wording.provider 未知：{wording.provider!r}；"
+            f"已知实现：{list(KNOWN_WORDING_PROVIDERS)}"
+        )
+    if wording.timeout_seconds <= 0:
+        raise ConfigError(
+            f"wording.timeout_seconds 必须为正数，当前为 {wording.timeout_seconds}"
+        )
+
     store_raw = raw.get("store", {})
     store_path = (path.parent / store_raw.get("path", "statesense.db")).resolve()
 
@@ -334,6 +374,7 @@ def load_config(path: Path) -> Config:
         outcome=outcome,
         notify=notify,
         shadow=shadow,
+        wording=wording,
         config_dir=path.parent,
         store_path=store_path,
         report=report,
