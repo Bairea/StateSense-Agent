@@ -20,8 +20,10 @@ from statesense.replay.scenarios import SCENARIOS, check_scenario
 from statesense.report import queries, render
 from statesense.report.models import LeakWindowDetail, ReportData
 from statesense import rulebook
+from statesense.llm import load_llm_env
 from statesense.scheduler import Scheduler
 from statesense.shadow.collector import ShadowCollector
+from statesense.shadow.http_provider import HttpShadowProvider
 from statesense.shadow.provider import ScriptedShadowProvider
 from statesense.store.db import SCHEMA_VERSION, Store
 
@@ -115,30 +117,57 @@ def shadow_phrase(config: Config) -> str:
     **「关着」必须写得出来。** 影子默认关闭，而「没开影子」与「开了但模型一直
     失败」在库里是两种完全不同的数据（前者没有影子行，后者全是失败行）。
     启动行把它们分开，事后翻日志才不必去猜当时到底开没开。
+
+    两种开启状态也必须分开写：offline 是**替身不是模型**，它的任何数字都
+    不能当模型效果读；http 是真实远端，要能看到具体是哪个模型在答。
     """
     if not config.shadow.enabled:
         return "关"
-    return f"{config.shadow.provider}(替身，非模型)"
+    if config.shadow.provider == "offline":
+        return "offline(离线替身，非模型)"
+    if config.shadow.provider == "http":
+        try:
+            env = load_llm_env(config.config_dir)
+        except ConfigError as exc:
+            return f"http(配置不完整：{exc})"
+        return f"http model={env.model}"
+    return config.shadow.provider
 
 
 def make_shadow_collector(config: Config) -> ShadowCollector | None:
     """按配置构造影子采集器。**返回 `None` 就是「影子关闭」** —— 整条链路
     （采样、调用、落库）都不存在，而不是「存在但什么都不做」。
 
-    目前只注册了 `offline` 这个确定性替身，它**不是模型**。真实运行下它没有预设
-    答复，于是每轮都会如实记成 `provider_error` —— 那是「失败绝不影响投递」这条
-    性质的现场演示，不是缺陷。真实 provider 落地前，这里可用的名字不会变多。
+    `offline` 是确定性替身，它**不是模型**：真实运行下它没有预设答复，每轮
+    都会如实记成 `provider_error` —— 那是「失败绝不影响投递」这条性质的
+    现场演示，不是缺陷。
+
+    `http` 是真实远端供应器。连接三项从 `.env` 读，缺项在这里抛 `ConfigError`
+    （fail closed）：「以为在收影子数据、实际一次都没调用」比启动失败严重得多。
+    每轮的传输层与结果层超时都用 `shadow.timeout_seconds` 一个旋钮——传输层
+    负责掐断，结果层负责丢弃迟到的答复，两层分工见 `shadow/collector.py`。
     """
     if not config.shadow.enabled:
         return None
-    if config.shadow.provider != "offline":
-        # 配置层已经挡过一次（KNOWN_SHADOW_PROVIDERS）。这里再抛一次是为了
-        # 不给「配置能写、运行时静默空转」留后路。
-        raise ConfigError(f"未实现的 shadow.provider: {config.shadow.provider}")
-    return ShadowCollector(
-        ScriptedShadowProvider(()),
-        timeout_seconds=config.shadow.timeout_seconds,
-    )
+    if config.shadow.provider == "offline":
+        return ShadowCollector(
+            ScriptedShadowProvider(()),
+            timeout_seconds=config.shadow.timeout_seconds,
+        )
+    if config.shadow.provider == "http":
+        env = load_llm_env(config.config_dir)
+        return ShadowCollector(
+            HttpShadowProvider(
+                env.url,
+                env.model,
+                env.api_key,
+                timeout_seconds=config.shadow.timeout_seconds,
+            ),
+            timeout_seconds=config.shadow.timeout_seconds,
+        )
+    # 配置层已经挡过一次（KNOWN_SHADOW_PROVIDERS）。这里再抛一次是为了
+    # 不给「配置能写、运行时静默空转」留后路。
+    raise ConfigError(f"未实现的 shadow.provider: {config.shadow.provider}")
 
 
 def _current_branch(start: Path | None = None) -> str | None:
@@ -232,6 +261,14 @@ def check(config: Config) -> int:
     # 影子是否开启必须在自检里可见：它是唯一一处「会向模型发数据」的开关，
     # 而默认关闭意味着「配置写对了」与「根本没启用」在外部看起来一样。
     print(f"影子        {shadow_phrase(config)}")
+    # shadow.provider = "http" 时 .env 缺项必须在这里就炸（fail fast）：
+    # 「配置写对了」的自检要连「远端真的配得上」一起验，不能等第一轮 tick
+    # 才发现每次都是 provider_error。
+    try:
+        make_shadow_collector(config)
+    except ConfigError as exc:
+        print(f"影子配置错误：{exc}", file=sys.stderr)
+        return 2
     print(f"ratio_min   {config.gate.ratio_min}")
     print(f"回看窗口    最近 {window} 分钟")
     print(f"data_status {snapshot.data_status}")

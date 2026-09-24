@@ -33,11 +33,12 @@ MANDATORY_GATES: tuple[str, ...] = (GATE_STATE_MIN,)
 
 #: 影子模型的可选实现。**封闭枚举，不是自由字符串。**
 #:
-#: 目前只有 `offline` —— 测试与回放用的确定性替身，**它不是模型**。
-#: 真实实现在落地时应当与它的传输层实现一起加进这里：先把名字接进配置、
-#: 实现却还没写，会让 `shadow.enabled = true` 变成一次静默空转
-#: （与 `gate.enabled` 里拼错闸门名同一类缺陷）。
-KNOWN_SHADOW_PROVIDERS: tuple[str, ...] = ("offline",)
+#: `offline` —— 测试与回放用的确定性替身，**它不是模型**。
+#: `http`    —— 真实远端供应器（OpenAI 兼容 chat/completions），url / model /
+#: api key 从 `.env` 读（见 `.env.example`；`.env` 不入库），缺项启动即报错。
+#: 名字先进枚举、实现却还没写，会让 `shadow.enabled = true` 变成一次静默空转
+#: （与 `gate.enabled` 里拼错闸门名同一类缺陷）——所以两者必须同一笔落地。
+KNOWN_SHADOW_PROVIDERS: tuple[str, ...] = ("offline", "http")
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,10 @@ class Config:
     notify: NotifyConfig
     #: 影子模型信号。关闭时整条链路（采样、调用、落库）都不存在。
     shadow: ShadowConfig
+    #: 配置文件所在目录。`shadow.provider = "http"` 时 `.env` 的查找兜底就在这里
+    #: （先 CWD/.env，再本目录）。只存目录，不存内容——密钥绝不进 Config，
+    #: repr 与日志里都不会出现。
+    config_dir: Path
     store_path: Path
     report: ReportConfig
     taxonomy: TaxonomyConfig
@@ -329,6 +334,7 @@ def load_config(path: Path) -> Config:
         outcome=outcome,
         notify=notify,
         shadow=shadow,
+        config_dir=path.parent,
         store_path=store_path,
         report=report,
         taxonomy=taxonomy,
